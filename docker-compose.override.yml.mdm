@@ -1,0 +1,59 @@
+# Breeze MDM Server — Docker Compose override
+# Usage: docker compose -f docker-compose.yml -f docker-compose.override.yml.mdm up -d
+#
+# This adds the MDM sidecar service that provides native Apple MDM protocol
+# support. The sidecar wraps NanoMDM and communicates with the Breeze API
+# over HTTP. Apple devices connect to it directly over HTTPS.
+#
+# Required environment variables (set in .env or export):
+#   MDM_TLS_CERT_FILE    - Path to TLS certificate for MDM endpoint (e.g., ./certs/mdm.crt)
+#   MDM_TLS_KEY_FILE     - Path to TLS private key (e.g., ./certs/mdm.key)
+#   APNS_CERT_FILE       - (Optional) Path to APNs push certificate (.p12 or .pem)
+#   APNS_KEY_FILE        - (Optional) Path to APNs private key (if separate from cert)
+#   APNS_TOPIC           - (Optional) APNs topic (your app's bundle ID)
+#   APNS_PRODUCTION      - (Optional) "true" for production APNs, "false" (default) for sandbox
+
+services:
+  breeze-mdm:
+    build:
+      context: ./apps/mdm-server
+      dockerfile: Dockerfile
+    container_name: breeze-mdm
+    restart: unless-stopped
+    environment:
+      BREEZE_API_URL: http://breeze-api:3001
+      MDM_LISTEN_ADDR: ":8443"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-breeze}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-breeze}
+      MDM_TLS_CERT_FILE: /certs/mdm.crt
+      MDM_TLS_KEY_FILE: /certs/mdm.key
+      APNS_CERT_FILE: ${APNS_CERT_FILE:-}
+      APNS_KEY_FILE: ${APNS_KEY_FILE:-}
+      APNS_TOPIC: ${APNS_TOPIC:-}
+      APNS_PRODUCTION: ${APNS_PRODUCTION:-false}
+    volumes:
+      - mdm-certs:/certs:ro
+    ports:
+      # MDM endpoint — must be publicly reachable by Apple devices
+      # In production, put this behind Caddy/reverse proxy with a real domain
+      - "8443:8443"
+    depends_on:
+      breeze-api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - breeze-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  mdm-certs:
+    driver: local
+
+networks:
+  breeze-network:
+    external: true

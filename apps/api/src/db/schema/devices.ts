@@ -1,10 +1,11 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { ipClassEnum, organizations, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
 import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
 
-export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux']);
+export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux', 'ios', 'ipados']);
 export const deviceStatusEnum = pgEnum('device_status', ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending']);
 export const deviceGroupTypeEnum = pgEnum('device_group_type', ['static', 'dynamic']);
 export const membershipSourceEnum = pgEnum('membership_source', ['manual', 'dynamic_rule', 'policy']);
@@ -128,6 +129,20 @@ export const devices = pgTable('devices', {
   // itself — see isDeviceLogSilent in @breeze/shared.
   lastLogAt: timestamp('last_log_at', { withTimezone: true }),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
+  // ─── MDM Module (Apple native MDM) ───────────────────────────────
+  // MDM-enrolled Apple devices (iOS/iPadOS/macOS) tracked here share the
+  // device list with agent-managed endpoints. macOS devices can be both
+  // agent-managed AND MDM-enrolled (dual-mode). NULL mdm_udid = not MDM.
+  mdmEnrolled: boolean('mdm_enrolled').notNull().default(false),
+  mdmUdId: varchar('mdm_udid', { length: 255 }),
+  mdmSerialNumber: varchar('mdm_serial_number', { length: 255 }),
+  mdmProduct: varchar('mdm_product', { length: 255 }),
+  mdmModelName: varchar('mdm_model_name', { length: 255 }),
+  mdmSupervised: boolean('mdm_supervised').default(false),
+  mdmActivationLockEnabled: boolean('mdm_activation_lock_enabled').default(false),
+  mdmLastCheckin: timestamp('mdm_last_checkin', { withTimezone: true }),
+  mdmEnrollmentType: varchar('mdm_enrollment_type', { length: 50 }).default('manual'),
+  // manual | abm_ade | user_enrollment
   // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
   // a recovery. recoveredFromSnapshotId is a soft reference to
   // backup_snapshots.id (no FK, like possibleReplacementOfDeviceId above) —
@@ -359,6 +374,8 @@ export const devices = pgTable('devices', {
 }, (table) => ({
   idOrgSiteUnique: uniqueIndex('devices_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
   idOrgUnique: uniqueIndex('devices_id_org_id_uniq').on(table.id, table.orgId),
+  mdmEnrolledIdx: index('devices_mdm_enrolled_idx').on(table.mdmEnrolled).where(sql`${table.mdmEnrolled} = true`),
+  mdmUdIdIdx: index('devices_mdm_udid_idx').on(table.mdmUdId).where(sql`${table.mdmUdId} IS NOT NULL`),
 }));
 
 // Linked device profiles for multi-boot systems (#2138). One row per physical

@@ -61,6 +61,9 @@ export const configFeatureTypeEnum = pgEnum('config_feature_type', [
   'time_sync',
   // #3834. APPENDED, matching the migration's ADD VALUE order.
   'workload_inventory',
+  // MDM Module. APPENDED, matching the migration's ADD VALUE order.
+  // MDM profiles (Apple .mobileconfig) assignable via configuration policies.
+  'mdm_profile',
 ]);
 
 export const configAssignmentLevelEnum = pgEnum('config_assignment_level', [
@@ -573,4 +576,25 @@ export const configPolicyMonitoringWatches = pgTable('config_policy_monitoring_w
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
   settingsIdIdx: index('cpmon_watches_settings_id_idx').on(table.settingsId),
+}));
+
+// ============================================
+// MDM Module — Apple MDM Profiles per Policy
+// ============================================
+
+// Single-item: one row per feature link (MDM profile settings)
+// Links MDM profiles (mdm_profiles table) to a configuration policy.
+// When a device matches this policy, the listed profiles are installed
+// via the MDM protocol (NanoMDM sidecar).
+export const configPolicyMdmProfileSettings = pgTable('config_policy_mdm_profile_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  featureLinkId: uuid('feature_link_id').notNull().unique().references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
+  // Which MDM profiles to enforce under this policy
+  profileIds: uuid('profile_ids').array().notNull().default([]),
+  // When true, profiles NOT in profile_ids are removed from matching devices
+  enforceExactSet: boolean('enforce_exact_set').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  featureLinkIdx: index('config_policy_mdm_profile_settings_feature_link_idx').on(table.featureLinkId),
 }));
