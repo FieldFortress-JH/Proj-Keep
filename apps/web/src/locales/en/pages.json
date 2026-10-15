@@ -174,7 +174,11 @@
     "securityScans": "IOC Scans",
     "devicesTime": "Time synchronization",
     "adminAiModels": "AI Models",
-    "billingAutopay": "Automatic payments"
+    "billingAutopay": "Automatic payments",
+    "mdmProfiles": "MDM Profiles",
+    "mdmProfileNew": "New MDM Profile",
+    "mdmProfileEdit": "Edit MDM Profile",
+    "mdmSettings": "MDM Settings"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote Monitoring and Management",

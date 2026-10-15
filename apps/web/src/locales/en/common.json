@@ -110,7 +110,8 @@
     "timeSync": "Time Sync",
     "aiModels": "AI Models",
     "autopay": "Autopay",
-    "payments": "Payments"
+    "payments": "Payments",
+    "mdmProfiles": "MDM Profiles"
   },
   "documentTitles": {
     "dashboard": "Dashboard",

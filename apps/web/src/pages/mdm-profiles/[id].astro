@@ -1,0 +1,10 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import MdmProfileEditor from '../../components/mdm/MdmProfileEditor';
+
+const { id } = Astro.params;
+---
+
+<DashboardLayout titleKey="titles.mdmProfileEdit">
+  <MdmProfileEditor client:load profileId={id!} />
+</DashboardLayout>

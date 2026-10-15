@@ -65,6 +65,7 @@ import {
   ServerCog,
   Inbox,
   Sparkles,
+  Smartphone,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '../../stores/uiStore';
@@ -296,6 +297,8 @@ export const navSections: NavSection[] = [
       { name: 'Network', labelKey: 'nav.networkMonitor', href: '/monitoring', icon: Activity, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'Network Discovery', labelKey: 'nav.networkDiscovery', href: '/discovery', icon: Network, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'OneDrive', labelKey: 'nav.oneDrive', href: '/onedrive', icon: Cloud, requiredPermission: { resource: 'devices', action: 'read' } },
+      // MDM Module: Apple native MDM profiles — embedded in fleet management
+      { name: 'MDM Profiles', labelKey: 'nav.mdmProfiles', href: '/mdm-profiles', icon: Smartphone, requiredPermission: { resource: 'devices', action: 'read' } },
     ],
   },
   {

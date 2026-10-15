@@ -34,6 +34,7 @@ import {
   Cloud,
   History,
   Bot,
+  Smartphone,
 } from "lucide-react";
 import { formatPercent } from "@/lib/i18n/format";
 import { formatUptime } from "../../lib/utils";
@@ -85,6 +86,7 @@ import DeviceReliabilityPanel from "./DeviceReliabilityPanel";
 import DeviceMonitoringTab from "./DeviceMonitoringTab";
 import DeviceComplianceTab from "./DeviceComplianceTab";
 import DeviceLinkedProfilesTab from "./DeviceLinkedProfilesTab";
+import MdmDeviceTab from "../mdm/MdmDeviceTab";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
 import { Puzzle } from "lucide-react";
@@ -122,7 +124,8 @@ type CoreTab =
   | "backup"
   | "linked-profiles"
   | "tickets"
-  | "operator-tasks";
+  | "operator-tasks"
+  | "mdm";
 
 /**
  * Extension-contributed `device.detail.tabs` tab id:
@@ -222,6 +225,7 @@ const VALID_TABS: CoreTab[] = [
   "linked-profiles",
   "tickets",
   "operator-tasks",
+  "mdm",
 ];
 
 // Mirrors the character set an `ExtensionSlotDescriptor.key` can contain:
@@ -647,6 +651,18 @@ export default function DeviceDetails({
       label: t("deviceDetails.security"),
       icon: <Shield className="h-4 w-4" />,
     },
+    // MDM Module: Apple MDM tab — only shown for MDM-enrolled devices
+    // (iOS/iPadOS, or macOS with MDM enrollment)
+    ...((device as any).mdmEnrolled || device.os === "ios" || device.os === "ipados" || device.os === "macos"
+      ? [{
+          id: "mdm" as Tab,
+          primary: true,
+          group: groups.management,
+          label: "MDM",
+          icon: <Smartphone className="h-4 w-4" />,
+          title: "Apple MDM — profiles, commands, and device management",
+        }]
+      : []),
     {
       id: "playbooks",
       group: groups.management,
@@ -1106,6 +1122,23 @@ export default function DeviceDetails({
           // backup-module type for a status it can never actually see.
           deviceStatus={device.status === "unknown" ? undefined : device.status}
           timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "mdm" && (
+        <MdmDeviceTab
+          deviceId={device.id}
+          device={{
+            id: device.id,
+            hostname: device.hostname,
+            osType: device.os,
+            mdmEnrolled: (device as any).mdmEnrolled,
+            mdmUdId: (device as any).mdmUdId,
+            mdmModelName: (device as any).mdmModelName,
+            mdmSupervised: (device as any).mdmSupervised,
+            mdmLastCheckin: (device as any).mdmLastCheckin,
+            mdmEnrollmentType: (device as any).mdmEnrollmentType,
+          }}
         />
       )}
 

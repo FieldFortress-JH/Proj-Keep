@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import MdmProfileList from '../../components/mdm/MdmProfileList';
+---
+
+<DashboardLayout titleKey="titles.mdmProfiles">
+  <MdmProfileList client:load />
+</DashboardLayout>

@@ -135,7 +135,7 @@ export type DeviceStatus =
    * untrustworthy.
    */
   | "unknown";
-export type OSType = "windows" | "macos" | "linux";
+export type OSType = "windows" | "macos" | "linux" | "ios" | "ipados";
 
 /**
  * Presentation-level discriminator for the unified Devices list (#1322, #4622).
@@ -214,6 +214,26 @@ export type Device = {
   helperVersion?: string | null;
   /** Agent-reported Breeze Assist install problem (#6925); null/absent = none. */
   helperInstallIssue?: string | null;
+
+  // ─── MDM Module (Apple native MDM) ───
+  /** Whether this device is enrolled in Apple MDM */
+  mdmEnrolled?: boolean;
+  /** Apple Unique Device ID */
+  mdmUdId?: string | null;
+  /** Apple-reported serial number */
+  mdmSerialNumber?: string | null;
+  /** Apple product identifier (e.g., "iPhone14,2") */
+  mdmProduct?: string | null;
+  /** Human-readable model name (e.g., "iPhone 15 Pro") */
+  mdmModelName?: string | null;
+  /** Whether the device is supervised (ABM-enrolled) */
+  mdmSupervised?: boolean;
+  /** Whether Activation Lock is enabled */
+  mdmActivationLockEnabled?: boolean;
+  /** Last MDM check-in time */
+  mdmLastCheckin?: string | null;
+  /** How the device enrolled (manual | abm_ade | user_enrollment) */
+  mdmEnrollmentType?: string | null;
   /**
    * Control-plane URL the agent last heartbeated to (devices.agent_server_url,
    * #2288). The opt-in Server column renders only its hostname. Any current
@@ -649,6 +669,8 @@ const osLabels: Record<OSType, string> = {
   windows: "Windows",
   macos: "macOS",
   linux: "Linux",
+  ios: "iOS",
+  ipados: "iPadOS",
 };
 
 type SortField = ColumnId | null;
