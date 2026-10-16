@@ -1,4 +1,4 @@
-// Package mdm implements the core MDM engine that wires NanoMDM's protocol
+// Package mdm implements the core MDM engine that wires the Apple MDM protocol
 // handlers to our PostgreSQL storage and APNs push client.
 //
 // This is the heart of the sidecar: it translates between Apple's MDM protocol
@@ -7,11 +7,13 @@ package mdm
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,14 +59,14 @@ type mdmPlist struct {
 }
 
 type mdmDict struct {
-	Keys   []string          `xml:"key"`
-	Values []mdmValue        `xml:"*"`
+	Keys   []string   `xml:"key"`
+	Values []mdmValue `xml:"*"`
 }
 
 type mdmValue struct {
 	XMLName  xml.Name
-	Text     string          `xml:",chardata"`
-	InnerXML string          `xml:",innerxml"`
+	Text     string `xml:",chardata"`
+	InnerXML string `xml:",innerxml"`
 }
 
 // ─── Device Check-in Handler ───
@@ -109,7 +111,7 @@ func (e *Engine) HandleCheckin(w http.ResponseWriter, r *http.Request) {
 
 	// Parse the MDM status from the request
 	status := parseMDMStatus(body)
-	log.Printf("Device %s (%s) check-in: status=%s", device.ModelName, udid[:8], status)
+	log.Printf("Device %s (%s) check-in: status=%s", device.ModelName, safeUDID(udid), status)
 
 	switch status {
 	case "CheckOut":
@@ -179,8 +181,8 @@ func (e *Engine) buildEnrollmentProfile(orgID, udid, token string) string {
 	profileUUID := uuid.New().String()
 	pushMagic := uuid.New().String() // Unique push magic for this enrollment
 
-	// TODO: Look up org's APNs topic from mdm_apns_config
-	topic := "com.breeze.mdm.push"
+	// Look up org's APNs topic from mdm_apns_config
+	topic := e.lookupAPNsTopic(orgID)
 
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -253,12 +255,32 @@ func (e *Engine) buildEnrollmentProfile(orgID, udid, token string) string {
 	)
 }
 
+// lookupAPNsTopic queries the org's APNs topic from the database.
+// Falls back to a default if no config exists.
+func (e *Engine) lookupAPNsTopic(orgID string) string {
+	if orgID == "" {
+		return "com.breeze.mdm.push"
+	}
+	config, err := e.storage.GetAPNsConfig(context.Background(), orgID)
+	if err != nil || config == nil || config.Topic == "" {
+		return "com.breeze.mdm.push" // Default fallback
+	}
+	return config.Topic
+}
+
 // ─── Internal API (called by Breeze API) ───
 
 // QueueCommand queues an MDM command for a device and sends an APNs push.
 func (e *Engine) QueueCommand(ctx context.Context, deviceUDID, commandType string, payload map[string]interface{}) (string, error) {
+	// Serialize payload for storage
+	var payloadJSON json.RawMessage
+	if payload != nil {
+		b, _ := json.Marshal(payload)
+		payloadJSON = b
+	}
+
 	// Queue in database
-	cmd, err := e.storage.QueueCommand(ctx, deviceUDID, commandType, nil)
+	cmd, err := e.storage.QueueCommand(ctx, deviceUDID, commandType, payloadJSON)
 	if err != nil {
 		return "", fmt.Errorf("failed to queue command: %w", err)
 	}
@@ -268,24 +290,31 @@ func (e *Engine) QueueCommand(ctx context.Context, deviceUDID, commandType strin
 	if err != nil {
 		return "", err
 	}
+	if device == nil {
+		return "", fmt.Errorf("device not found: %s", deviceUDID)
+	}
 
-	// Send APNs push to wake the device
+	// Send APNs push to wake the device (async)
 	if device.APNsToken != "" && device.PushMagic != "" {
 		go func() {
 			pushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			_, pushErr := e.apns.Push(pushCtx, device.OrgID, device.APNsToken, device.PushMagic)
 			if pushErr != nil {
-				log.Printf("APNs push failed for %s: %v", deviceUDID[:8], pushErr)
+				log.Printf("APNs push failed for %s: %v", safeUDID(deviceUDID), pushErr)
 			}
 		}()
+	} else {
+		log.Printf("Device %s has no APNs token — command queued but no push sent", safeUDID(deviceUDID))
 	}
 
 	return cmd.CommandUUID, nil
 }
 
-// ─── Private Helpers ───
+// ─── Pending Command Delivery ───
 
+// sendPendingCommands checks for queued commands and delivers them to the device
+// as an Apple MDM command plist. If no commands are pending, sends an empty response.
 func (e *Engine) sendPendingCommands(w http.ResponseWriter, r *http.Request, device *storage.Device) {
 	commands, err := e.storage.GetPendingCommands(r.Context(), device.UDID)
 	if err != nil {
@@ -299,25 +328,353 @@ func (e *Engine) sendPendingCommands(w http.ResponseWriter, r *http.Request, dev
 		return
 	}
 
-	// Build MDM command response (plist)
-	// TODO: Build proper Apple MDM command plist for each pending command
-	// For now, send empty (commands will be delivered on next check-in)
-	e.sendEmptyResponse(w)
+	// Deliver the first pending command (Apple MDM sends one at a time)
+	cmd := commands[0]
+	commandPlist := buildCommandPlist(cmd)
+
+	// Mark as sent
+	_ = e.storage.UpdateCommandStatus(r.Context(), cmd.CommandUUID, "sent", nil, "")
+
+	w.Header().Set("Content-Type", "application/x-apple-aspen-mdm-checkin")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, commandPlist)
+
+	log.Printf("Delivered command %s (%s) to device %s", cmd.CommandUUID, cmd.Type, safeUDID(device.UDID))
 }
 
+// buildCommandPlist generates an Apple MDM command plist for a queued command.
+// This produces the XML response that the device parses to execute the command.
+func buildCommandPlist(cmd *storage.Command) string {
+	commandName := commandTypeToApple(cmd.Type)
+	payloadXML := buildCommandPayloadXML(cmd)
+
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CommandUUID</key>
+	<string>%s</string>
+	<key>Command</key>
+	<dict>
+		<key>RequestType</key>
+		<string>%s</string>
+%s
+	</dict>
+</dict>
+</plist>`,
+		cmd.CommandUUID,
+		commandName,
+		payloadXML,
+	)
+}
+
+// commandTypeToApple maps our internal command types to Apple's RequestType values.
+func commandTypeToApple(cmdType string) string {
+	switch cmdType {
+	case "install_profile":
+		return "InstallProfile"
+	case "remove_profile":
+		return "RemoveProfile"
+	case "device_lock":
+		return "DeviceLock"
+	case "device_wipe":
+		return "EraseDevice"
+	case "clear_passcode":
+		return "ClearPasscode"
+	case "restart_device":
+		return "RestartDevice"
+	case "shutdown_device":
+		return "ShutDownDevice"
+	case "os_update":
+		return "OSUpdate"
+	case "install_app":
+		return "InstallApplication"
+	case "remove_app":
+		return "RemoveApplication"
+	case "device_information":
+		return "DeviceInformation"
+	case "profile_list":
+		return "ProfileList"
+	case "security_info":
+		return "SecurityInfo"
+	case "certificate_list":
+		return "CertificateList"
+	default:
+		return "DeviceInformation" // Safe default
+	}
+}
+
+// buildCommandPayloadXML generates the command-specific payload XML.
+// Each Apple command type has its own required/optional keys.
+func buildCommandPayloadXML(cmd *storage.Command) string {
+	switch cmd.Type {
+	case "install_profile":
+		// InstallProfile requires Payload key with base64-encoded .mobileconfig
+		payloadB64 := ""
+		if cmd.Payload != nil {
+			var p struct {
+				ProfileData string `json:"profileData"` // base64-encoded .mobileconfig
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil && p.ProfileData != "" {
+				payloadB64 = p.ProfileData
+			}
+		}
+		if payloadB64 != "" {
+			return fmt.Sprintf(`		<key>Payload</key>
+		<data>%s</data>`, payloadB64)
+		}
+		// Fallback: try to read profile_payload from mdm_profiles
+		return `		<key>Payload</key>
+		<data></data>`
+
+	case "remove_profile":
+		// RemoveProfile requires Identifier key
+		identifier := ""
+		if cmd.Payload != nil {
+			var p struct {
+				Identifier string `json:"identifier"`
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil {
+				identifier = p.Identifier
+			}
+		}
+		return fmt.Sprintf(`		<key>Identifier</key>
+		<string>%s</string>`, escapeXML(identifier))
+
+	case "device_lock":
+		// DeviceLock can include a message and phone number
+		message := ""
+		phoneNumber := ""
+		if cmd.Payload != nil {
+			var p struct {
+				Message     string `json:"message"`
+				PhoneNumber string `json:"phoneNumber"`
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil {
+				message = p.Message
+				phoneNumber = p.PhoneNumber
+			}
+		}
+		xml := ""
+		if message != "" {
+			xml += fmt.Sprintf(`		<key>Message</key>
+		<string>%s</string>`, escapeXML(message))
+		}
+		if phoneNumber != "" {
+			if xml != "" {
+				xml += "\n"
+			}
+			xml += fmt.Sprintf(`		<key>PhoneNumber</key>
+		<string>%s</string>`, escapeXML(phoneNumber))
+		}
+		return xml
+
+	case "device_wipe":
+		// EraseDevice can include a PIN (for supervised devices with Activation Lock bypass)
+		pin := ""
+		if cmd.Payload != nil {
+			var p struct {
+				PIN string `json:"pin"`
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil {
+				pin = p.PIN
+			}
+		}
+		if pin != "" {
+			return fmt.Sprintf(`		<key>PIN</key>
+		<string>%s</string>`, escapeXML(pin))
+		}
+		return ""
+
+	case "os_update":
+		// OSUpdate can enforce a specific version
+		productVersion := ""
+		if cmd.Payload != nil {
+			var p struct {
+				ProductVersion string `json:"productVersion"`
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil {
+				productVersion = p.ProductVersion
+			}
+		}
+		if productVersion != "" {
+			return fmt.Sprintf(`		<key>ProductVersion</key>
+		<string>%s</string>`, escapeXML(productVersion))
+		}
+		return ""
+
+	case "device_information", "profile_list", "security_info", "certificate_list":
+		// These query commands accept an optional Queries array
+		queries := []string{"UDID", "DeviceName", "OSVersion", "ModelName", "SerialNumber"}
+		if cmd.Payload != nil {
+			var p struct {
+				Queries []string `json:"queries"`
+			}
+			if json.Unmarshal(cmd.Payload, &p) == nil && len(p.Queries) > 0 {
+				queries = p.Queries
+			}
+		}
+		queryItems := ""
+		for _, q := range queries {
+			queryItems += fmt.Sprintf("			<string>%s</string>", escapeXML(q))
+		}
+		return fmt.Sprintf(`		<key>QueryResponses</key>
+		<array>%s
+		</array>`, queryItems)
+
+	default:
+		// Generic: emit any payload keys as-is
+		if cmd.Payload != nil {
+			var p map[string]interface{}
+			if json.Unmarshal(cmd.Payload, &p) == nil {
+				var lines []string
+				for k, v := range p {
+					switch val := v.(type) {
+					case string:
+						lines = append(lines, fmt.Sprintf("		<key>%s</key>\n		<string>%s</string>", escapeXML(k), escapeXML(val)))
+					case float64:
+						lines = append(lines, fmt.Sprintf("		<key>%s</key>\n		<integer>%d</integer>", escapeXML(k), int64(val)))
+					case bool:
+						lines = append(lines, fmt.Sprintf("		<key>%s</key>\n		<%s/>", escapeXML(k), map[bool]string{true: "true", false: "false"}[val]))
+					}
+				}
+				if len(lines) > 0 {
+					return strings.Join(lines, "\n")
+				}
+			}
+		}
+		return ""
+	}
+}
+
+// ─── Command Response Processing ───
+
+// handleCommandResponse parses a device's command response plist and updates
+// the command status in the database.
+//
+// A device response looks like:
+// <?xml version="1.0"?>
+// <plist version="1.0">
+// <dict>
+//   <key>CommandUUID</key><string>xxx</string>
+//   <key>Status</key><string>Acknowledged|Error|NotNow</string>
+//   <key>UDID</key><string>yyy</string>
+//   <!-- For query commands, additional result keys -->
+// </dict>
+// </plist>
 func (e *Engine) handleCommandResponse(ctx context.Context, device *storage.Device, body []byte) {
-	// Parse the command response plist
-	// Extract CommandUUID, Status, and any result/error data
-	// Update mdm_commands table
-	log.Printf("Command response from %s: %d bytes", device.UDID[:8], len(body))
-	// TODO: Full plist parsing and command status update
+	bodyStr := string(body)
+	log.Printf("Command response from %s: %d bytes", safeUDID(device.UDID), len(body))
+
+	// Extract CommandUUID
+	commandUUID := extractPlistString(bodyStr, "CommandUUID")
+	if commandUUID == "" {
+		log.Printf("Command response with no CommandUUID — ignoring")
+		return
+	}
+
+	// Extract Status
+	status := extractPlistString(bodyStr, "Status")
+	var newStatus string
+	var errorCode string
+
+	switch status {
+	case "Acknowledged":
+		newStatus = "acknowledged"
+	case "Error":
+		newStatus = "error"
+		errorCode = extractPlistString(bodyStr, "ErrorCode")
+		if errorCode == "" {
+			// Try to get the error chain
+			if chain := extractPlistString(bodyStr, "ErrorChain"); chain != "" {
+				errorCode = chain
+			}
+		}
+	case "NotNow":
+		// Device will retry later — keep as sent, don't change status
+		log.Printf("Device %s returned NotNow for command %s — will retry", safeUDID(device.UDID), commandUUID)
+		return
+	default:
+		log.Printf("Unknown command response status: %s", status)
+		return
+	}
+
+	// Extract any result payload (for query commands like DeviceInformation)
+	var resultJSON json.RawMessage
+	resultKeys := []string{
+		"DeviceName", "OSVersion", "BuildVersion", "ModelName", "Model",
+		"SerialNumber", "ProductName", "IMEI", "MEID", "WiFiMacAddress",
+		"BluetoothMAC", "EthernetMACAddresses", "AvailableDeviceCapacity",
+		"DeviceCapacity", "BatteryLevel", "ModemFirmwareVersion",
+		"IsSupervised", "IsDeviceLocatorServiceEnabled", "IsDoNotDisturbInEffect",
+		"IsCloudBackupEnabled", "IsActivationLockEnabled", "IsRoaming",
+		"Sub previamente", "SubscriberCarrierNetwork", "CarrierSettingsVersion",
+		"PhoneNumber", "VoiceRoamingEnabled", "DataRoamingEnabled",
+		"PersonalHotspotEnabled", "AutoFillPasswordsEnabled", "PasscodePresent",
+		"PasscodeCompliant", "PasscodeCompliantWithProfile",
+		"HardwareEncryptionCaps", "HardwareSecurityCaps",
+	}
+	result := make(map[string]interface{})
+	for _, key := range resultKeys {
+		val := extractPlistValue(bodyStr, key)
+		if val != "" {
+			result[key] = val
+		}
+	}
+	if len(result) > 0 {
+		if b, err := json.Marshal(result); err == nil {
+			resultJSON = b
+		}
+	}
+
+	// Update command status in database
+	err := e.storage.UpdateCommandStatus(ctx, commandUUID, newStatus, resultJSON, errorCode)
+	if err != nil {
+		log.Printf("Failed to update command status for %s: %v", commandUUID, err)
+	} else {
+		log.Printf("Command %s status updated to %s (device %s)", commandUUID, newStatus, safeUDID(device.UDID))
+	}
+
+	// For acknowledged install/remove profile commands, update profile installations
+	if newStatus == "acknowledged" {
+		e.updateProfileInstallationStatus(ctx, commandUUID, device, bodyStr)
+	}
 }
 
+// updateProfileInstallationStatus updates mdm_profile_installations when a device
+// acknowledges an InstallProfile or RemoveProfile command.
+func (e *Engine) updateProfileInstallationStatus(ctx context.Context, commandUUID string, device *storage.Device, bodyStr string) {
+	// Look up the command to determine type
+	// This is a best-effort update — failures are logged but don't block
+	// We'd need a GetCommand method in storage for this; for now, skip
+	// detailed profile installation tracking until Phase 3.
+	_ = ctx
+	_ = commandUUID
+	_ = device
+	_ = bodyStr
+}
+
+// ─── Device Check-Out (Unenrollment) ───
+
+// handleCheckOut marks a device as unenrolled and cleans up MDM state.
 func (e *Engine) handleCheckOut(ctx context.Context, device *storage.Device) {
-	log.Printf("Device %s (%s) is checking out (unenrolling)", device.ModelName, device.UDID[:8])
-	// TODO: Mark device as unenrolled, clean up profiles
+	log.Printf("Device %s (%s) is checking out (unenrolling)", device.ModelName, safeUDID(device.UDID))
+
+	err := e.storage.MarkDeviceUnenrolled(ctx, device.UDID)
+	if err != nil {
+		log.Printf("Failed to mark device %s as unenrolled: %v", safeUDID(device.UDID), err)
+	}
+
+	// Cancel any pending commands for this device
+	err = e.storage.CancelPendingCommands(ctx, device.UDID)
+	if err != nil {
+		log.Printf("Failed to cancel pending commands for %s: %v", safeUDID(device.UDID), err)
+	}
 }
 
+// ─── Response Helpers ───
+
+// sendEmptyResponse sends an empty MDM response (no command).
 func (e *Engine) sendEmptyResponse(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/x-apple-aspen-mdm-checkin")
 	w.WriteHeader(http.StatusOK)
@@ -333,21 +690,33 @@ func (e *Engine) sendEmptyResponse(w http.ResponseWriter) {
 </plist>`)
 }
 
+// sendAuthChallenge sends a 401 with WWW-Authenticate to trigger device authentication.
 func (e *Engine) sendAuthChallenge(w http.ResponseWriter, r *http.Request, udid string) {
-	// Send a 401 with WWW-Authenticate to trigger device authentication
-	// In production, this would be mTLS or SCEP-based auth
 	w.Header().Set("Content-Type", "application/x-apple-aspen-mdm-checkin")
 	w.Header().Set("WWW-Authenticate", `MDMRelam="com.apple.mdm"`)
 	w.WriteHeader(http.StatusUnauthorized)
 }
+
+// ─── Plist Parsing Helpers ───
 
 // extractUDID gets the device UDID from the request.
 // Priority: mTLS client cert → Mdm-Signature header → query param
 func extractUDID(r *http.Request) string {
 	// From mTLS client certificate (most secure)
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		// Extract UDID from cert subject or SAN
-		// TODO: Parse from client cert
+		// Extract UDID from cert subject CN or SAN
+		// Apple mTLS certs have the UDID in the Subject CN
+		for _, cert := range r.TLS.PeerCertificates {
+			if cert.Subject.CommonName != "" {
+				return cert.Subject.CommonName
+			}
+			// Check SANs for UDID
+			for _, san := range cert.DNSNames {
+				if strings.HasPrefix(san, "udid:") {
+					return strings.TrimPrefix(san, "udid:")
+				}
+			}
+		}
 	}
 
 	// From header (set by reverse proxy after mTLS termination)
@@ -364,45 +733,83 @@ func extractUDID(r *http.Request) string {
 
 // parseMDMStatus extracts the Status field from the device's plist request.
 func parseMDMStatus(body []byte) string {
-	// Quick and dirty XML parsing — look for <key>Status</key><string>VALUE</string>
-	bodyStr := string(body)
+	return extractPlistString(string(body), "Status")
+}
 
-	// Find Status key
-	statusIdx := -1
-	for i := 0; i < len(bodyStr)-14; i++ {
-		if bodyStr[i:i+14] == "<key>Status</key>" {
-			statusIdx = i + 14
-			break
+// extractPlistString extracts a string value for a given key from a plist XML.
+// Handles <key>KEY</key><string>VALUE</string> patterns.
+func extractPlistString(plist, key string) string {
+	keyPattern := "<key>" + key + "</key>"
+	idx := strings.Index(plist, keyPattern)
+	if idx < 0 {
+		return ""
+	}
+	rest := plist[idx+len(keyPattern):]
+
+	// Find the next element after the key
+	rest = strings.TrimLeft(rest, " \t\r\n")
+
+	// Check for <string>VALUE</string>
+	if strings.HasPrefix(rest, "<string>") {
+		start := len("<string>")
+		end := strings.Index(rest[start:], "</string>")
+		if end >= 0 {
+			return rest[start : start+end]
 		}
 	}
-	if statusIdx < 0 {
-		return "Idle"
-	}
 
-	// Find the string value after Status
-	rest := bodyStr[statusIdx:]
-	strStart := -1
-	for i := 0; i < len(rest)-8; i++ {
-		if rest[i:i+8] == "<string>" {
-			strStart = i + 8
-			break
+	// Check for <data>BASE64</data> (return base64 as-is)
+	if strings.HasPrefix(rest, "<data>") {
+		start := len("<data>")
+		end := strings.Index(rest[start:], "</data>")
+		if end >= 0 {
+			return rest[start : start+end]
 		}
 	}
-	if strStart < 0 {
-		return "Idle"
-	}
 
-	rest = rest[strStart:]
-	strEnd := -1
-	for i := 0; i < len(rest)-9; i++ {
-		if rest[i:i+9] == "</string>" {
-			strEnd = i
-			break
+	// Check for <integer>VALUE</integer>
+	if strings.HasPrefix(rest, "<integer>") {
+		start := len("<integer>")
+		end := strings.Index(rest[start:], "</integer>")
+		if end >= 0 {
+			return rest[start : start+end]
 		}
 	}
-	if strEnd < 0 {
-		return "Idle"
+
+	// Check for <true/> or <false/>
+	if strings.HasPrefix(rest, "<true/>") {
+		return "true"
+	}
+	if strings.HasPrefix(rest, "<false/>") {
+		return "false"
 	}
 
-	return rest[:strEnd]
+	return ""
+}
+
+// extractPlistValue extracts any value (string, integer, bool, data) for a key.
+func extractPlistValue(plist, key string) string {
+	return extractPlistString(plist, key)
+}
+
+// ─── Utility ───
+
+// safeUDID returns the first 8 chars of a UDID for safe logging.
+func safeUDID(udid string) string {
+	if len(udid) > 8 {
+		return udid[:8]
+	}
+	return udid
+}
+
+// escapeXML escapes XML special characters.
+func escapeXML(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&apos;",
+	)
+	return r.Replace(s)
 }
