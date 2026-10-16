@@ -1,0 +1,58 @@
+# Breeze MDM — Caddy routing include
+#
+# This file is meant to be included in the main Caddyfile.prod via:
+#   import Caddyfile.mdm
+#
+# Or merged manually into Caddyfile.prod under the site block.
+#
+# Routes /mdm/* to the MDM sidecar (breeze-mdm:8443).
+# Apple devices call these endpoints directly:
+#   GET  /mdm/enroll   — download enrollment profile (.mobileconfig)
+#   PUT  /mdm/mdm      — device check-in (poll for commands)
+#   PUT  /mdm/connect  — device command response
+#   POST /mdm/mdm      — same as PUT (some device types)
+#   POST /mdm/connect  — same as PUT (some device types)
+#
+# IMPORTANT: These endpoints must be reachable over public HTTPS.
+# Apple's APNs and MDM protocol require TLS with a publicly-trusted cert.
+# A self-signed/internal CA cert will NOT work for device enrollment.
+
+  # --- Apple MDM Protocol (device-facing, proxied to MDM sidecar) ---
+  # No compression — Apple's MDM protocol uses binary plist over HTTPS,
+  # and compression can interfere with some device HTTP stacks.
+  @mdmProtocol {
+    path /mdm/enroll
+    path /mdm/mdm
+    path /mdm/connect
+  }
+  handle @mdmProtocol {
+    # Forward the device's mTLS cert info if terminated at Caddy
+    # (for UDID extraction in the sidecar)
+    reverse_proxy breeze-mdm:8443 {
+      # Forward original host so the sidecar can build correct enrollment URLs
+      header_up Host {http.request.host}
+      header_up X-Real-IP {http.request.remote.host}
+      header_up X-Forwarded-For {http.request.remote.host}
+      header_up X-Forwarded-Proto {http.request.scheme}
+
+      # If mTLS is terminated at Caddy (not recommended for MDM — devices
+      # present their own certs), forward cert info:
+      # header_up X-MDM-UDID {http.vars.tls.client.subject_cn}
+
+      # No buffering for MDM protocol
+      flush_interval -1
+
+      # Longer timeout for device check-ins (devices hold connections open)
+      transport http {
+        read_timeout 120s
+        write_timeout 120s
+      }
+    }
+  }
+
+  # --- MDM health check (for monitoring, goes to sidecar) ---
+  @mdmHealth path /mdm/health
+  handle @mdmHealth {
+    rewrite * /health
+    reverse_proxy breeze-mdm:8443
+  }

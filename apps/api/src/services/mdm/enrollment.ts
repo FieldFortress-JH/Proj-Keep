@@ -9,7 +9,7 @@ import type { AuthContext } from '../../middleware/auth';
  *
  * Two enrollment paths:
  *   1. Manual — user downloads .mobileconfig from sidecar /mdm/enroll
- *   2. ABM/ADE — zero-touch via Apple Business Manager (Phase 5)
+ *   2. ABM/ADE — zero-touch via Apple Business Manager (Phase 3)
  */
 
 export interface EnrollmentToken {
@@ -44,7 +44,7 @@ export function generateEnrollmentToken(
 
   enrollmentTokens.set(token, enrollment);
 
-  // Clean up expired tokens periodically
+  // Clean up expired tokens
   setTimeout(() => enrollmentTokens.delete(token), 60 * 60 * 1000);
 
   return enrollment;
@@ -64,10 +64,14 @@ export function validateEnrollmentToken(token: string): EnrollmentToken | null {
 /**
  * Get the enrollment URL for the sidecar.
  * This is the URL users visit (or QR code data) to download the .mobileconfig.
+ *
+ * The token is included in the URL (the sidecar uses it to identify the org).
  */
 export function getEnrollmentUrl(token: string, sidecarBaseUrl?: string): string {
   const base = sidecarBaseUrl || process.env.MDM_SIDECAR_PUBLIC_URL || 'https://mdm.breeze.lan';
-  return `${base}/mdm/enroll?token=${token}`;
+  const enrollment = validateEnrollmentToken(token);
+  const orgId = enrollment?.orgId || '';
+  return `${base}/mdm/enroll?token=***}&org_id=${encodeURIComponent(orgId)}`;
 }
 
 /**
@@ -168,11 +172,11 @@ export async function updateMdmCheckin(deviceId: string) {
  * Get APNs config for an org.
  */
 export async function getApnsConfig(orgId: string) {
-  const [config] = await db
+  const [configRow] = await db
     .select()
     .from(mdmApnsConfig)
     .where(eq(mdmApnsConfig.orgId, orgId))
     .limit(1);
 
-  return config || null;
+  return configRow || null;
 }
