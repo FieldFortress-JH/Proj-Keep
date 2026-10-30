@@ -4,9 +4,13 @@
 // `{error: string}`, a plain `details: string[]` from hand-rolled route
 // validators, Hono's default `{message: string}`, and the legacy
 // pre-#2201 raw zod-validator `{error: {issues: [...]}}` / serialized
-// ZodError bodies (kept defensively for older deployed APIs).
+// ZodError bodies (kept defensively for older deployed APIs). When the
+// wrapper's `error` merely restates `details` as dotted JSON paths it is
+// dropped and the details render once with readable field labels (#8369).
 // Falling back to `new Error(obj)` produces `[object Object]` in the UI;
 // this function picks the most readable rendering of whatever we got.
+
+import { DISPLAY_ACRONYMS } from './displayAcronyms';
 
 type ZodIssue = { message?: string; path?: Array<string | number> };
 
@@ -22,12 +26,57 @@ function joinZodIssues(issues: unknown): string | null {
   return messages.length > 0 ? messages.join('; ') : null;
 }
 
+/**
+ * Turns a zod field path from the API's validation 400
+ * (`settings.contact.email`, `contacts.0.email`) into a readable field name
+ * (`Email`): the last non-index segment, split on camelCase/snake_case and
+ * sentence-cased (#8369). A trailing `Cents` is dropped — money fields such
+ * as the AI budgets are stored in cents but entered in dollars in the UI, so
+ * `monthlyBudgetCents` is "Monthly budget", matching the form label.
+ *
+ * Only the leaf is used, so `contact.email` and `billing.email` both read
+ * "Email" — the user is on the form that sent them. English-only by
+ * construction (it derives from the schema key, not a translation); still far
+ * closer to the form label than a JSON path.
+ */
+export function humanizeFieldPath(path: string): string {
+  const segments = path.split('.').filter((s) => s.length > 0 && !/^\d+$/.test(s));
+  const leaf = segments.at(-1);
+  if (!leaf) return path;
+  const base = leaf.replace(/^(.+?)(?:Cents|_cents)$/, '$1');
+  const words = base
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[\s_-]+/)
+    .filter((w) => w.length > 0)
+    .map((w) => DISPLAY_ACRONYMS[w.toLowerCase()] ?? w.toLowerCase());
+  if (words.length === 0) return path;
+  words[0] = words[0].charAt(0).toUpperCase() + words[0].slice(1);
+  return words.join(' ');
+}
+
+// "Email: Invalid email address" — but not "Slack webhook URL: Slack webhook
+// URL must be …" when the message already names the field.
+function labelFieldMessage(field: string, message: string): string {
+  const label = humanizeFieldPath(field);
+  const lowerMessage = message.toLowerCase();
+  const lowerLabel = label.toLowerCase();
+  if (lowerMessage.startsWith(lowerLabel) && !/[a-z]/i.test(message.charAt(label.length))) {
+    return message;
+  }
+  return `${label}: ${message}`;
+}
+
 // Renders a zod flatten payload ({formErrors: string[], fieldErrors:
 // Record<string, string[]>}) — emitted as `details` by every zValidator 400
-// via the shared wrapper (apps/api/src/lib/validation.ts, #2201; its `error`
-// string uses the same join rules so the two dedupe below) and by some route
-// validators (e.g. configuration-policy feature links).
-function joinZodFlatten(value: unknown): string | null {
+// via the shared wrapper (apps/api/src/lib/validation.ts, #2201) and by some
+// route validators (e.g. configuration-policy feature links).
+//
+// `rawPaths` reproduces the wrapper's own `error` string byte-for-byte (same
+// ordering and '; ' join, dotted JSON paths), which is how extractApiError
+// recognises that `error` is just the developer rendering of these details.
+// The default renders readable field labels instead (#8369).
+function joinZodFlatten(value: unknown, rawPaths = false): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const { formErrors, fieldErrors } = value as { formErrors?: unknown; fieldErrors?: unknown };
   const parts: string[] = [];
@@ -37,10 +86,29 @@ function joinZodFlatten(value: unknown): string | null {
     }
   }
   if (fieldErrors && typeof fieldErrors === 'object' && !Array.isArray(fieldErrors)) {
+    // Readable mode groups by the humanized label (#9533): every entry of an
+    // array field has its own dotted path (`ids.0`, `ids.1`), and two bad ids
+    // rendered "IDs: Invalid UUID; IDs: Invalid UUID". One label per field,
+    // each distinct message once, in first-seen order.
+    const byLabel = new Map<string, { field: string; messages: string[] }>();
     for (const [field, messages] of Object.entries(fieldErrors as Record<string, unknown>)) {
       if (!Array.isArray(messages)) continue;
       const valid = messages.filter((m): m is string => typeof m === 'string' && m.length > 0);
-      if (valid.length > 0) parts.push(`${field}: ${valid.join('; ')}`);
+      if (valid.length === 0) continue;
+      if (rawPaths) {
+        parts.push(`${field}: ${valid.join('; ')}`);
+        continue;
+      }
+      const label = humanizeFieldPath(field);
+      const entry = byLabel.get(label);
+      if (!entry) {
+        byLabel.set(label, { field, messages: [...new Set(valid)] });
+        continue;
+      }
+      for (const m of valid) if (!entry.messages.includes(m)) entry.messages.push(m);
+    }
+    for (const { field, messages } of byLabel.values()) {
+      parts.push(labelFieldMessage(field, messages.join('; ')));
     }
   }
   return parts.length > 0 ? parts.join('; ') : null;
@@ -132,7 +200,11 @@ export function extractApiError(data: unknown, fallback: string): string {
   const parts: string[] = [];
 
   if (typeof body.error === 'string' && body.error.length > 0) {
-    parts.push(body.error);
+    // The shared zValidator wrapper's `error` is the dotted-path rendering of
+    // the same flatten `details` (apps/api/src/lib/validation.ts). Skip it so
+    // the details render once, with readable field labels (#8369). Any other
+    // `error` (a route's own headline) is kept.
+    if (body.error !== joinZodFlatten(body.details, true)) parts.push(body.error);
   } else if (body.error && typeof body.error === 'object') {
     const errObj = body.error as { issues?: unknown; message?: unknown; name?: unknown };
     let fromError = joinZodIssues(errObj.issues);

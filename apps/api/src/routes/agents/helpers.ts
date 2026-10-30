@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import { randomBytes } from 'crypto';
-import { db, withSystemDbAccessContext } from '../../db';
+import { db, withSystemDbAccessContext, getCurrentDbAccessContext, withDbTransaction } from '../../db';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import {
   devices,
@@ -35,7 +35,6 @@ import {
   pamOrgConfig,
   agentVersions,
 } from '../../db/schema';
-import { getRedis } from '../../services/redis';
 import { publishEvent } from '../../services/eventBus';
 import { scheduleSoftwareComplianceCheck } from '../../jobs/softwareComplianceWorker';
 import {
@@ -44,6 +43,7 @@ import {
   recordSoftwareRemediationDecision
 } from '../metrics';
 import { queueCommandForExecution } from '../../services/commandQueue';
+import { releaseFilesystemScanGenerationForCommand } from '../../services/filesystemScanGenerationRelease';
 import { parseCisCollectorOutput } from '../../services/cisHardening';
 import {
   claimFilesystemScanGeneration,
@@ -56,7 +56,8 @@ import {
   saveFilesystemSnapshot,
   upsertFilesystemScanState,
 } from '../../services/filesystemAnalysis';
-import { recordSoftwarePolicyAudit } from '../../services/softwarePolicyService';
+import { evaluateSoftwarePolicyArming, recordSoftwarePolicyAudit } from '../../services/softwarePolicyService';
+import { MAX_DERIVED_SERVICE_WATCHES, serviceObservationKey } from '../../services/softwarePolicyServiceRules';
 import {
   resolvePatchConfigPolicyForDevice,
   patchExclusiveWindowsUpdateFromPolicySet,
@@ -66,6 +67,7 @@ import {
 import { resolveEffectiveWarrantyInlineSettings } from '../../services/warrantyPolicyResolution';
 import { hierarchyFor, type DeviceHierarchyOpts } from '../../services/deviceHierarchy';
 import { applicableCandidates, candidatesWithLink, policySetFor, type ApplicabilityRule, type DevicePolicySetOpts } from '../../services/devicePolicySet';
+import { devicePolicyCacheOrg, readDevicePolicyCache, writeDevicePolicyCache, type DevicePolicyCacheOpts } from '../../services/devicePolicyCache';
 import { warrantyHpCmslCollectionEffective } from '@breeze/shared/validators';
 import { policyOwnershipCondition } from '../../services/configPolicyOwnership';
 import { HARDWARE_MONITORING_DEFAULTS, hardwareMonitoringInlineSettingsSchema, type HardwareMonitoringInlineSettings } from '@breeze/shared';
@@ -79,9 +81,11 @@ import {
 } from '../../services/workloads/configUpdate';
 import { loadLegacyDirectConnection, type LegacyDirectConnection } from '../../services/m365DirectGraph';
 import { peekUserGroupMembershipCached, resolveUserGroupMembershipCached, type GroupMembershipResult } from '../../services/onedriveGraph';
-import { captureException } from '../../services/sentry';
+import { captureException, captureMessage } from '../../services/sentry';
 import { orgAgentUpdateConfigCache } from '../../services/agentOrgSettingsCache';
 import { isParkedDevice } from '../../services/unassignedPool/deliveryEligibility';
+import { checkDeviceRemoteToolsPolicy } from '../../services/aiRemoteToolsPolicy';
+import { recordFilesystemAutoTriggerSkipped, type FilesystemAutoTrigger } from '../../services/filesystemAnalysisPolicyMetrics';
 import { getBinaryEdition } from '../../services/binaryEdition';
 import { redactSecretsDeep, redactOptionalSecretText } from '../../services/secretRedaction';
 import { CloudflareMtlsService, parseIssuedLeafCertificate } from '../../services/cloudflareMtls';
@@ -92,15 +96,15 @@ import { MONITOR_KIND_SPECS, applyOverrides } from '../../services/monitors/kind
 import { monitorDefinitions } from '../../db/schema/monitorDefinitions';
 import { PAM_DEFAULTS, parsePamSettings, type PamSettings } from './pamSettings';
 import {
-  normalizeAgentUpdatePolicy,
-  type AgentUpdateSettings,
-} from './agentUpdatePolicy';
+  resolveAgentUpdateConfig,
+  type AgentUpdateConfig,
+  type AgentVersionPins,
+} from '../../services/agentUpdateConfig';
+import { type AgentUpdateSettings } from './agentUpdatePolicy';
 import {
   normalizeScanPath,
   osRootScanPath,
-  isAlwaysMaintenanceWindow,
   parseMaintenanceWindow,
-  resolveInheritedAgentVersionPins,
 } from '@breeze/shared';
 import {
   type SecurityProviderValue,
@@ -282,6 +286,11 @@ export function normalizeProvider(raw: unknown): SecurityProviderValue {
     case 'f_secure':
     case 'fsecure':
       return 'withsecure';
+    // CylancePROTECT, rebranded Aurora Endpoint Defense (#9178).
+    case 'cylance':
+      return 'cylance';
+    case 'unknown':
+      return 'unknown';
     default:
       return 'other';
   }
@@ -537,9 +546,18 @@ export async function upsertSecurityStatusForDevice(
   // it is the evidence behind the derived `realTimeProtection` boolean. See
   // #3641 / #3593.
   const preferredProduct = avProducts.find((p) => p.realTimeProtection) ?? avProducts[0];
-  const provider = normalizeProvider(payload.provider ?? preferredProduct?.provider);
   const avProductsValue = payload.avProducts ?? null;
   const realTimeProtection = payload.realTimeProtection ?? preferredProduct?.realTimeProtection ?? null;
+  // #8538: the agent marshals provider:"other" as its default even when every
+  // applicable AV source failed — the failure is signalled only by omitting
+  // realTimeProtection (#7965). "other" with an unknown protection reading is
+  // therefore "not collected", not an unmapped product (those carry a real
+  // true/false reading). Stored as 'unknown'.
+  const normalizedProvider = normalizeProvider(payload.provider ?? preferredProduct?.provider);
+  const provider: SecurityProviderValue =
+    normalizedProvider === 'other' && typeof payload.provider === 'string' && realTimeProtection === null
+      ? 'unknown'
+      : normalizedProvider;
   const threatCount = payload.threatCount ?? 0;
 
   await db
@@ -634,6 +652,77 @@ async function updateThreatStatusForAction(command: typeof deviceCommands.$infer
   }
 }
 
+const SCAN_RULE_SET_ERRORS_MAX = 50;
+const SCAN_RULE_SET_ERROR_DETAIL_MAX = 512;
+
+type ScanRuleSetError = { id: string; version?: number; code: string; detail?: string };
+
+function parseScanEngine(raw: unknown): 'yara' | 'legacy' | undefined {
+  return raw === 'yara' || raw === 'legacy' ? raw : undefined;
+}
+
+/**
+ * W02 C3 `ruleSetErrors`, bounded and shape-checked: entries without a string
+ * id and code are dropped, detail is capped at 512 chars, at most 50 entries.
+ * `undefined` when the agent sent no array at all (an agent older than W02).
+ */
+function parseRuleSetErrors(raw: unknown): ScanRuleSetError[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ScanRuleSetError[] = [];
+  for (const item of raw) {
+    if (!isObject(item)) continue;
+    const id = asString(item.id);
+    const code = asString(item.code);
+    if (!id || !code) continue;
+    const entry: ScanRuleSetError = { id: id.slice(0, 64), code: code.slice(0, 64) };
+    if (typeof item.version === 'number' && Number.isInteger(item.version) && item.version > 0) entry.version = item.version;
+    const detail = asString(item.detail);
+    if (detail) entry.detail = detail.slice(0, SCAN_RULE_SET_ERROR_DETAIL_MAX);
+    out.push(entry);
+    if (out.length >= SCAN_RULE_SET_ERRORS_MAX) break;
+  }
+  return out;
+}
+
+/**
+ * Dispatch-time errors first, then the agent's, de-duplicated on
+ * (id, version, code) so a retried result does not append twice; null when
+ * there are none.
+ */
+function mergeRuleSetErrors(existing: unknown, reported: ScanRuleSetError[]): ScanRuleSetError[] | null {
+  const merged: ScanRuleSetError[] = [];
+  const seen = new Set<string>();
+  for (const e of [...(parseRuleSetErrors(existing) ?? []), ...reported]) {
+    const key = `${e.id}|${e.version ?? ''}|${e.code}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(e);
+    if (merged.length >= SCAN_RULE_SET_ERRORS_MAX) break;
+  }
+  return merged.length > 0 ? merged : null;
+}
+
+/** id (lower-case) -> version, from `security_scans.dispatched_rule_sets`. */
+function dispatchedRuleSetVersions(raw: unknown): Map<string, number> {
+  const out = new Map<string, number>();
+  if (!Array.isArray(raw)) return out;
+  for (const entry of raw) {
+    if (!isObject(entry)) continue;
+    const id = asString(entry.id);
+    const version = entry.version;
+    if (id && typeof version === 'number' && Number.isInteger(version) && version > 0) out.set(id.toLowerCase(), version);
+  }
+  return out;
+}
+
+function withDispatchedRuleSetVersion(details: unknown, versions: Map<string, number>): unknown {
+  if (!isObject(details)) return details;
+  const { ruleSetVersion: _agentSupplied, ...rest } = details as Record<string, unknown>;
+  const ruleSetId = asString(rest.ruleSetId)?.toLowerCase();
+  const version = ruleSetId ? versions.get(ruleSetId) : undefined;
+  return version !== undefined ? { ...rest, ruleSetVersion: version } : rest;
+}
+
 export async function handleSecurityCommandResult(
   command: typeof deviceCommands.$inferSelect,
   resultData: z.infer<typeof commandResultSchema>
@@ -659,7 +748,12 @@ export async function handleSecurityCommandResult(
   if (command.type === securityCommandTypes.scan) {
     const payload = isObject(command.payload) ? command.payload : {};
     const scanType = asString(resultJson?.scanType) ?? asString(payload.scanType) ?? 'quick';
-    const scanRecordId = asString(resultJson?.scanRecordId) ?? asString(payload.scanRecordId);
+    // #6263 W05-9: the scan this COMMAND was dispatched for — bound by
+    // security_scans.command_id (stamped at dispatch), then by the command's
+    // own payload. The agent-reported id is only a fallback for a command with
+    // neither (dispatched before W05 and its payload erased), and the lookup
+    // stays scoped to this device's scans either way.
+    const scanRecordId = asString(payload.scanRecordId) ?? asString(resultJson?.scanRecordId);
     const threatsValue = Array.isArray(resultJson?.threats) ? resultJson.threats : [];
     const threatsFoundRaw = resultJson?.threatsFound;
     const threatsFound = typeof threatsFoundRaw === 'number'
@@ -679,13 +773,44 @@ export async function handleSecurityCommandResult(
       ? 'failed'
       : timedOut ? 'timed_out' : 'completed';
 
-    let existingScan: { id: string } | undefined;
-    if (isUuid(scanRecordId)) {
-      [existingScan] = await db
-        .select({ id: securityScans.id })
-        .from(securityScans)
-        .where(and(eq(securityScans.id, scanRecordId), eq(securityScans.deviceId, command.deviceId)))
-        .limit(1);
+    // #6263 W03 (W02 C3): the agent's engine + per-set errors. Absent on
+    // agents that predate W02, in which case the dispatch outcome stands.
+    const agentEngine = parseScanEngine(resultJson?.engine);
+    const agentRuleSetErrors = parseRuleSetErrors(resultJson?.ruleSetErrors);
+
+    let existingScan:
+      | { id: string; engine: string | null; ruleSetErrors: unknown; dispatchedRuleSets: unknown }
+      | undefined;
+    [existingScan] = await db
+      .select({
+        id: securityScans.id,
+        engine: securityScans.engine,
+        ruleSetErrors: securityScans.ruleSetErrors,
+        dispatchedRuleSets: securityScans.dispatchedRuleSets,
+      })
+      .from(securityScans)
+      .where(
+        and(
+          eq(securityScans.deviceId, command.deviceId),
+          isUuid(scanRecordId)
+            ? or(eq(securityScans.commandId, command.id), eq(securityScans.id, scanRecordId))
+            : eq(securityScans.commandId, command.id),
+        ),
+      )
+      .orderBy(sql`(${securityScans.commandId} = ${command.id}) DESC NULLS LAST`)
+      .limit(1);
+
+    // Dispatched as YARA but the agent did not confirm an engine (a malformed
+    // value, or a build without the W02 result keys): never leave it looking
+    // like a clean YARA scan.
+    let reportedErrors = agentRuleSetErrors;
+    if (existingScan?.engine === 'yara' && !agentEngine) {
+      if (resultJson?.engine !== undefined) {
+        console.warn('[agents/helpers] security_scan reported an unknown engine', {
+          deviceId: command.deviceId, scanRecordId, engine: String(resultJson.engine).slice(0, 32),
+        });
+      }
+      reportedErrors = [...(agentRuleSetErrors ?? []), { id: '*', code: 'engine_unreported' }];
     }
 
     if (existingScan) {
@@ -696,7 +821,11 @@ export async function handleSecurityCommandResult(
           completedAt,
           duration: durationSeconds,
           threatsFound,
-          itemsScanned
+          itemsScanned,
+          ...(agentEngine ? { engine: agentEngine } : {}),
+          ...(reportedErrors !== undefined
+            ? { ruleSetErrors: mergeRuleSetErrors(existingScan.ruleSetErrors, reportedErrors) }
+            : {}),
         })
         .where(eq(securityScans.id, existingScan.id));
     } else {
@@ -710,12 +839,31 @@ export async function handleSecurityCommandResult(
         completedAt,
         threatsFound,
         duration: durationSeconds,
-        itemsScanned
+        itemsScanned,
+        engine: agentEngine ?? null,
+        ruleSetErrors: agentRuleSetErrors && agentRuleSetErrors.length > 0 ? agentRuleSetErrors : null,
+      });
+    }
+
+    // #6263 W02: a rule set that failed to compile/load on the agent is not a
+    // failed scan — surface it for operators and keep ingesting what was found.
+    if (Array.isArray(resultJson?.ruleSetErrors) && resultJson.ruleSetErrors.length > 0) {
+      console.warn('[agents/helpers] security_scan reported ruleSetErrors', {
+        deviceId: command.deviceId,
+        scanRecordId,
+        ruleSetErrors: resultJson.ruleSetErrors.slice(0, 20),
       });
     }
 
     if (resultData.status === 'completed' && threatsValue.length > 0) {
-      const provider = normalizeProvider(parsedStatus?.provider);
+      // DECISION W02-d: every security_scan threat (YARA and legacy-signature
+      // hits alike) is Breeze's own detection, not the device's AV product.
+      const provider = 'breeze' as const;
+      // #6263 W05-9: the version a threat matched is the one the scan was
+      // DISPATCHED with — the agent verifies the bundle's id/version/sha and
+      // the fetch route serves only that version. Server-authoritative: any
+      // agent-supplied ruleSetVersion is dropped.
+      const dispatchedVersions = dispatchedRuleSetVersions(existingScan?.dispatchedRuleSets);
       const inserts: Array<typeof securityThreats.$inferInsert> = [];
 
       for (const threat of threatsValue) {
@@ -741,7 +889,7 @@ export async function handleSecurityCommandResult(
           // chokepoint). AV records routinely embed the offending command line
           // or script fragment, so redact every string in the blob. quarantinedTo
           // is a local path and belongs in the details blob too.
-          details: redactSecretsDeep(threat)
+          details: withDispatchedRuleSetVersion(redactSecretsDeep(threat), dispatchedVersions)
         });
       }
 
@@ -1505,9 +1653,22 @@ export async function handleCisCommandResult(
     return;
   }
 
-  const completed = resultData.status === 'completed';
   const payloadDetails = isObject(payload.details) ? payload.details : null;
   const resultPayload = parseResultJson(resultData.stdout);
+  // #9604: the remediation's own `success` flag decides too, not just the
+  // command status. Agents before the fix report a remediation they could not
+  // apply as a COMPLETED command whose stdout says `{ success: false, error }`;
+  // fixed agents send a failed command. Only an explicit `false` flips the
+  // outcome, so a stdout without the field keeps the command status.
+  const agentReportedNotApplied = resultPayload?.success === false;
+  const completed = resultData.status === 'completed' && !agentReportedNotApplied;
+  const failureError = completed
+    ? null
+    : readTrimmedString(resultData.error)
+      ?? readTrimmedString(resultPayload?.error)
+      ?? (agentReportedNotApplied
+        ? 'Agent reported the remediation was not applied'
+        : `Remediation command ${resultData.status}`);
   const resultDetails = resultPayload && isObject(resultPayload.details)
     ? resultPayload.details
     : null;
@@ -1538,7 +1699,10 @@ export async function handleCisCommandResult(
     commandId: command.id,
     commandStatus: resultData.status,
     exitCode: resultData.exitCode ?? null,
-    error: resultData.error ?? null,
+    error: completed ? (resultData.error ?? null) : failureError,
+    // Older agents send `completed` + `success:false`; this explains why the
+    // action reads failed while commandStatus reads completed.
+    ...(agentReportedNotApplied ? { agentReportedNotApplied: true } : {}),
     stderr: resultData.stderr ?? null,
     completedAt: new Date().toISOString(),
   };
@@ -1595,11 +1759,47 @@ export function getFilesystemThresholdScanPath(osType: unknown): string {
   return osRootScanPath(osType);
 }
 
+const FILESYSTEM_POLICY_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
+const filesystemPolicySkipLoggedAt = new Map<string, number>();
+// A refused threshold scan writes no snapshot/command row, so the DB cooldown
+// never engages for that device. Remember the refusal briefly so a locked-down
+// device at >= threshold does not repeat the cooldown selects and policy lookup
+// on every heartbeat.
+const FILESYSTEM_POLICY_DENY_TTL_MS = 5 * 60 * 1000;
+const filesystemThresholdDeniedUntil = new Map<string, number>();
+
+/**
+ * The automatic triggers (disk-threshold scan, auto-resume continuation) must
+ * honour the same per-device remote-tools policy the REST route and AI tools
+ * enforce (#8509). Fail-closed via `checkDeviceRemoteToolsPolicy`. A refusal
+ * is counted and logged at most once an hour per device+trigger; not Sentry.
+ */
+async function automaticFilesystemScanAllowed(
+  deviceId: string,
+  trigger: FilesystemAutoTrigger,
+): Promise<boolean> {
+  const decision = await checkDeviceRemoteToolsPolicy(deviceId);
+  if (decision.allowed) return true;
+  recordFilesystemAutoTriggerSkipped(trigger);
+  const key = `${deviceId}:${trigger}`;
+  const now = Date.now();
+  if (now - (filesystemPolicySkipLoggedAt.get(key) ?? 0) >= FILESYSTEM_POLICY_SKIP_LOG_INTERVAL_MS) {
+    filesystemPolicySkipLoggedAt.set(key, now);
+    console.warn(
+      `[agents/helpers] skipping automatic filesystem_analysis (${trigger}) for device ${deviceId}: ${decision.reason}`
+    );
+  }
+  return false;
+}
+
 export async function maybeQueueThresholdFilesystemAnalysis(
   device: Pick<typeof devices.$inferSelect, 'id' | 'osType' | 'orgId'>,
   diskPercent: number
 ): Promise<{ queued: boolean; path?: string; thresholdPercent?: number }> {
   if (!Number.isFinite(diskPercent) || diskPercent < filesystemDiskThresholdPercent) {
+    return { queued: false };
+  }
+  if ((filesystemThresholdDeniedUntil.get(device.id) ?? 0) > Date.now()) {
     return { queued: false };
   }
   // A device parked in a holding org receives lifecycle removal only.
@@ -1641,6 +1841,14 @@ export async function maybeQueueThresholdFilesystemAnalysis(
     return { queued: false };
   }
 
+  // Last, so an allowed device looks the policy up at most once per cooldown;
+  // a refused one is remembered for FILESYSTEM_POLICY_DENY_TTL_MS.
+  if (!(await automaticFilesystemScanAllowed(device.id, 'threshold'))) {
+    filesystemThresholdDeniedUntil.set(device.id, Date.now() + FILESYSTEM_POLICY_DENY_TTL_MS);
+    return { queued: false };
+  }
+  filesystemThresholdDeniedUntil.delete(device.id);
+
   const path = getFilesystemThresholdScanPath(device.osType);
   const [thresholdCommand] = await db.insert(deviceCommands).values({
     deviceId: device.id,
@@ -1674,12 +1882,31 @@ export async function maybeQueueThresholdFilesystemAnalysis(
   };
 }
 
+/**
+ * #8509/#8945: this scan ended without a result (agent refused it as
+ * scan_in_progress, or it failed / timed out). Producers register a command as its volume's scan generation when they queue
+ * it, so a dead command left as the generation would make another scan's
+ * (or an older good) result look superseded and be dropped. Release it — conditionally, so
+ * a newer producer's registration is never cleared. The running scan then
+ * claims through the NULL-generation branch of claimFilesystemScanGeneration.
+ */
+async function releaseFailedFilesystemScanGeneration(
+  command: typeof deviceCommands.$inferSelect,
+  status: string,
+): Promise<void> {
+  await releaseFilesystemScanGenerationForCommand(command, status);
+}
+
 export async function handleFilesystemAnalysisCommandResult(
   command: typeof deviceCommands.$inferSelect,
   resultData: z.infer<typeof commandResultSchema>,
   orgId: string
 ): Promise<void> {
   if (resultData.status !== 'completed') {
+    // #8509 (scan_in_progress refusal) and #8945 (any failed/timeout result):
+    // a scan that produced no result must not stay registered as the volume's
+    // generation, or older good results are dropped as superseded.
+    await releaseFailedFilesystemScanGeneration(command, resultData.status);
     return;
   }
 
@@ -1688,14 +1915,22 @@ export async function handleFilesystemAnalysisCommandResult(
   const snapshotTrigger = trigger === 'threshold' ? 'threshold' : 'on_demand';
   const scanMode = asString(payload.scanMode) === 'incremental' ? 'incremental' : 'baseline';
 
+  // #8024 (Sentry BREEZE-39): the drops below are reported with captureMessage
+  // and a registered event code, never captureException(new Error(...)).
+  // scrubEvent replaces an exception's value with '[redacted]', so the old
+  // reports all reached Sentry as one contentless "Error: [redacted]"
+  // attributed to this function: it read as the handler throwing, and nothing
+  // said which drop it was. The ids stay in the console line, out of the event.
   const parsed = parseFilesystemAnalysisStdout(resultData.stdout ?? '');
   if (Object.keys(parsed).length === 0) {
-    captureException(new Error(`filesystem_analysis command ${command.id} dropped: unparseable stdout`));
     // A completed scan whose stdout is empty or non-JSON produces no snapshot,
     // which surfaces to the user as an empty Disk Cleanup tab with no error.
     console.warn(
       `[agents/helpers] filesystem_analysis command ${command.id} (device ${command.deviceId}) completed with unparseable/empty stdout (len=${resultData.stdout?.length ?? 0}); no snapshot written`
     );
+    captureMessage('filesystem_analysis result dropped: unparseable stdout', {
+      eventCode: 'filesystem_analysis_result_unparseable',
+    });
     return;
   }
 
@@ -1711,10 +1946,12 @@ export async function handleFilesystemAnalysisCommandResult(
     .limit(1);
 
   if (!deviceRow) {
-    captureException(new Error(`filesystem_analysis command ${command.id} dropped: unknown device`));
     console.warn(
       `[agents/helpers] filesystem_analysis command ${command.id} has no devices row for ${command.deviceId}; no snapshot written`
     );
+    captureMessage('filesystem_analysis result dropped: unknown device', {
+      eventCode: 'filesystem_analysis_result_unknown_device',
+    });
     return;
   }
 
@@ -1728,8 +1965,22 @@ export async function handleFilesystemAnalysisCommandResult(
   // both writes, even when the caller catches a post-processing failure.
   const persisted = await db.transaction(async (tx) => {
     const claim = await claimFilesystemScanGeneration(command.deviceId, scanPath, command.id, tx, orgId);
-    if (claim === 'superseded' || claim === 'already_applied') {
-      captureException(new Error(`filesystem_analysis command ${command.id} dropped: ${claim}`));
+    if (claim === 'superseded') {
+      // Expected, not an error: a newer scan of this volume was queued after
+      // this one (a second click, the AI tool, a threshold or resume trigger)
+      // and owns the snapshot. Reporting it put every overlap in Sentry.
+      console.warn(
+        `[agents/helpers] filesystem_analysis command ${command.id} (device ${command.deviceId}) superseded by a newer scan of ${scanPath}; result not applied`
+      );
+      return null;
+    }
+    if (claim === 'already_applied') {
+      console.warn(
+        `[agents/helpers] filesystem_analysis command ${command.id} (device ${command.deviceId}) was already applied; duplicate result ignored`
+      );
+      captureMessage('filesystem_analysis result dropped: already applied', {
+        eventCode: 'filesystem_analysis_result_duplicate',
+      });
       return null;
     }
 
@@ -1842,6 +2093,12 @@ export async function handleFilesystemAnalysisCommandResult(
     return;
   }
 
+  // An operator who turned remote tools off stops the chain at its next step
+  // (no retroactive cancel of a scan already running on the device).
+  if (!(await automaticFilesystemScanAllowed(command.deviceId, 'auto_resume'))) {
+    return;
+  }
+
   const nextPayload: Record<string, unknown> = {
     ...(isObject(payload) ? payload : {}),
     path: scanPath,
@@ -1911,6 +2168,7 @@ export interface EventLogSettings {
   minimumLevel: EventLogLevel;
   collectionIntervalMinutes: number;
   rateLimitPerHour: number;
+  applicationProviders: string[];
 }
 
 export const EVENT_LOG_DEFAULTS: EventLogSettings = {
@@ -1923,6 +2181,7 @@ export const EVENT_LOG_DEFAULTS: EventLogSettings = {
   // NewEventLogCollector default.
   collectionIntervalMinutes: 15,
   rateLimitPerHour: 12000,
+  applicationProviders: [],
 };
 
 const LEVEL_PRIORITY: Record<string, number> = {
@@ -1939,7 +2198,7 @@ const EVENT_LOG_APPLICABILITY: ApplicabilityRule = { ownership: 'orgOrPartner', 
 type EventLogRankRow = {
   level: string; assignmentPriority: number; roleFilter: readonly string[] | null; osFilter: readonly string[] | null;
   retentionDays: number; maxEventsPerCycle: number; collectCategories: string[]; minimumLevel: string;
-  collectionIntervalMinutes: number; rateLimitPerHour: number;
+  collectionIntervalMinutes: number; rateLimitPerHour: number; applicationProviders: string[];
 };
 
 function eventLogSettingsFromRows(rows: EventLogRankRow[], device: { deviceRole: string; osType: string }): EventLogSettings {
@@ -1955,6 +2214,7 @@ function eventLogSettingsFromRows(rows: EventLogRankRow[], device: { deviceRole:
     minimumLevel: winner.minimumLevel as EventLogLevel,
     collectionIntervalMinutes: winner.collectionIntervalMinutes,
     rateLimitPerHour: winner.rateLimitPerHour,
+    applicationProviders: winner.applicationProviders ?? [],
   };
 }
 
@@ -1969,6 +2229,7 @@ async function resolveDeviceEventLogSettings(deviceId: string, opts?: DevicePoli
           roleFilter: candidate.roleFilter, osFilter: candidate.osFilter,
           retentionDays: link.eventLog.retentionDays, maxEventsPerCycle: link.eventLog.maxEventsPerCycle,
           collectCategories: link.eventLog.collectCategories, minimumLevel: link.eventLog.minimumLevel,
+          applicationProviders: link.eventLog.applicationProviders,
           collectionIntervalMinutes: link.eventLog.collectionIntervalMinutes, rateLimitPerHour: link.eventLog.rateLimitPerHour,
         }]
         : []), set.hierarchy);
@@ -2036,6 +2297,7 @@ async function resolveDeviceEventLogSettings(deviceId: string, opts?: DevicePoli
       minimumLevel: configPolicyEventLogSettings.minimumLevel,
       collectionIntervalMinutes: configPolicyEventLogSettings.collectionIntervalMinutes,
       rateLimitPerHour: configPolicyEventLogSettings.rateLimitPerHour,
+      applicationProviders: configPolicyEventLogSettings.applicationProviders,
     })
     .from(configPolicyAssignments)
     .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
@@ -2059,39 +2321,19 @@ const EVENT_LOG_CACHE_TTL_SECONDS = 120; // 2 minutes
 
 /**
  * Resolve event_log policy settings for a device via full hierarchy.
- * Uses Redis cache with 2-min TTL. Falls back to defaults if no policy found.
+ * Uses Redis cache with 2-min TTL, bound to the device's org (#8257; see
+ * services/devicePolicyCache). Falls back to defaults if no policy found.
  */
-export async function getDeviceEventLogSettings(deviceId: string, opts?: DevicePolicySetOpts): Promise<EventLogSettings> {
+export async function getDeviceEventLogSettings(deviceId: string, opts?: DevicePolicyCacheOpts): Promise<EventLogSettings> {
   // Validate before the cache short-circuit: a foreign hierarchy is a bug even on a hit.
-  hierarchyFor(deviceId, opts);
-  policySetFor(deviceId, opts);
-  const redis = getRedis();
-  const cacheKey = `eventlog:settings:device:${deviceId}`;
+  const cacheOrgId = devicePolicyCacheOrg(deviceId, opts);
 
-  // Try cache first
-  if (redis) {
-    try {
-      const cached = await redis.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached) as EventLogSettings;
-      }
-    } catch (cacheErr) {
-      console.warn(`[eventlog] Redis cache read failed for device ${deviceId}:`, cacheErr);
-    }
-  }
+  const cached = await readDevicePolicyCache<EventLogSettings>('eventlog', deviceId, cacheOrgId);
+  if (cached) return cached;
 
   // Resolve via full hierarchy: device → device_group → site → org → partner
   const settings = await resolveDeviceEventLogSettings(deviceId, opts);
-
-  // Cache the result
-  if (redis) {
-    try {
-      await redis.set(cacheKey, JSON.stringify(settings), 'EX', EVENT_LOG_CACHE_TTL_SECONDS);
-    } catch (cacheErr) {
-      console.warn(`[eventlog] Redis cache write failed for device ${deviceId}:`, cacheErr);
-    }
-  }
-
+  await writeDevicePolicyCache('eventlog', deviceId, cacheOrgId, settings, EVENT_LOG_CACHE_TTL_SECONDS);
   return settings;
 }
 
@@ -2100,11 +2342,12 @@ export async function getDeviceEventLogSettings(deviceId: string, opts?: DeviceP
  * Returns agent-facing settings, including defaults when no policy is assigned.
  * This ensures stale non-default agent settings get reset after policy removal.
  */
-export async function buildEventLogConfigUpdate(deviceId: string, opts?: DevicePolicySetOpts): Promise<{
+export async function buildEventLogConfigUpdate(deviceId: string, opts?: DevicePolicyCacheOpts): Promise<{
   max_events_per_cycle: number;
   collect_categories: string[];
   minimum_level: string;
   collection_interval_minutes: number;
+  application_providers: string[];
 }> {
   const settings = await getDeviceEventLogSettings(deviceId, opts);
 
@@ -2113,6 +2356,8 @@ export async function buildEventLogConfigUpdate(deviceId: string, opts?: DeviceP
     collect_categories: settings.collectCategories,
     minimum_level: settings.minimumLevel,
     collection_interval_minutes: settings.collectionIntervalMinutes,
+    // Cached settings from the previous release do not yet carry this field.
+    application_providers: settings.applicationProviders ?? [],
   };
 }
 
@@ -2255,34 +2500,17 @@ export async function resolveDeviceHardwareMonitoringPolicy(deviceId: string): P
 export const HARDWARE_MONITORING_CACHE_TTL_SECONDS = 120;
 
 /**
- * Resolve hardware-monitoring settings for a device with a 2-min Redis cache,
- * matching `getDeviceEventLogSettings`.
+ * Resolve hardware-monitoring settings for a device with a 2-min Redis cache
+ * bound to the device's org, matching `getDeviceEventLogSettings`.
  */
-export async function getDeviceHardwareMonitoringSettings(deviceId: string, opts?: DevicePolicySetOpts): Promise<HardwareMonitoringInlineSettings> {
-  hierarchyFor(deviceId, opts);
-  policySetFor(deviceId, opts);
-  const redis = getRedis();
-  const cacheKey = `hwmon:settings:device:${deviceId}`;
+export async function getDeviceHardwareMonitoringSettings(deviceId: string, opts?: DevicePolicyCacheOpts): Promise<HardwareMonitoringInlineSettings> {
+  const cacheOrgId = devicePolicyCacheOrg(deviceId, opts);
 
-  if (redis) {
-    try {
-      const cached = await redis.get(cacheKey);
-      if (cached) return hardwareMonitoringInlineSettingsSchema.parse(JSON.parse(cached));
-    } catch (cacheErr) {
-      console.warn(`[hardware-health] settings cache read failed for device ${deviceId}:`, cacheErr);
-    }
-  }
+  const cached = await readDevicePolicyCache('hwmon', deviceId, cacheOrgId, (v) => hardwareMonitoringInlineSettingsSchema.parse(v));
+  if (cached) return cached;
 
   const settings = await resolveDeviceHardwareMonitoringSettings(deviceId, opts);
-
-  if (redis) {
-    try {
-      await redis.set(cacheKey, JSON.stringify(settings), 'EX', HARDWARE_MONITORING_CACHE_TTL_SECONDS);
-    } catch (cacheErr) {
-      console.warn(`[hardware-health] settings cache write failed for device ${deviceId}:`, cacheErr);
-    }
-  }
-
+  await writeDevicePolicyCache('hwmon', deviceId, cacheOrgId, settings, HARDWARE_MONITORING_CACHE_TTL_SECONDS);
   return settings;
 }
 
@@ -2290,7 +2518,7 @@ export async function getDeviceHardwareMonitoringSettings(deviceId: string, opts
  * Build hardware_monitoring config update payload for heartbeat response.
  * Returns agent-facing settings, including defaults when no policy is assigned.
  */
-export async function buildHardwareMonitoringConfigUpdate(deviceId: string, opts?: DevicePolicySetOpts): Promise<{
+export async function buildHardwareMonitoringConfigUpdate(deviceId: string, opts?: DevicePolicyCacheOpts): Promise<{
   enabled: boolean;
   poll_interval_minutes: number;
   disk_health_interval_minutes: number;
@@ -2549,6 +2777,114 @@ async function resolveMonitorDerivedWatches(deviceId: string, opts?: DevicePolic
   return { kind: 'resolved', watches };
 }
 
+// ============================================
+// #6958 PR E: service watches derived from software-policy compliance
+// ============================================
+
+/** A compliance row older than this no longer contributes watches. */
+export const SOFTWARE_SERVICE_WATCH_STALE_MS = 30 * 60 * 1000;
+/** `check_interval_seconds` when derived software watches are the only watches. */
+export const SOFTWARE_SERVICE_ONLY_CHECK_INTERVAL_SECONDS = 300;
+
+/**
+ * Who can hold a software_compliance_status row for this device: the
+ * software_policy resolver's rule (resolveSoftwarePolicyForDevice:
+ * loadDeviceHierarchy drops the partner — ownership AND target — for an
+ * unassigned_pool org; SQL role/OS filter). The security_agents resolver uses
+ * the same rule over a SUBSET of the device's groups (execution-safe ones),
+ * so this rule admits a superset of both: the pre-filter below can only ever
+ * say "maybe" too often, never "no" wrongly.
+ */
+const SOFTWARE_SERVICE_WATCH_APPLICABILITY: ApplicabilityRule = {
+  ownership: 'orgOrPartnerUnlessUnassignedPool', partnerTarget: 'partnerUnlessUnassignedPool', roleOs: 'sql',
+};
+
+/**
+ * The service watches the software compliance worker derived for this device
+ * (`software_compliance_status.service_watches`, from `service_running`
+ * clauses of allowlist rules' catalog versions).
+ *
+ * - Read in the CALLER'S OWN context (agent: org-scoped with currentPartnerId,
+ *   so a partner-wide policy is legible through
+ *   `software_policies_partner_wide_select`; the compliance row through the
+ *   device-join policy). Never a system escape (#2417 / #1105).
+ * - Only rows refreshed within SOFTWARE_SERVICE_WATCH_STALE_MS, of ACTIVE
+ *   policies.
+ * - `auto_restart` is re-derived from the LIVE policy row on every resolution
+ *   (`evaluateSoftwarePolicyArming(…, 'install')`), never stored: disarming
+ *   or deactivating a policy revokes restart authority without waiting for
+ *   the row to age out. A name under several policies is armed if any is. The
+ *   result is cached for MONITORING_CACHE_TTL_SECONDS (120 s) by
+ *   buildMonitoringConfigUpdate, so a cached entry can carry `auto_restart:
+ *   true` for up to 120 s after a disarm — accepted (plan Review Focus 3).
+ * - #8142: on the heartbeat the beat's policy set is passed in; when no
+ *   applicable candidate carries a `software_policy` or `security_agents`
+ *   link, no compliance row can exist for the device, so the answer is []
+ *   with ZERO statements. Without a set (display path, set-load error) the
+ *   query runs.
+ * - Deduped case-insensitively (watchKey semantics), sorted, capped at
+ *   MAX_DERIVED_SERVICE_WATCHES.
+ */
+export async function resolveSoftwarePolicyServiceWatches(
+  deviceId: string,
+  opts?: DevicePolicySetOpts,
+): Promise<MonitoringWatchConfig[]> {
+  const set = policySetFor(deviceId, opts);
+  if (set) {
+    const linked = applicableCandidates(set, SOFTWARE_SERVICE_WATCH_APPLICABILITY)
+      .some((c) => c.links.software_policy !== undefined || c.links.security_agents !== undefined);
+    if (!linked) return [];
+  }
+
+  const rows = await db
+    .select({
+      serviceWatches: softwareComplianceStatus.serviceWatches,
+      mode: softwarePolicies.mode,
+      enforceMode: softwarePolicies.enforceMode,
+      remediationOptions: softwarePolicies.remediationOptions,
+    })
+    .from(softwareComplianceStatus)
+    .innerJoin(softwarePolicies, eq(softwarePolicies.id, softwareComplianceStatus.policyId))
+    .where(and(
+      eq(softwareComplianceStatus.deviceId, deviceId),
+      eq(softwarePolicies.isActive, true),
+      gt(softwareComplianceStatus.lastChecked, new Date(Date.now() - SOFTWARE_SERVICE_WATCH_STALE_MS)),
+      isNotNull(softwareComplianceStatus.serviceWatches),
+    ));
+
+  const byKey = new Map<string, { name: string; armed: boolean }>();
+  for (const row of rows) {
+    if (!Array.isArray(row.serviceWatches)) continue;
+    const armed = evaluateSoftwarePolicyArming(
+      { mode: row.mode, enforceMode: row.enforceMode, remediationOptions: row.remediationOptions },
+      'install',
+    ).armed;
+    for (const entry of row.serviceWatches as unknown[]) {
+      const name = entry && typeof entry === 'object' ? (entry as { name?: unknown }).name : undefined;
+      if (typeof name !== 'string' || name.length === 0) continue;
+      const key = serviceObservationKey(name);
+      const existing = byKey.get(key);
+      if (existing) existing.armed = existing.armed || armed;
+      else byKey.set(key, { name, armed });
+    }
+  }
+
+  return Array.from(byKey.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, MAX_DERIVED_SERVICE_WATCHES)
+    .map(([, { name, armed }]) => ({
+      watch_type: 'service' as const,
+      name,
+      // The agent alerts on derived watches through monitoring.check_failed;
+      // software-compliance alerting itself is #6960 W3.
+      alert_on_stop: false,
+      alert_after_consecutive_failures: MONITOR_WATCH_DEFAULTS.alertAfterConsecutiveFailures,
+      auto_restart: armed,
+      max_restart_attempts: MONITOR_WATCH_DEFAULTS.maxRestartAttempts,
+      restart_cooldown_seconds: MONITOR_WATCH_DEFAULTS.restartCooldownSeconds,
+    }));
+}
+
 /**
  * Outcome of resolving a device's monitoring config. Three states, because the
  * wire has three meanings (#2949):
@@ -2593,13 +2929,24 @@ async function resolveDeviceMonitoringSettings(deviceId: string, opts?: DevicePo
   const monitorWatches = monitorResult.watches;
   const policy = policyResult.kind === 'resolved' ? policyResult.settings : null;
 
+  // #6958 PR E: software-policy-derived service watches. A monitor watch of the
+  // same service (watchKey, case-insensitive) WINS: its alerting and restart
+  // settings are what the operator authored for that service.
+  const monitorServiceKeys = new Set(monitorWatches
+    .filter((w) => w.watch_type === 'service')
+    .map((w) => serviceObservationKey(w.name)));
+  const derivedWatches = (await resolveSoftwarePolicyServiceWatches(deviceId, opts))
+    .filter((w) => !monitorServiceKeys.has(serviceObservationKey(w.name)));
+
   // Nothing applies: no policy resolved AND no monitor contributes a watch.
   // This is an authoritative answer, so it is sent as an explicit empty watch
   // set — the agent's ApplyConfig stops the monitor and drops every watch
   // state on `watches: []` (agent/internal/monitoring/monitor.go), and has
   // since monitoring first shipped. Omitting the key instead reads as "no
   // change" on the agent and strands the last delivered watches (#2949).
-  if (!policy && monitorWatches.length === 0) {
+  // Derived watches count too: answering `watches: []` here would make the
+  // agent drop them.
+  if (!policy && monitorWatches.length === 0 && derivedWatches.length === 0) {
     return {
       kind: 'none_applies',
       settings: { check_interval_seconds: MONITOR_ONLY_CHECK_INTERVAL_SECONDS, watches: [] },
@@ -2609,8 +2956,9 @@ async function resolveDeviceMonitoringSettings(deviceId: string, opts?: DevicePo
   return {
     kind: 'resolved',
     settings: {
-      check_interval_seconds: policy?.check_interval_seconds ?? MONITOR_ONLY_CHECK_INTERVAL_SECONDS,
-      watches: monitorWatches,
+      check_interval_seconds: policy?.check_interval_seconds
+        ?? (monitorWatches.length > 0 ? MONITOR_ONLY_CHECK_INTERVAL_SECONDS : SOFTWARE_SERVICE_ONLY_CHECK_INTERVAL_SECONDS),
+      watches: [...monitorWatches, ...derivedWatches],
     },
   };
 }
@@ -2765,23 +3113,45 @@ async function resolvePolicyCheckInterval(deviceId: string, opts?: DevicePolicyS
 
 const MONITORING_CACHE_TTL_SECONDS = 120; // 2 minutes
 
-export async function buildMonitoringConfigUpdate(deviceId: string, opts?: DevicePolicySetOpts): Promise<MonitoringConfigUpdate | null> {
-  hierarchyFor(deviceId, opts);
-  policySetFor(deviceId, opts);
-  const redis = getRedis();
-  const cacheKey = `monitoring:settings:device:${deviceId}`;
+/**
+ * #8287: the device's CURRENT watch set for DISPLAY filtering from a user
+ * request (summary, status, tab-counts). Same resolver the agent heartbeat
+ * uses, but:
+ *  - runs in the CALLER'S OWN DB context — no system escalation (#2417) and no
+ *    second pooled connection under the request transaction (#1105). Partner-
+ *    wide policies/monitors are legible because their tables carry the
+ *    SELECT-only `org_id IS NULL AND partner_id = breeze_current_partner_id()`
+ *    branch, fed by `currentPartnerId` from `buildDbAccessContext`;
+ *  - never writes `monitoring:settings:device:*` (only reads it), so a
+ *    user-scoped answer can never poison the cache the agent heartbeat reads;
+ *    and reads it only for `orgId`, the device's org as the caller loaded it,
+ *    so an entry from before an org move is never shown (#8257).
+ *
+ * Returns null — "unknown, do not filter" — when:
+ *  - the device vanished mid-resolution;
+ *  - there is no ambient context, or a non-system context has no
+ *    `currentPartnerId` (e.g. organization-scope SSO sessions mint
+ *    `partnerId: null`). There, partner-wide rows are invisible and the
+ *    resolver would answer a TRUNCATED set (often `watches: []`), which would
+ *    hide live alerts. Failing open shows possibly-stale rows instead.
+ */
+export async function resolveMonitoringConfigForDisplay(deviceId: string, orgId: string): Promise<MonitoringConfigUpdate | null> {
+  const cached = await readDevicePolicyCache<MonitoringConfigUpdate>('monitoring', deviceId, orgId);
+  if (cached) return cached;
+  const ctx = getCurrentDbAccessContext();
+  if (!ctx || (ctx.scope !== 'system' && !ctx.currentPartnerId)) return null;
+  // Savepoint: a SQL error here is caught upstream (fail open), but on the bare
+  // request transaction it would abort/poison the caller's commit (25P02).
+  const resolution = await withDbTransaction(() => resolveDeviceMonitoringSettings(deviceId));
+  return resolution.kind === 'unresolved' ? null : resolution.settings;
+}
 
-  // Try cache first
-  if (redis) {
-    try {
-      const cached = await redis.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached) as MonitoringConfigUpdate;
-      }
-    } catch (cacheErr) {
-      console.warn(`[monitoring] Redis cache read failed for device ${deviceId}:`, cacheErr);
-    }
-  }
+export async function buildMonitoringConfigUpdate(deviceId: string, opts?: DevicePolicyCacheOpts): Promise<MonitoringConfigUpdate | null> {
+  const cacheOrgId = devicePolicyCacheOrg(deviceId, opts);
+
+  // Try cache first (bound to the device's org, #8257)
+  const cached = await readDevicePolicyCache<MonitoringConfigUpdate>('monitoring', deviceId, cacheOrgId);
+  if (cached) return cached;
 
   const resolution = await resolveDeviceMonitoringSettings(deviceId, opts);
 
@@ -2792,12 +3162,8 @@ export async function buildMonitoringConfigUpdate(deviceId: string, opts?: Devic
   // assigned to a device that had none activates on the very next heartbeat
   // instead of waiting out the TTL (the same reason null was never cached).
   // #8142: a device with no monitors link now answers none_applies with zero statements from the beat's policy set, so this stays uncached (see the W03 plan's decision).
-  if (redis && resolution.kind === 'resolved') {
-    try {
-      await redis.set(cacheKey, JSON.stringify(resolution.settings), 'EX', MONITORING_CACHE_TTL_SECONDS);
-    } catch (cacheErr) {
-      console.warn(`[monitoring] Redis cache write failed for device ${deviceId}:`, cacheErr);
-    }
+  if (resolution.kind === 'resolved') {
+    await writeDevicePolicyCache('monitoring', deviceId, cacheOrgId, resolution.settings, MONITORING_CACHE_TTL_SECONDS);
   }
 
   return resolution.settings;
@@ -2842,25 +3208,10 @@ function extractSettingsDefaults(settings: unknown): Record<string, unknown> {
   return isObject(root.defaults) ? root.defaults : {};
 }
 
-/**
- * Effective per-component update version pins (issue #2124). `null` means "no
- * pin" → track the globally promoted latest version (historical behaviour).
- */
-export interface AgentVersionPins {
-  agent: string | null;
-  watchdog: string | null;
-}
-
-/**
- * The full effective agent-update config for an org: the update-policy gate
- * inputs PLUS the version pins. Both are resolved from the SAME single org⋈
- * partner join (see getOrgAgentUpdateConfig) so the heartbeat hot path pays one
- * round trip for everything it needs.
- */
-export interface AgentUpdateConfig {
-  settings: AgentUpdateSettings;
-  pins: AgentVersionPins;
-}
+// The pure resolution (#9170) and its types live in services/agentUpdateConfig.ts
+// so the partner settings inheritance read model can call it without this
+// module's import graph. Re-exported for existing importers.
+export type { AgentVersionPins, AgentUpdateConfig };
 
 /**
  * Resolve the EFFECTIVE agent update config for an org (Org > General). The
@@ -2906,34 +3257,14 @@ export async function getOrgAgentUpdateConfig(orgId: string): Promise<AgentUpdat
     .where(eq(organizations.id, orgId))
     .limit(1);
 
-  const orgDefaults = extractSettingsDefaults(row?.orgSettings);
-  const partnerDefaults = extractSettingsDefaults(row?.partnerSettings);
-
-  // Effective merge, per field (mirrors effectiveSettings.mergeCategory): a
-  // partner-set field wins and locks; the org value fills the gap only where the
-  // partner has not set that field. `in` (not truthiness) matches mergeCategory,
-  // which locks any key the partner has present.
-  const effectivePolicy =
-    'agentUpdatePolicy' in partnerDefaults
-      ? partnerDefaults.agentUpdatePolicy
-      : orgDefaults.agentUpdatePolicy;
-  const effectiveWindow =
-    'maintenanceWindow' in partnerDefaults
-      ? partnerDefaults.maintenanceWindow
-      : orgDefaults.maintenanceWindow;
-  // Version pins: inherit-with-override, per component (issue #2124). Resolved
-  // via the shared `resolveInheritedAgentVersionPins` (packages/shared) — the
-  // SAME function `getOrgAgentVersionPinsBatch`
-  // (services/orgAgentVersionPins.ts, issue #5285) calls, so the two resolvers
-  // can never silently drift apart. See that function's docstring for the
-  // full precedence contract.
-  const pins: AgentVersionPins = resolveInheritedAgentVersionPins(orgDefaults, partnerDefaults);
-
-  const policy = normalizeAgentUpdatePolicy(effectivePolicy);
-  const rawWindow = typeof effectiveWindow === 'string' ? effectiveWindow.trim() : '';
-  // The explicit "24/7"/empty always-state means "no restriction" → null, same
-  // as an absent window. Only a real window string is carried through to the gate.
-  const maintenanceWindow = rawWindow && !isAlwaysMaintenanceWindow(rawWindow) ? rawWindow : null;
+  // Effective merge (partner-locks for the policy fields, inherit-with-override
+  // for the version pins via the shared `resolveInheritedAgentVersionPins`, the
+  // SAME function `getOrgAgentVersionPinsBatch` calls): see the pure core.
+  const config = resolveAgentUpdateConfig(
+    extractSettingsDefaults(row?.partnerSettings),
+    extractSettingsDefaults(row?.orgSettings),
+  );
+  const { maintenanceWindow } = config.settings;
   // New writes are validated at save time (issue #1963), but a legacy malformed
   // value still parses to null in the gate and fails open (lifts the time
   // restriction). Surface that so the silently-lifted restriction is observable
@@ -2951,7 +3282,7 @@ export async function getOrgAgentUpdateConfig(orgId: string): Promise<AgentUpdat
       `agent updates are NOT time-restricted (failing open). value=${JSON.stringify(maintenanceWindow)}`,
     );
   }
-  return { settings: { policy, maintenanceWindow }, pins };
+  return config;
 }
 
 /**
@@ -3253,9 +3584,16 @@ export async function resolveOrgPamFallback(orgId: string): Promise<PamSettings>
   return PAM_DEFAULTS;
 }
 
-export interface PamConfigUpdateOptions extends DevicePolicySetOpts {
+export interface PamConfigUpdateOptions extends DevicePolicyCacheOpts {
   /** Source of the org grandfather flag; defaults to resolveOrgPamFallback. */
   loadOrgPamFallback?: (orgId: string) => Promise<PamSettings>;
+  /**
+   * #8616: resolve without writing the per-device Redis entry. The heartbeat
+   * sets it when its own hierarchy load failed: the resolver then reads
+   * without the beat's hierarchy and may return defaults for a device it
+   * cannot see, which must not be served to later beats as a decision.
+   */
+  skipCacheWrite?: boolean;
 }
 
 /** #8142: PAM's own rules (raw partner, no role/OS filter). */
@@ -3360,33 +3698,19 @@ const PAM_CACHE_TTL_SECONDS = 120;
  * Build PAM config update payload for heartbeat response.
  * Resolves pam policy settings via the config policy hierarchy, then the
  * org-level grandfather flag, then PAM_DEFAULTS (uacInterceptionEnabled: false).
- * Cached per-device in Redis for 120s — policy changes propagate within ~2min + heartbeat interval.
+ * Cached per-device in Redis for 120s, bound to the device's org (#8257) —
+ * policy changes propagate within ~2min + heartbeat interval.
  */
 export async function buildPamConfigUpdate(deviceId: string, opts?: PamConfigUpdateOptions): Promise<PamSettings> {
-  hierarchyFor(deviceId, opts);
-  policySetFor(deviceId, opts);
-  const redis = getRedis();
-  const cacheKey = `pam:settings:device:${deviceId}`;
+  const cacheOrgId = devicePolicyCacheOrg(deviceId, opts);
 
-  if (redis) {
-    try {
-      const cached = await redis.get(cacheKey);
-      if (cached) return JSON.parse(cached) as PamSettings;
-    } catch (cacheErr) {
-      console.warn(`[pam] Redis cache read failed for device ${deviceId}:`, cacheErr);
-    }
-  }
+  const cached = await readDevicePolicyCache<PamSettings>('pam', deviceId, cacheOrgId);
+  if (cached) return cached;
 
   const settings = await resolveDevicePamSettings(deviceId, opts);
-
-  if (redis) {
-    try {
-      await redis.set(cacheKey, JSON.stringify(settings), 'EX', PAM_CACHE_TTL_SECONDS);
-    } catch (cacheErr) {
-      console.warn(`[pam] Redis cache write failed for device ${deviceId}:`, cacheErr);
-    }
+  if (!opts?.skipCacheWrite) {
+    await writeDevicePolicyCache('pam', deviceId, cacheOrgId, settings, PAM_CACHE_TTL_SECONDS);
   }
-
   return settings;
 }
 

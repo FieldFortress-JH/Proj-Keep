@@ -44,7 +44,7 @@ A `system_image` snapshot taken by a v0.112.0 or later agent on Linux or Windows
 | Type | What it recovers | When to use |
 |------|-----------------|-------------|
 | **Full restore** | Everything in the snapshot | Replacing a failed drive or rebuilding a system |
-| **Selective restore** | Individual files you choose (not folders — see below) | Recovering accidentally deleted files |
+| **Selective restore** | The files and folders you choose | Recovering accidentally deleted files or folders |
 | **Bare metal recovery** | Files and/or OS state (registry or `/etc`, services, firewall, scheduled tasks, packages) onto a machine that reinstalls or boots its own OS — or, on Linux, a full disk rebuild from a whole-machine snapshot | Replacing a dead machine entirely. See [Bare Metal Recovery](/backup/bare-metal-recovery/) |
 
 ---
@@ -55,7 +55,7 @@ A `system_image` snapshot taken by a v0.112.0 or later agent on Linux or Windows
 
 <Steps>
 1. Go to **Backup → Restore** in the console to open the **Restore Wizard**.
-2. Select the snapshot to restore from.
+2. Choose the device whose backup you want to restore, then select one of its snapshots. The wizard lists one device's snapshots at a time and selects nothing until a device is chosen (it picks the device for you only when you arrive from the **Snapshots** tab or the organization has a single backed-up device). The review step names the source device.
 3. Choose **Full Restore**.
 4. Choose the destination:
    - **Staging folder on the device** — the default. Files are restored under the device's system temp directory (`breeze-restore/<original path>`); the originals are never overwritten. (Earlier releases labelled this option "Original location", which it never was.) To restore in place — overwriting the originals — choose **Alternate path** and type in the original root path yourself.
@@ -67,15 +67,15 @@ A `system_image` snapshot taken by a v0.112.0 or later agent on Linux or Windows
 
 <Steps>
 1. Go to **Backup → Restore** in the console to open the **Restore Wizard**. (The **Snapshots** tab links to it from the snapshot file list.)
-2. Select the snapshot.
+2. Choose the device, then select the snapshot. Arriving from the **Snapshots** tab, the snapshot and its device are already selected.
 3. Choose **Selective Restore**.
-4. Browse the file tree and check the boxes next to the individual files you want to recover. Selection is per-file — checking a folder is not supported, and the API rejects a folder path submitted directly; select the files inside it instead.
+4. Browse the file tree and check the files and folders you want to recover. Each folder shows how many backed-up files it holds. Checking a folder selects every file indexed beneath it, and a partly selected folder shows a partial checkmark. When the selection covers more than 1,000 files, Breeze asks you to confirm.
 5. Choose the destination path (see the staging-folder default above).
 6. Review and click **Restore**.
 </Steps>
 
-<Aside type="caution">
-  Selective restore currently matches files by path **prefix**, not by exact folder boundary. If you select `/home/alice`, a sibling folder like `/home/alice2` or `/home/alice-old` is also included in the restore, since its path starts with the same characters. Review the file list carefully before confirming a selective restore of folders with similar names.
+<Aside>
+  A selected folder is expanded to the files the snapshot indexed beneath it, matched on whole folder names: selecting `/home/alice` never includes a sibling such as `/home/alice2`. One restore can expand to at most 10,000 files; a larger selection is refused with the count, so split it into several restores. The same rules apply when you restore a folder through the API or the AI assistant.
 </Aside>
 
 ---
@@ -139,7 +139,7 @@ A failed check is reported with a result code such as `checksum_mismatch`, `size
 
 **Restores require a backup helper that checks attestations.** A restore that writes, imports or boots a backup (file restore, SQL Server restore, Hyper-V restore, restore as VM, instant boot, bare-metal recovery and rebuild) is sent only to a device whose backup helper reports it checks restores against attestations (Breeze agent v0.120.0 or later). An older device is refused when you start the restore, and again if the device was downgraded before the command was delivered: **Update the Breeze agent on this device, then try again.** Bare-metal recovery media and recovery tools older than v0.120.0 are refused at code exchange and authentication: **This recovery tool is too old to check backup integrity. Download current recovery media or the current recovery tool, then try again.** Verification and test restore are not affected.
 
-**Unattested snapshots need a confirmation.** A snapshot with no attestation (taken before attestations existed, or by an older helper) is labelled **Not verified** in the restore wizards. Restoring it requires a technician to confirm it with two-factor authentication (or, on a deployment with two-factor authentication disabled, an explicit confirmation). A technician who has not set up a second factor is asked to set one up first (an authenticator app or a passkey, from their profile), then retries the restore and confirms it. The confirmation applies to that one snapshot, target device and restore type, is recorded in the audit log as `backup.restore.unattested_override` (with the confirmation method), and the restore result carries the warning **Unattested snapshot: files were not checked against a snapshot attestation.** The same confirmation is needed to restore a backup kept on a device's own disk onto a different device. AI-initiated restores and DR plan executions cannot confirm and are refused for such snapshots; start them from the console.
+**Unattested snapshots need a confirmation.** A snapshot with no attestation (taken before attestations existed, or by an older helper) is labelled **Not verified** in the restore wizards, which badge each snapshot **Verified**, **Checking**, **Not verified** or **Failed integrity check**. Restoring it requires a technician to confirm it with two-factor authentication (or, on a deployment with two-factor authentication disabled, an explicit confirmation). A technician who has not set up a second factor is asked to set one up first (an authenticator app or a passkey, from their profile), then retries the restore and confirms it. Text-message codes don't count: an account with only SMS codes must add an authenticator app or a passkey. The confirmation applies to that one snapshot, target device and restore type, is recorded in the audit log as `backup.restore.unattested_override` (with the confirmation method), and the restore result carries the warning **Unattested snapshot: files were not checked against a snapshot attestation.** The same confirmation is needed to restore a backup kept on a device's own disk onto a different device. AI-initiated restores and DR plan executions cannot confirm and are refused for such snapshots; start them from the console.
 
 **Snapshots still being checked wait.** A restore of a snapshot whose attestation is still being verified is refused with **This backup is still being checked. Try again in a few minutes.**; a queued restore waits for the check.
 
@@ -174,3 +174,4 @@ Cross-device restores also require the destination device to be online when you 
 - **Destination path.** See the staging-folder default above — an explicit destination path is the only way to control where files land, including restoring in place.
 - **Permissions.** See "What Is and Isn't Preserved" above. If restoring to a different device or OS, permissions may need adjustment regardless.
 - **Disk space.** Ensure the target device has enough free space for the restore. The snapshot's total size is shown in the Restore Wizard summary.
+- **Download speed.** With a v0.122.1 or later agent, file restores and bare-metal recovery download up to 8 files at a time from storage, while still putting files in place in the snapshot's manifest order.

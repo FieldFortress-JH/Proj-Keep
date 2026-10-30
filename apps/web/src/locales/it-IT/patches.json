@@ -39,9 +39,10 @@
     },
     "confirm": {
       "title": "Conferma approvazione patch",
-      "selectedOrganization": "l'organizzazione selezionata",
-      "messageOne": "Approvare la patch su {{count}} dispositivo in {{org}}?",
-      "messageMany": "Approvare la patch su {{count}} dispositivi in {{org}}?"
+      "selectedRing": "(senza nome)",
+      "messageRingOne": "Approvare la patch su {{count}} dispositivo in tutte le organizzazioni nell'anello {{ring}}?",
+      "messageRingMany": "Approvare la patch su {{count}} dispositivi in tutte le organizzazioni nell'anello {{ring}}?",
+      "messagePartnerWide": "Approvare la patch per tutte le organizzazioni del tuo partner?"
     },
     "checkingAccess": "Verifica dell’accesso in corso..."
   },
@@ -83,14 +84,19 @@
       "pendingDevices": "{{count}} con patch in sospeso",
       "approved": "{{count}} approvate",
       "pendingApproval": "{{count}} in attesa di approvazione",
+      "failedInstalls_one": "{{count}} installazione non riuscita",
+      "failedInstalls_other": "{{count}} installazioni non riuscite",
       "critical": "{{count}} critiche",
-      "reboot": "{{count}} riavvii"
+      "reboot": "{{count}} riavvii",
+      "imagesNotChecked_one": "{{count}} immagine container non verificata",
+      "imagesNotChecked_other": "{{count}} immagini container non verificate"
     },
     "filters": {
       "allDevices": "Tutti i dispositivi ({{count}})",
       "statusFilterLabel": "Filtra per stato di conformità",
       "pendingPatches": "Patch in sospeso ({{count}})",
       "critical": "Critiche ({{count}})",
+      "failed": "Installazioni non riuscite ({{count}})",
       "pendingReboot": "Riavvio in sospeso ({{count}})",
       "thirdPartyPending": "Terze parti in sospeso ({{count}})",
       "compliant": "Conformi ({{count}})"
@@ -109,6 +115,8 @@
       "approvedTitle": "Patch in sospeso approvate per l'installazione",
       "pendingApproval": "In attesa di approvazione",
       "pendingApprovalTitle": "Patch in sospeso ancora in attesa di approvazione",
+      "failed": "Non riuscite",
+      "failedTitle": "Patch in sospeso il cui ultimo tentativo di installazione non è riuscito",
       "osPatches": "Patch OS",
       "osPatchesTitle": "Aggiornamenti in sospeso da Windows Update, Apple o gestori di pacchetti Linux",
       "thirdParty": "Terze parti",
@@ -153,6 +161,11 @@
       "messageOne": "{{action}} su {{count}} dispositivo in {{org}}?",
       "messageMany": "{{action}} su {{count}} dispositivi in {{org}}?",
       "messageMultiOrg": "{{action}} su {{count}} dispositivi in {{orgCount}} organizzazioni ({{orgNames}})?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} di {{total}}",
+      "previous": "Pagina precedente",
+      "next": "Pagina successiva"
     }
   },
   "patchInstallHistory": {
@@ -253,7 +266,9 @@
       "moderate": "Moderata",
       "low": "Bassa",
       "unrated": "Non valutata",
-      "unratedNote": "Non verrà approvata automaticamente"
+      "unratedNote": "Non verrà approvata automaticamente",
+      "derivedNote": "Valutazione derivata",
+      "derivedTooltip": "Il fornitore non ha pubblicato una valutazione per questo aggiornamento. Questa gravità è stata derivata dalla classificazione e dal titolo."
     },
     "approval": {
       "pending": "In sospeso",
@@ -301,6 +316,7 @@
       "os": "OS",
       "release": "Rilascio",
       "approval": "Approvazione",
+      "devices": "Dispositivi",
       "actions": "Azioni"
     },
     "releaseUnknown": "Sconosciuta",
@@ -313,6 +329,23 @@
       "badgeDevices_other": "Installazione non riuscita su {{count}} dispositivi",
       "noReason": "Nessun motivo segnalato dall'agente",
       "failedAt": "Ultimo tentativo di installazione non riuscito: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} dispositivo",
+      "badge_other": "{{count}} dispositivi",
+      "none": "Nessun dispositivo nell’ambito ha ancora bisogno di questa patch",
+      "open": "Mostra i dispositivi che hanno ancora bisogno di {{title}}",
+      "heading": "Dispositivi che hanno ancora bisogno di {{title}}",
+      "loading": "Caricamento dei dispositivi…",
+      "error": "Impossibile caricare l’elenco dei dispositivi.",
+      "showing": "{{shown}} di {{total}} visualizzati",
+      "loadMore": "Carica altri",
+      "lastChecked": "Ultimo controllo: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Versione del pacchetto {{version}}",
+      "id": "ID catalogo {{id}}",
+      "title": "Un’altra voce del catalogo ha lo stesso titolo. Ognuna viene approvata separatamente."
     }
   },
   "patchesPage": {
@@ -353,7 +386,8 @@
       "createRing": "Impossibile creare l'anello di aggiornamento",
       "deleteRing": "Impossibile eliminare l'anello",
       "approveUnknown": "Stato di approvazione sconosciuto: non è stato possibile leggere la risposta del server. Aggiorna per verificare quali patch sono state approvate.",
-      "approveAbortedWithFailures": "{{message}} (Il server aveva inoltre rifiutato {{count}} patch in precedenza.)"
+      "approveAbortedWithFailures": "{{message}} (Il server aveva inoltre rifiutato {{count}} patch in precedenza.)",
+      "checkRingLinks": "Impossibile verificare quali criteri usano questo anello; non è stato eliminato nulla"
     },
     "toast": {
       "ringSaved": "Anello di aggiornamento salvato",
@@ -383,10 +417,18 @@
       "createTitle": "Crea anello di aggiornamento"
     },
     "truncatedNotice": "Vengono mostrate {{shown}} patch su {{total}}. I filtri qui restringono solo ciò che è già caricato, quindi il resto non è raggiungibile da questa vista: usa l'API delle patch per consultare il catalogo completo.",
-    "shiftedNotice": "Vengono mostrate {{shown}} patch su {{total}}: il catalogo è cambiato durante il caricamento. Ricarica per vedere il resto."
+    "emptyRingSeverityNotice": "Nessun dispositivo in questo anello. La gravità segnalata dai dispositivi compare dopo l’assegnazione dei dispositivi, quindi fino ad allora la maggior parte delle patch risulta Non valutata.",
+    "shiftedNotice": "Vengono mostrate {{shown}} patch su {{total}}: il catalogo è cambiato durante il caricamento. Ricarica per vedere il resto.",
+    "ringDelete": {
+      "messageNone": "Nessun criterio usa questo anello. Le sue regole di approvazione e le impostazioni di pianificazione verranno eliminate e non potranno essere ripristinate.",
+      "title": "Eliminare {{name}}?",
+      "messageOne": "1 criterio smetterà di applicare le patch pianificate finché non sceglierai un altro anello.",
+      "messageMany": "{{count}} criteri smetteranno di applicare le patch pianificate finché non sceglierai un altro anello.",
+      "confirm": "Elimina anello"
+    }
   },
   "patchJobsList": {
-    "empty": "Nessun job di patch ancora. I job creati da criteri, anelli di aggiornamento o dall'assistente IA appariranno qui.",
+    "empty": "Nessun job di patch ancora. I job creati da criteri, anelli di aggiornamento o da Breeze AI appariranno qui.",
     "loading": "Caricamento dei job di patch...",
     "columns": {
       "name": "Job",
@@ -509,6 +551,22 @@
       "title": "Applicazione installazione",
       "description": "Quanto tempo hanno i dispositivi per installare le patch approvate e per quanto tempo un utente può rimandare il riavvio. Il comportamento di riavvio è configurato per criterio nella scheda Patch."
     },
+    "featureUpdates": {
+      "title": "Aggiornamenti delle funzionalità di Windows",
+      "description": "Se i dispositivi di questo anello ricevono le versioni delle funzionalità di Windows (ad esempio 25H2). Breeze le installa solo tramite le regole di approvazione seguenti; aggiungi un override Aggiornamenti funzionalità per approvarle automaticamente.",
+      "modeBlock": "Blocca",
+      "modeAllow": "Consenti la versione più recente",
+      "modePin": "Blocca su una versione",
+      "productLabel": "Versione di Windows",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Versione",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Windows Update su ciascun dispositivo viene impostato per puntare a questa versione (criterio versione di destinazione di Windows Update for Business). A meno che l'impostazione del criterio \"Breeze è l'unica origine di Windows Update\" sia attiva, Windows può scaricare e installare la versione secondo la propria pianificazione, al di fuori dell'approvazione di Breeze.",
+      "validation": {
+        "release": "Inserisci una versione come 25H2."
+      }
+    },
     "approvalPolicy": {
       "title": "Criterio di approvazione",
       "description": "Cosa viene approvato automaticamente in questo anello e per quanto tempo trattenere una patch dopo il rilascio del vendor. L'impostazione predefinita si applica a ogni categoria; aggiungi un override per gestirne una diversamente.",
@@ -564,7 +622,47 @@
     "badges": {
       "manual": "Manuale",
       "os": "SO: {{severities}}",
-      "thirdParty": "App di terze parti"
+      "thirdParty": "App di terze parti",
+      "appRules_one": "{{count}} regola app",
+      "appRules_other": "{{count}} regole app",
+      "featureUpdatesNewest": "Aggiornamenti funzionalità: più recente",
+      "featureUpdatesPinned": "Aggiornamenti funzionalità: {{release}}"
+    }
+  },
+  "ringAppRules": {
+    "applicationRules": "Regole applicazioni",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Blocca applicazioni specifiche dalla gestione automatica delle patch oppure fissale a una versione massima.",
+    "blocked": "Bloccata",
+    "pinned": "Bloccata a versione",
+    "maxVersion": "Versione massima",
+    "pinnedApplicationsNeedAVersion": "Le applicazioni bloccate a versione richiedono una versione.",
+    "addApplication": "Aggiungi applicazione",
+    "searchCatalogAndDetectedApplications": "Cerca nel catalogo e tra le applicazioni rilevate...",
+    "searching": "Ricerca in corso...",
+    "catalog": "catalogo",
+    "couldnTLoadApplicationsYouCanStill": "Impossibile caricare le applicazioni: puoi comunque aggiungerle sotto tramite ID pacchetto.",
+    "noMatches": "Nessuna corrispondenza.",
+    "orEnterAPackageIDManually": "Oppure inserisci manualmente un ID pacchetto",
+    "removeRuleFor": "Rimuovi regola per {{application}}",
+    "scopeNote": "Queste regole si applicano a ogni dispositivo il cui criterio di configurazione è collegato a questo anello."
+  },
+  "patchDetails": {
+    "unknown": "Sconosciuto",
+    "source": "Origine",
+    "packageId": "KB / ID pacchetto",
+    "severity": "Gravità",
+    "releaseDate": "Data di rilascio",
+    "firstSeen": "Prima rilevazione nel catalogo",
+    "rings": {
+      "title": "Anelli di aggiornamento",
+      "note": "Quando ogni anello approva automaticamente questa patch (regola a livello di anello; le eccezioni per categoria non sono mostrate).",
+      "none": "Nessun anello di aggiornamento configurato.",
+      "manual": "Nessuna approvazione automatica — richiede approvazione manuale",
+      "immediate": "Approvata automaticamente subito",
+      "needsDate": "In attesa — nessuna data di rilascio per avviare la finestra di {{count}} giorni",
+      "autoApproves": "Approvata automaticamente il {{date}}",
+      "hold_one": "Ritardo di {{count}} giorno",
+      "hold_other": "Ritardo di {{count}} giorni"
     }
   }
 }

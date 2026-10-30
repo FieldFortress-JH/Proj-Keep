@@ -13,10 +13,10 @@
   "targetDevice": "Dispositivo de destino: {{hostname}}",
   "batch": {
     "approveAll": "Aprovar tudo ({{count}})",
-    "declineAll": "Recusar tudo ({{count}})",
+    "declineAll": "Negar tudo ({{count}})",
     "groupTitle": "{{count}} solicitações semelhantes · {{tool}}",
     "moreHostnames": "+{{count}} mais",
-    "denyConfirmSummary": "Isso recusa {{count}} solicitações de {{org}}."
+    "denyConfirmSummary": "Isso nega {{count}} solicitações de {{org}}."
   },
   "filters": {
     "orgLabel": "Organização",
@@ -42,6 +42,7 @@
   },
   "denyPrompt": "Por que você está recusando esta solicitação? O motivo é opcional.",
   "denyReasonPlaceholder": "Opcional — compartilhado com quem solicitou",
+  "denyReasonShownToUserHint": "O usuário final vê isto na notificação (primeiros 500 caracteres).",
   "confirmDeny": "Confirmar recusa",
   "cancel": "Cancelar",
   "deny": "Recusar",
@@ -98,15 +99,16 @@
     "loading": "Carregando aprovações recentes…",
     "error": "Não foi possível carregar as aprovações recentes.",
     "retry": "Tentar novamente",
+    "decisionReasonLabel": "Motivo do aprovador",
     "empty": "Nada foi finalizado recentemente.",
     "status": {
       "failed": "Falhou",
-      "rejected": "Rejeitada",
+      "rejected": "Negada",
       "expired": "Expirada",
       "cancelled": "Cancelada",
       "completed": "Concluída",
       "denied": "Negada",
-      "refused": "Aprovação recusada",
+      "refused": "Aprovada, depois bloqueada",
       "approved": "Aprovada",
       "reported": "Reportada",
       "unknown": "Desconhecido"
@@ -131,7 +133,7 @@
     "durationValue": "{{minutes}} minutos a partir da aprovação",
     "purpose": "Finalidade",
     "requestedBy": "Solicitado por",
-    "principalUser": "Chat de IA do Breeze",
+    "principalUser": "Breeze AI",
     "principalApiKey": "Chave de API do MCP",
     "principalOauth": "Conexão OAuth do MCP",
     "paths": "Caminhos",
@@ -146,6 +148,33 @@
       "credential_store": "Armazenamentos de credenciais do sistema operacional",
       "private_keys": "Chaves privadas (SSH, GnuPG, TLS)",
       "session_tokens": "Tokens de sessão e credenciais de nuvem salvos"
+    }
+  },
+  "operatorPlan": {
+    "title": "Plano para a tarefa de IA",
+    "summary_one": "{{count}} efeito, revisão {{revision}} do plano",
+    "summary_other": "{{count}} efeitos, revisão {{revision}} do plano",
+    "groupBreeze": "Dispositivos Breeze",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Etapa {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Os efeitos são executados nesta ordem. O login é desativado por último, então interromper antes nunca deixa e-mails sem roteamento.",
+    "empty": "Este plano não contém efeitos.",
+    "invalid": "Não foi possível exibir este plano por completo. Não o aprove."
+  },
+  "intentStatus": {
+    "title": "Status da aprovação",
+    "waitingForApprovers": "Aguardando os aprovadores",
+    "notFound": "Não foi possível encontrar essa aprovação.",
+    "status": {
+      "pending_approval": "Aprovação pendente",
+      "in_progress": "Em andamento",
+      "completed": "Concluída",
+      "failed": "Falhou",
+      "rejected": "Negado",
+      "expired": "Expirada",
+      "cancelled": "Cancelada"
     }
   }
 }

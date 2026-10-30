@@ -8,10 +8,6 @@ function makePolicyLocal(overrides: {
   return {
     settings: {
       sources: ['os'],
-      autoApprove: false,
-      autoApproveSeverities: [],
-      autoApproveDeferralDays: 0,
-      apps: [],
       ...overrides.settings,
     },
     ring: {
@@ -24,6 +20,7 @@ function makePolicyLocal(overrides: {
       excludeCategories: [],
       autoApprove: { security: true },
       appRules: [],
+      featureUpdates: { mode: 'block' },
       ...overrides.ring,
     },
   };
@@ -34,13 +31,13 @@ describe('buildPatchesSnapshot', () => {
     const snapshot = buildPatchesSnapshot(makePolicyLocal({
       settings: {
         sources: ['os', 'third_party'],
-        autoApprove: true,
-        autoApproveSeverities: ['critical', 'important'],
-        autoApproveDeferralDays: 7,
-        apps: [
+      },
+      ring: {
+        appRules: [
           { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
           { source: 'custom', packageId: 'corp-tool', action: 'pin', pinnedVersion: '1.2.3' },
         ],
+        featureUpdates: { mode: 'pin', product: 'windows-11', targetVersion: '25H2' },
       },
     }));
 
@@ -52,16 +49,11 @@ describe('buildPatchesSnapshot', () => {
       excludeCategories: [],
       autoApprove: { security: true },
       sources: ['os', 'third_party'],
-      policyAutoApprove: {
-        enabled: true,
-        severities: ['critical', 'important'],
-        deferralDays: 7,
-      },
-      apps: [
+      ringAppRules: [
         { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
         { source: 'custom', packageId: 'corp-tool', action: 'pin', pinnedVersion: '1.2.3' },
       ],
-      ringAppRules: [],
+      ringFeatureUpdates: { mode: 'pin', product: 'windows-11', targetVersion: '25H2' },
       ringValidation: {
         classification: 'valid_ring',
         valid: true,
@@ -69,52 +61,26 @@ describe('buildPatchesSnapshot', () => {
     });
   });
 
-  // #8184 W01: ring rules ride in their own key; the legacy `apps` key keeps
-  // carrying only the policy's rules in this wave.
-  it('snapshots the ring app rules under ringAppRules, leaving apps as the policy list', () => {
-    const snapshot = buildPatchesSnapshot(makePolicyLocal({
-      settings: { apps: [{ source: 'custom', packageId: 'corp-tool', action: 'block' }] },
-      ring: {
-        appRules: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'pin', pinnedVersion: '120' }],
-      },
-    }));
-
-    expect(snapshot.ringAppRules).toEqual([
-      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'pin', pinnedVersion: '120' },
-    ]);
-    expect(snapshot.apps).toEqual([{ source: 'custom', packageId: 'corp-tool', action: 'block' }]);
-  });
-
-  it('maps policyAutoApprove from settings.autoApprove/autoApproveSeverities/autoApproveDeferralDays', () => {
-    const snapshot = buildPatchesSnapshot(makePolicyLocal({
-      settings: {
-        autoApprove: true,
-        autoApproveSeverities: ['moderate'],
-        autoApproveDeferralDays: 14,
-      },
-    }));
-
-    expect(snapshot.policyAutoApprove).toEqual({
-      enabled: true,
-      severities: ['moderate'],
-      deferralDays: 14,
-    });
-  });
-
-  it('falls back to schema defaults for legacy settings missing auto-approve fields and apps', () => {
-    // Legacy stored settings predate these fields — the fallbacks mirror the
-    // patchInlineSettingsSchema defaults and are deliberate.
-    const snapshot = buildPatchesSnapshot({
-      settings: { sources: ['os'] },
-      ring: makePolicyLocal().ring,
+  // #8188 W04: every supported executor reads `ringAppRules`, so the legacy
+  // `apps` mirror and the inert `policyAutoApprove` block are no longer
+  // written. A stale policy-level value on the loaded settings never reaches
+  // the snapshot.
+  it('writes neither the legacy apps key nor policyAutoApprove', () => {
+    const ringRules = [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }] as const;
+    const policyLocal = makePolicyLocal({ ring: { appRules: [...ringRules] } });
+    Object.assign(policyLocal.settings as Record<string, unknown>, {
+      apps: [{ source: 'custom', packageId: 'corp-tool', action: 'block' }],
+      autoApprove: true,
+      autoApproveSeverities: ['critical'],
+      autoApproveDeferralDays: 7,
     });
 
-    expect(snapshot.policyAutoApprove).toEqual({
-      enabled: false,
-      severities: [],
-      deferralDays: 0,
-    });
-    expect(snapshot.apps).toEqual([]);
+    const snapshot = buildPatchesSnapshot(policyLocal);
+
+    expect(snapshot).not.toHaveProperty('apps');
+    expect(snapshot).not.toHaveProperty('policyAutoApprove');
+    expect(snapshot.ringAppRules).toEqual(ringRules);
+    expect(JSON.stringify(snapshot)).not.toContain('corp-tool');
   });
 
   it('carries ring category include/exclude filters into the snapshot (#2117)', () => {

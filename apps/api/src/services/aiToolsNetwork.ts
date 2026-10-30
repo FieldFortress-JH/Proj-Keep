@@ -4,7 +4,7 @@
  * Tools for network change monitoring, baseline configuration, IP history, and discovery.
  * - get_network_changes (Tier 1): Query network change events
  * - acknowledge_network_device (Tier 2): Acknowledge a network change event
- * - configure_network_baseline (Tier 2): Create/update network baseline configuration
+ * - configure_network_baseline (Tier 3 supervised, W04): Create/update network baseline configuration
  * - get_ip_history (Tier 1): Query historical IP assignments
  * - network_discovery (Tier 3): Initiate a network discovery scan
  * - get_network_asset_reachability (Tier 1): Sourced, dated reachability for a discovered asset
@@ -28,7 +28,7 @@ import { loadReachability } from './assetReachabilityLoader';
 import { deviceSiteDenied, siteScopeCondition, SITE_SCOPE_EMPTY_NOTE, deviceScopeCondition, filterToDeviceScope } from './aiToolsSiteScope';
 import { eq, and, desc, gte, inArray, lte, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
-import { isAiAgentPrincipal } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import type { AiTool } from './aiTools';
 
 /**
@@ -42,7 +42,7 @@ import type { AiTool } from './aiTools';
  * 23503. Mirrors `aiToolsFleet.ts`'s `isAgentPrincipalCaller` (#6206).
  */
 function isAgentPrincipalCaller(auth: AuthContext): boolean {
-  return isAiAgentPrincipal(auth);
+  return isAutomationPrincipal(auth);
 }
 
 /** #6911: the refusal `acknowledge_network_device` returns to an agent principal. */
@@ -82,6 +82,14 @@ function normalizeIpLiteral(value: string): string | null {
   if (parsed === 0) return null;
   return parsed === 6 ? withoutZone.toLowerCase() : withoutZone;
 }
+
+// network_discovery scanType -> the agent's scan methods. `full` is the
+// agent's own default set (agent/internal/discovery/scanner.go normalizeConfig).
+const DISCOVERY_SCAN_METHODS: Record<string, string[]> = {
+  ping: ['ping'],
+  arp: ['arp'],
+  full: ['arp', 'ping', 'port_scan', 'snmp'],
+};
 
 async function verifyDeviceAccess(
   deviceId: string,
@@ -273,7 +281,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
       const placementDenied = linked && deviceSiteDenied(auth, authority.siteId, authority.id);
       return JSON.stringify({
         asset: { ...row, model: maskOidShapedModel(row.model), nicVendor: nicVendorFromMac(row.macAddress) },
-        placement: placementDenied ? null : await readPlacement(authority.kind, authority.id),
+        placement: placementDenied ? null : await readPlacement(authority.kind, authority.id, authority.orgId),
         placementAuthority: { kind: authority.kind, id: authority.id, linked },
       });
     },
@@ -460,11 +468,13 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // 3. configure_network_baseline - Tier 2 (mutating)
+  // 3. configure_network_baseline - Tier 3 supervised (arms recurring scans, W04-D7)
   // ============================================
 
   registerTool({
-    tier: 2,
+    // Full-control W04 (#6758, W04-D7): 2 → 3 supervised. Creating a baseline
+    // arms a recurring on-site discovery scan; aiGuardrails TIER3_SUPERVISED_TOOLS.
+    tier: 3,
     domain: 'network',
     searchHint: 'network baseline configuration, scheduled scan cadence and change alerts',
     definition: {
@@ -945,7 +955,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
           subnet: { type: 'string', description: 'CIDR subnet to scan (e.g., "192.168.1.0/24")' },
           scanType: { type: 'string', enum: ['ping', 'arp', 'full'], description: 'Type of scan (default: ping)' }
         },
-        required: ['deviceId']
+        required: ['deviceId', 'subnet']
       }
     },
     handler: async (input, auth) => {
@@ -954,9 +964,15 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
       const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, true));
       if ('error' in access) return JSON.stringify({ error: access.error });
 
+      // The agent's handleNetworkDiscovery reads `subnets` and `methods`
+      // (agent/internal/heartbeat/handlers_network.go), the same shape the
+      // discovery-profile worker sends. A singular `subnet` / `scanType` left
+      // Subnets empty and every scan failed with "no valid subnets provided"
+      // (#8799).
+      const scanType = (input.scanType as string | undefined) ?? 'ping';
       const result = await aiExecuteCommand(auth, 'network_discovery', deviceId, 'network_discovery', {
-        subnet: input.subnet,
-        scanType: input.scanType ?? 'ping'
+        subnets: [input.subnet as string],
+        methods: DISCOVERY_SCAN_METHODS[scanType] ?? DISCOVERY_SCAN_METHODS.ping,
       }, { userId: auth.user.id, timeoutMs: 120000 });
 
       return JSON.stringify(result);

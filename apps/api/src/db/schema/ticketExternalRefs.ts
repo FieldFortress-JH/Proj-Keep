@@ -22,6 +22,16 @@ export const ticketExternalRefs = pgTable('ticket_external_refs', {
   partnerServicePrincipalId: uuid('partner_service_principal_id').notNull(),
   externalId: varchar('external_id', { length: 255 }).notNull(),
   externalUrl: text('external_url'),
+  // The source's human-facing number (#8313, 2026-12-25-120000), e.g. a
+  // helpdesk's "#41023", which is not its id. Searchable through the partial
+  // index idx_ticket_external_refs_org_external_number (org_id,
+  // lower(external_number)); externalId stays the stable resume key.
+  externalNumber: varchar('external_number', { length: 255 }),
+  // The ticket this ref was written on, when a merge moved it onto its
+  // survivor (#10120, 2027-01-08-120000): set only by ticketMerge/repoint.ts,
+  // kept across a second merge (A→B→C keeps A), NULL for a ref written
+  // directly. A plain FK like ticket_comments.merged_from_ticket_id.
+  originTicketId: uuid('origin_ticket_id').references(() => tickets.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 }, (t) => [

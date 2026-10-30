@@ -2,7 +2,8 @@ import '@/lib/i18n';
 import { useCallback, useEffect, useState } from 'react';
 import { ShieldAlert, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { fetchWithAuth, useAuthStore } from '@/stores/auth';
+import { useAuthStore } from '@/stores/auth';
+import { getPartnersMe, invalidatePartnersMe } from '@/lib/api/partnersMe';
 import { useJwtClaims } from '@/lib/authScope';
 
 // Spec: docs/superpowers/specs/2026-09-18-mfa-required-default-new-partners-design.md (D4)
@@ -50,8 +51,44 @@ function writeDismissedOn(value: string): void {
 
 type PartnerMe = { settings?: { security?: { requireMfa?: unknown } } };
 
-export default function MfaPolicyOffBanner() {
+const PARTNER_SETTINGS_PATH = '/settings/partner';
+
+function onPartnerSettingsRoute(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.location.pathname.replace(/\/+$/, '') === PARTNER_SETTINGS_PATH;
+}
+
+type MfaPolicyOffBannerProps = {
+  /**
+   * `layout` (default): the persisted global island in DashboardLayout. It
+   * stands down on /settings/partner, where the page renders its own copy
+   * (`page`) aligned to the page container and below the header (#9171).
+   * Both read the same per-day dismissal key, so dismissing either hides both.
+   */
+  placement?: 'layout' | 'page';
+};
+
+export default function MfaPolicyOffBanner({ placement = 'layout' }: MfaPolicyOffBannerProps = {}) {
   const { t } = useTranslation('common');
+  // The layout instance is `transition:persist`, so it does not remount on soft
+  // navigation; re-read the route after each Astro swap / history traversal.
+  const [onPartnerSettings, setOnPartnerSettings] = useState(onPartnerSettingsRoute);
+  useEffect(() => {
+    if (placement !== 'layout') return;
+    const sync = () => {
+      setOnPartnerSettings(onPartnerSettingsRoute());
+      // The page copy may have been dismissed while this persisted instance
+      // stood down; re-read the shared per-day key.
+      setDismissedToday(readDismissedOn() === localDateKey(new Date()));
+    };
+    sync();
+    document.addEventListener('astro:page-load', sync);
+    window.addEventListener('popstate', sync);
+    return () => {
+      document.removeEventListener('astro:page-load', sync);
+      window.removeEventListener('popstate', sync);
+    };
+  }, [placement]);
   const user = useAuthStore((s) => s.user);
   const claimsState = useJwtClaims();
   const [policyOff, setPolicyOff] = useState(false);
@@ -70,15 +107,16 @@ export default function MfaPolicyOffBanner() {
 
   const check = useCallback(async (isCurrent: () => boolean) => {
     try {
-      const response = await fetchWithAuth('/orgs/partners/me');
-      if (!response.ok) {
+      // Shared with the page and the other layout islands reading it at load (#9172).
+      const read = await getPartnersMe();
+      if (!read.ok) {
         // Render nothing. A 403 here is an org-scoped or restricted session
         // the gates above should already have excluded; anything else is a
         // transient failure and the banner is not worth a broken page.
         if (isCurrent()) setPolicyOff(false);
         return;
       }
-      const data = (await response.json().catch(() => null)) as PartnerMe | null;
+      const data = read.data as PartnerMe | null;
       if (!isCurrent()) return;
       // An unreadable body is treated like the other failure paths (render
       // nothing) rather than as "MFA is off" — the banner only claims the
@@ -104,14 +142,18 @@ export default function MfaPolicyOffBanner() {
       void check(() => active && seq === latest);
     };
     run();
-    window.addEventListener(PARTNER_SETTINGS_SAVED_EVENT, run);
+    // A save changed the partner record: a read still in flight from before it
+    // must not be shared with the re-check (#9172 in-flight de-dup).
+    const recheck = () => { invalidatePartnersMe(); run(); };
+    window.addEventListener(PARTNER_SETTINGS_SAVED_EVENT, recheck);
     return () => {
       active = false;
-      window.removeEventListener(PARTNER_SETTINGS_SAVED_EVENT, run);
+      window.removeEventListener(PARTNER_SETTINGS_SAVED_EVENT, recheck);
     };
   }, [eligible, check]);
 
   if (!eligible || dismissedToday || !policyOff) return null;
+  if (placement === 'layout' && onPartnerSettings) return null;
 
   const dismiss = () => {
     writeDismissedOn(localDateKey(new Date()));
@@ -119,22 +161,22 @@ export default function MfaPolicyOffBanner() {
   };
 
   return (
-    <div
-      role="status"
+    // Not a live region: role="status" re-announced on every page load (#9031).
+    // One row at >=1024px (message + inline CTA + dismiss, ~40px); wraps below.
+    <aside
+      aria-label={t('mfaPolicyOffBanner.label')}
       data-testid="mfa-policy-off-banner"
-      className="mb-4 flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3"
+      className={`flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/10 px-4 py-2${placement === 'layout' ? ' mb-4' : ''}`}
     >
-      <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-warning" aria-hidden="true" />
-      <div className="min-w-0 flex-1">
-        <p className="text-sm text-foreground">{t('mfaPolicyOffBanner.message')}</p>
-        <div className="mt-3">
-          <a
-            href="/settings/partner#security"
-            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-          >
-            {t('mfaPolicyOffBanner.cta')}
-          </a>
-        </div>
+      <ShieldAlert className="h-5 w-5 shrink-0 text-warning" aria-hidden="true" />
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-1">
+        <p className="max-w-prose text-sm text-foreground">{t('mfaPolicyOffBanner.message')}</p>
+        <a
+          href="/settings/partner#security"
+          className="shrink-0 rounded-md bg-primary px-3 py-1 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+        >
+          {t('mfaPolicyOffBanner.cta')}
+        </a>
       </div>
       <button
         type="button"
@@ -144,6 +186,6 @@ export default function MfaPolicyOffBanner() {
       >
         <X className="h-4 w-4" aria-hidden="true" />
       </button>
-    </div>
+    </aside>
   );
 }

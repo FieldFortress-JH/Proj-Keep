@@ -517,11 +517,14 @@ describe('scrubEvent', () => {
         release_sync_failure_reason: 'ssrf-blocked',
         release_sync_context: 'stale-volume-fallback',
         backup_dispatch_issue: 'redelivery-refused',
+        command_dispatch_refusal: 'trust_denied',
         worker: 'patchScheduler',
         worker_failure_reason: 'desktop_stop_pending',
         command_result_phase: 'cis_result',
         patch_reconcile_stage: 'enqueue_failed',
         patch_reconcile_repeat: '2-4',
+        patch_scheduler_stage: 'closest_wins_resolve_failed',
+        update_ring_stage: 'device_count_failed',
         jobId: 'bull-job-918273',
         path: '/public/quotes/raw-capability',
         arbitrary: 'raw-capability',
@@ -603,6 +606,10 @@ describe('scrubEvent', () => {
       // contentless and an operator cannot tell a deliberate at-most-once drop
       // from an ordinary backup-worker crash.
       backup_dispatch_issue: 'redelivery-refused',
+      // #8022/BREEZE-45: the maintenance-reboot sweep's refused-dispatch
+      // warning. Dropped here, every refusal arrives as the same contentless
+      // event and the reason a device is never rebooted is unrecoverable.
+      command_dispatch_refusal: 'trust_denied',
       // #1379/BREEZE-9: attachWorkerObservability sets this on every worker,
       // and the allowlist introduced two days later (a50769487) has discarded
       // it ever since, which is why ~12k held-context events carry an empty
@@ -614,6 +621,10 @@ describe('scrubEvent', () => {
       command_result_phase: 'cis_result',
       patch_reconcile_stage: 'enqueue_failed',
       patch_reconcile_repeat: '2-4',
+      // #9632: closest-wins scheduling failures and the ring-count failure.
+      // Dropped here, they arrive contentless and indistinguishable.
+      patch_scheduler_stage: 'closest_wins_resolve_failed',
+      update_ring_stage: 'device_count_failed',
       // NB: `jobId` was in the input bag and is deliberately absent here — a
       // BullMQ per-job counter is unbounded by construction, so allowlisting it
       // would inflate Sentry's tag index without making anything triageable.
@@ -641,6 +652,27 @@ describe('scrubEvent', () => {
     expect(() => scrubEvent({} as any)).not.toThrow();
     expect(() => scrubEvent({ request: {} } as any)).not.toThrow();
     expect(() => scrubEvent({ request: { headers: {} } } as any)).not.toThrow();
+  });
+
+  // W08 (#8147): the scrubber validates a caller-supplied route_template by
+  // building a request-less context. A non-template value must be dropped —
+  // never thrown out of beforeSend (an error reporter must not crash).
+  it.each(['*', '/quotes?token=raw', 'not-a-route', '/quotes/%3Atoken'])(
+    'drops an unsafe route_template tag %j without throwing',
+    async (routeTemplate) => {
+      const { scrubEvent } = await import('./sentry');
+      let out: Record<string, any> | undefined;
+      expect(() => {
+        out = scrubEvent({ tags: { route_template: routeTemplate, pg_code: '42501' } });
+      }).not.toThrow();
+      expect(out?.tags).toEqual({ pg_code: '42501' });
+    },
+  );
+
+  it('keeps the fixed tunnel-host route_template tag (#8158)', async () => {
+    const { scrubEvent } = await import('./sentry');
+    const out = scrubEvent({ tags: { route_template: 'tunnel-host', pg_code: '42501' } }) as Record<string, any>;
+    expect(out?.tags).toEqual({ route_template: 'tunnel-host', pg_code: '42501' });
   });
 });
 

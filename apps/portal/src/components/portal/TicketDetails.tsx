@@ -5,15 +5,19 @@ import { ArrowLeft, AlertCircle, Loader2 } from 'lucide-react';
 import {
   portalApi,
   portalAttachmentContentPath,
+  type PortalApproval,
   type TicketComment,
   type TicketCommentAttachment,
   type TicketDetails as TicketDetailsType,
+  type PortalMergedTicket,
   type TicketStatus,
 } from '@/lib/api';
 import { formatDate, formatDateTime } from '@/lib/utils';
+import { isPortalMergedTicket } from '@/lib/mergedTicket';
 import { cn } from '@/lib/utils';
+import { approvalAskSentence } from '@/lib/approvalText';
 import { BTN_PRIMARY, INPUT, StatusMark } from './ui';
-import { ticketStatusLabel, ticketStatusTone } from './ticketMarks';
+import { ticketStatusLabel, ticketStatusTone, ticketTypeLabel } from './ticketMarks';
 import { TicketSlaBadge } from './TicketList';
 
 /** Activity copy derived from the ticket's own status. This component only ever
@@ -41,10 +45,17 @@ function activityStatusText(status: TicketStatus, updatedAt: string | null): str
 }
 
 interface TicketDetailsProps {
-  ticket: TicketDetailsType | null;
+  /** A live ticket, or a request staff merged into another one (#8972). */
+  ticket: TicketDetailsType | PortalMergedTicket | null;
   error?: string | null;
   /** HTTP status of the failed load: 404 reads as \"not found\"; anything else is an outage. */
   statusCode?: number;
+  /** A work-approval request on this ticket that the viewer can decide (#8200). */
+  pendingApproval?: {
+    id: string;
+    /** Raw ask (ISO timestamps), formatted client-side so times render in the viewer's zone. */
+    approval: Pick<PortalApproval, 'trigger' | 'ticketNumber' | 'ask'>;
+  } | null;
 }
 
 /**
@@ -199,7 +210,50 @@ function ReplyComposer({
   );
 }
 
-export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps) {
+/** Where a merged request went (#8972, spec §6.1). No reply form and no status:
+ *  the conversation continues on the ticket it was merged into. */
+function MergedTicketNotice({ ticket }: { ticket: PortalMergedTicket }) {
+  const target = ticket.mergedInto;
+  const message = target
+    ? `This request was merged into ${target.internalNumber ?? 'another request'}.`
+    : ticket.survivorDeleted
+      ? 'This request was merged into a ticket that has since been removed.'
+      : 'This request was merged into another request.';
+  return (
+    <div className="max-w-3xl">
+      <div className="mb-6">
+        <a
+          href={withBase('/tickets')}
+          className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to tickets
+        </a>
+      </div>
+      <div role="status" data-testid="portal-ticket-merged-banner" className="rounded-lg bg-primary/10 p-4 text-sm text-foreground">
+        <p className="font-semibold">{message}</p>
+        {target ? (
+          <p className="mt-1">
+            Follow the conversation there.{' '}
+            <a
+              href={withBase(`/tickets/${encodeURIComponent(target.id)}`)}
+              data-testid="portal-ticket-merged-link"
+              className="font-semibold text-primary-on-tint underline underline-offset-4"
+            >
+              Open {target.internalNumber ?? 'the request'}
+            </a>
+          </p>
+        ) : (
+          <p className="mt-1 text-muted-foreground">Your tickets list has the latest.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function TicketDetails({ ticket: ticketOrMerged, error, statusCode, pendingApproval }: TicketDetailsProps) {
+  const mergedTicket = isPortalMergedTicket(ticketOrMerged) ? ticketOrMerged : null;
+  const ticket = mergedTicket ? null : (ticketOrMerged as TicketDetailsType | null);
   // The API returns public replies newest-first; this reads as a conversation
   // under the description, so show them oldest-first. `comments` is defensively
   // defaulted for any payload that predates the field. Local state so a reply
@@ -219,6 +273,11 @@ export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps)
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const when = (iso: string) => (mounted ? formatDateTime(iso) : '');
+  // The ask sentence carries times in the viewer's zone, so (like `when`) it is
+  // computed only after mount; the server-rendered UTC text never reaches the page.
+  const askSentence = mounted && pendingApproval ? approvalAskSentence(pendingApproval.approval) : null;
+
+  if (mergedTicket) return <MergedTicketNotice ticket={mergedTicket} />;
 
   if (error || !ticket) {
     return (
@@ -244,6 +303,7 @@ export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps)
   }
 
   const tone = ticketStatusTone(ticket.status);
+  const typeLabel = ticketTypeLabel(ticket.ticketType);
 
   return (
     <div className="max-w-3xl">
@@ -257,12 +317,40 @@ export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps)
         </a>
       </div>
 
+      {pendingApproval && (
+        <div
+          role="status"
+          data-testid="ticket-pending-approval"
+          className="mb-6 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg bg-warning/10 p-4 text-sm text-warning-on-tint"
+        >
+          <div>
+            <p className="font-semibold">This ticket has work waiting for your approval</p>
+            {askSentence && <p className="mt-0.5">{askSentence}</p>}
+          </div>
+          <a
+            href={`${withBase('/approvals')}#${encodeURIComponent(pendingApproval.id)}`}
+            data-testid="ticket-pending-approval-link"
+            className="font-semibold underline underline-offset-4"
+          >
+            Review request
+          </a>
+        </div>
+      )}
+
       <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
         <div>
           <h1 className="font-display text-2xl font-semibold leading-tight tracking-tight text-foreground">
             {ticket.subject}
           </h1>
-          <p className="text-figures mt-1 text-sm text-muted-foreground">#{ticket.ticketNumber}</p>
+          <p className="text-figures mt-1 text-sm text-muted-foreground">
+            #{ticket.ticketNumber}
+            {typeLabel && (
+              <>
+                {' · '}
+                <span data-testid="portal-ticket-type">{typeLabel}</span>
+              </>
+            )}
+          </p>
         </div>
         <div className="flex items-center gap-4 pt-1.5">
           <StatusMark tone={tone}>
@@ -324,6 +412,9 @@ export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps)
               // author_type alone showed the customer their IT team's reply
               // labelled "Customer email".
               const isCustomerEmail = c.authorType === 'email' && c.senderPortalUserId != null;
+              // A reply the customer wrote in the helpdesk this one was
+              // imported from (#8313): theirs, though it has no portal login.
+              const isImportedCustomerReply = c.originalAuthorKind === 'requester';
               return (
               <li key={c.id} className="py-4" data-testid="ticket-comment">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -332,7 +423,10 @@ export function TicketDetails({ ticket, error, statusCode }: TicketDetailsProps)
                     {isCustomerEmail && (
                       <span className="ml-1.5 text-xs font-medium text-muted-foreground">Customer email</span>
                     )}
-                    {c.authorType !== 'portal' && !isCustomerEmail && (
+                    {isImportedCustomerReply && !isCustomerEmail && (
+                      <span className="ml-1.5 text-xs font-medium text-muted-foreground" data-testid="ticket-comment-imported-customer">Customer</span>
+                    )}
+                    {c.authorType !== 'portal' && !isCustomerEmail && !isImportedCustomerReply && (
                       <span className="ml-1.5 text-xs font-medium text-muted-foreground">Your IT team</span>
                     )}
                   </span>

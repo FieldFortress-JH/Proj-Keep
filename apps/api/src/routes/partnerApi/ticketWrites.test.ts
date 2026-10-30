@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   partnerContexts: [] as unknown[],
   select: vi.fn(),
   createTicket: vi.fn(),
+  linkAlertToTicket: vi.fn(),
   updateTicketFields: vi.fn(),
   changeTicketStatus: vi.fn(),
   assignTicket: vi.fn(),
@@ -69,6 +70,7 @@ vi.mock('../../services/ticketService', async (importOriginal) => {
   return {
     ...actual,
     createTicket: mocks.createTicket,
+    linkAlertToTicket: mocks.linkAlertToTicket,
     updateTicketFields: mocks.updateTicketFields,
     changeTicketStatus: mocks.changeTicketStatus,
     assignTicket: mocks.assignTicket,
@@ -115,7 +117,7 @@ function ticketRow(overrides: Record<string, unknown> = {}) {
   return {
     id: TICKET_ID, orgId: ORG_ID, partnerId: PARTNER_ID, ticketNumber: 'ABC123', internalNumber: 'T-2026-0001',
     subject: 'Printer offline', description: null, category: null,
-    status: 'new', statusId: null, priority: 'normal', source: 'api', workKind: 'support',
+    status: 'new', statusId: null, priority: 'normal', source: 'api', workKind: 'support', ticketType: 'incident',
     categoryId: null, assignedTo: null, deviceId: null,
     requesterContactId: null, submittedBy: null, submitterName: null, submitterEmail: null,
     tags: [], customFields: null, externalTicketId: null, externalTicketUrl: null,
@@ -180,6 +182,50 @@ describe('partner tickets write surface', () => {
     mocks.ticketExternalRefsFor.mockResolvedValue(new Map());
     app = new Hono();
     app.route('/', partnerApiRoutes);
+  });
+
+  it('links an in-org alert after creating the ticket as the principal', async () => {
+    selectResults = [[{ id: COMMENT_ID, orgId: ORG_ID }]];
+    const res = await send('/tickets', 'POST', { ...createBody, alertId: COMMENT_ID });
+    expect(res.status).toBe(201);
+    expect(mocks.createTicket.mock.calls[0]![0]).not.toHaveProperty('alertId');
+    expect(mocks.linkAlertToTicket).toHaveBeenCalledWith(TICKET_ID, COMMENT_ID, ACTOR, 'created_from');
+  });
+
+  it('rejects an alert in another accessible org before ticket creation', async () => {
+    selectResults = [[{ id: COMMENT_ID, orgId: OTHER_ORG_ID }]];
+    const res = await send('/tickets', 'POST', { ...createBody, alertId: COMMENT_ID });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ code: 'partner_ticket_alert_org_mismatch' });
+    expect(mocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('hides alerts outside principal reach before ticket creation', async () => {
+    const res = await send('/tickets', 'POST', { ...createBody, alertId: COMMENT_ID });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'partner_alert_not_found' });
+    expect(mocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('includes alertId in the real fingerprint and rejects a changed alert under the same key', async () => {
+    selectResults = [[{ id: COMMENT_ID, orgId: ORG_ID }]];
+    const headers = { 'X-Idempotency-Key': 'alert-link-key' };
+    expect((await send('/tickets', 'POST', { ...createBody, alertId: COMMENT_ID }, headers)).status).toBe(201);
+    const fingerprint = mocks.claimIdempotency.mock.calls[0]![0].fingerprint;
+    mocks.findIdempotencyReplay.mockImplementation(async (_principal, _route, _key, nextFingerprint) =>
+      nextFingerprint === fingerprint ? { kind: 'match', resourceId: TICKET_ID } : { kind: 'mismatch' });
+    const res = await send('/tickets', 'POST', { ...createBody, alertId: USER_ID }, headers);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'partner_tickets_idempotency_key_reused' });
+    expect(mocks.createTicket).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates link failures out of the create transaction', async () => {
+    selectResults = [[{ id: COMMENT_ID, orgId: ORG_ID }]];
+    mocks.linkAlertToTicket.mockRejectedValueOnce(new TicketServiceError('forced link failure', 500));
+    const res = await send('/tickets', 'POST', { ...createBody, alertId: COMMENT_ID }, { 'X-Idempotency-Key': 'failed-link' });
+    expect(res.status).toBe(500);
+    expect(mocks.linkIdempotencyResource).not.toHaveBeenCalled();
   });
 
   it('requires tickets:write on every route — tickets:read is not enough', async () => {
@@ -351,6 +397,9 @@ describe('partner tickets write surface', () => {
     expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { assigneeId: USER_ID })).status).toBe(400);
     expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { responseSlaMinutes: 5 })).status).toBe(400);
     expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { submittedBy: USER_ID })).status).toBe(400);
+    // #4617: a ticket budget is a staff decision on the customer's spend ceiling — not a PSA field.
+    expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { budgetMinutes: 60 })).status).toBe(400);
+    expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { budgetAmount: '100.00' })).status).toBe(400);
 
     selectResults = [[foundRow()]];
     const ok = await send(`/tickets/${TICKET_ID}`, 'PATCH', { subject: 'Renamed', tags: ['a'] });
@@ -481,12 +530,37 @@ describe('partner tickets write surface', () => {
     expect(partnerTicketCommentWriteResponseSchema.parse(await retry.json()).idempotencyReplay).toBe(true);
     expect(mocks.addTicketComment).toHaveBeenCalledTimes(2);
 
+    // #8972: the path ticket is a merge tombstone and the comment moved to the
+    // survivor: the replay resolves the comment by id and answers 200.
+    mocks.findIdempotencyReplay.mockResolvedValueOnce({ kind: 'replay', resourceId: COMMENT_ID });
+    selectResults = [
+      [foundRow({ mergedIntoTicketId: OTHER_ORG_ID, mergedAt: new Date('2026-09-27T08:00:00.000Z') })],
+      [commentRow({ ticketId: OTHER_ORG_ID })],
+    ];
+    const moved = await send(`/tickets/${TICKET_ID}/comments`, 'POST', { content: 'Mirrored note', isPublic: false }, { 'X-Idempotency-Key': 'c-1' });
+    expect(moved.status, await moved.clone().text()).toBe(200);
+    const movedBody = partnerTicketCommentWriteResponseSchema.parse(await moved.json());
+    expect(movedBody.idempotencyReplay).toBe(true);
+    expect(movedBody.id).toBe(COMMENT_ID);
+
     // A linked comment on another ticket cannot happen (ticket-bound claim +
-    // fingerprint); finding one is corrupt state, not a client error.
+    // fingerprint); finding one on a LIVE path ticket is corrupt state, not a client error.
     mocks.findIdempotencyReplay.mockResolvedValueOnce({ kind: 'replay', resourceId: COMMENT_ID });
     selectResults = [[foundRow()], [commentRow({ ticketId: OTHER_ORG_ID })]];
     const wrongTicket = await send(`/tickets/${TICKET_ID}/comments`, 'POST', { content: 'Mirrored note', isPublic: false }, { 'X-Idempotency-Key': 'c-1' });
     expect(wrongTicket.status).toBe(500);
+  });
+
+  it('POST /tickets replays the original response when the created ticket is now a merge tombstone', async () => {
+    mocks.findIdempotencyReplay.mockResolvedValueOnce({ kind: 'replay', resourceId: TICKET_ID });
+    selectResults = [[foundRow({ mergedIntoTicketId: OTHER_ORG_ID, mergedAt: new Date('2026-09-27T08:00:00.000Z') })]];
+    const res = await send('/tickets', 'POST', createBody, { 'X-Idempotency-Key': 'psa-1' });
+    expect(res.status, await res.clone().text()).toBe(200);
+    const body = partnerTicketWriteResponseSchema.parse(await res.json());
+    expect(body.idempotencyReplay).toBe(true);
+    expect(body.id).toBe(TICKET_ID);
+    expect(body.data).toMatchObject({ mergedIntoTicketId: OTHER_ORG_ID, mergedAt: '2026-09-27T08:00:00.000Z' });
+    expect(mocks.createTicket).not.toHaveBeenCalled();
   });
 
   it('withholds the echoed record (data null + blocked) when a written field carries a credential, but still returns the ids', async () => {
@@ -501,4 +575,38 @@ describe('partner tickets write surface', () => {
     expect(body.blocked).toEqual([expect.objectContaining({ id: TICKET_ID, resource: 'tickets' })]);
     expect(JSON.stringify(body)).not.toContain('AKIAIOSFODNN7EXAMPLE');
   });
+
+  // #7900 / #8592 W01: ticketType is an additive field on the write surface.
+  it('POST /tickets forwards an explicit ticketType, echoes it, and rejects an unknown one', async () => {
+    mocks.createTicket.mockResolvedValueOnce(ticketRow({ ticketType: 'change' }));
+    const res = await send('/tickets', 'POST', { ...createBody, ticketType: 'change' });
+    expect(res.status, await res.clone().text()).toBe(201);
+    expect(mocks.createTicket.mock.calls[0]![0]).toMatchObject({ ticketType: 'change', source: 'api' });
+    expect(partnerTicketWriteResponseSchema.parse(await res.json()).data?.ticketType).toBe('change');
+
+    mocks.createTicket.mockClear();
+    expect((await send('/tickets', 'POST', { ...createBody, ticketType: 'outage' })).status).toBe(400);
+    expect(mocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets without ticketType sends none (the service defaults it) and the record still carries one', async () => {
+    const res = await send('/tickets', 'POST', createBody);
+    expect(res.status).toBe(201);
+    expect(mocks.createTicket.mock.calls[0]![0]).not.toHaveProperty('ticketType');
+    expect(partnerTicketWriteResponseSchema.parse(await res.json()).data?.ticketType).toBe('incident');
+  });
+
+  it('PATCH /tickets/:id reclassifies through updateTicketFields; an unknown type is a 400', async () => {
+    selectResults = [[foundRow()]];
+    mocks.updateTicketFields.mockResolvedValueOnce(ticketRow({ ticketType: 'problem' }));
+    const ok = await send(`/tickets/${TICKET_ID}`, 'PATCH', { ticketType: 'problem' });
+    expect(ok.status, await ok.clone().text()).toBe(200);
+    expect(mocks.updateTicketFields).toHaveBeenCalledWith(TICKET_ID, { ticketType: 'problem' }, ACTOR);
+    expect(partnerTicketWriteResponseSchema.parse(await ok.json()).data?.ticketType).toBe('problem');
+
+    mocks.updateTicketFields.mockClear();
+    expect((await send(`/tickets/${TICKET_ID}`, 'PATCH', { ticketType: 'outage' })).status).toBe(400);
+    expect(mocks.updateTicketFields).not.toHaveBeenCalled();
+  });
 });
+

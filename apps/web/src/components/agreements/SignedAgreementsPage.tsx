@@ -1,17 +1,26 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { FileText } from 'lucide-react';
+import { QUOTE_ACCEPT_ON_BEHALF_METHODS } from '@breeze/shared';
 import '@/lib/i18n';
 import { navigateTo } from '@/lib/navigation';
 import { useHashState } from '@/lib/useHashState';
 import { fetchWithAuth } from '../../stores/auth';
 import { fetchAllOrganizationsFrom } from '../../lib/fetchAllOrganizations';
 import { runAction, handleActionError } from '../../lib/runAction';
-import { listContractDocuments, contractDocumentPdfPath, linkContractDocument, type ContractDocument } from '../../lib/api/contractDocuments';
+import { listContractDocuments, contractDocumentPdfPath, linkContractDocument, signedAgreementFilename, type ContractDocument, type SignedAgreementCopy } from '../../lib/api/contractDocuments';
 import { listContracts, type ContractSummary } from '../../lib/api/contracts';
 import { usePdfDownload } from '../billing/shared/usePdfDownload';
 import { formatDate } from '../billing/invoiceTypes';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePermissions } from '../../lib/permissions';
+import { showToast } from '../shared/Toast';
+import RecordSignedAgreementDialog from './RecordSignedAgreementDialog';
+import SendAgreementDialog from './SendAgreementDialog';
+import AgreementRequestsTable from './AgreementRequestsTable';
+
+type StatusView = 'pending' | 'signed' | 'closed';
+const STATUS_VIEWS: readonly StatusView[] = ['pending', 'signed', 'closed'];
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -20,24 +29,43 @@ interface Organization {
   name: string;
 }
 
-/** Same reasoning as ContractDocumentsSection's DocumentDownloadButton — the
- *  download hook must be called once per row, not inside a `.map()`. */
-function DocumentDownloadButton({ doc }: { doc: ContractDocument }) {
+/** Same reasoning as ContractDocumentsSection's DocumentDownloadButton - the
+ *  download hook must be called once per row, not inside a `.map()`. The
+ *  certified copy is always a PDF (agreement + signature certificate); the
+ *  original streams the stored bytes, which for an externally signed scan is a
+ *  PNG/JPEG. */
+function DocumentDownloadButton({ doc, copy }: { doc: ContractDocument; copy: SignedAgreementCopy }) {
   const { t } = useTranslation('billing');
   const { download, downloading } = usePdfDownload({
-    path: contractDocumentPdfPath(doc.id),
-    filename: `contract-document-${doc.id}.pdf`,
+    path: contractDocumentPdfPath(doc.id, copy),
+    filename: signedAgreementFilename(doc, copy),
     errorMessage: t('contracts.contractDetail.documents.downloadError'),
+    // The API serves the original instead when the certificate can't be built
+    // and says so in X-Agreement-Copy; name the file for what it really is.
+    onResponse: copy === 'certified'
+      ? (res) => {
+          if (res.headers.get('X-Agreement-Copy') !== 'original') return;
+          showToast({ type: 'warning', message: t('agreements.signedPage.certifiedUnavailable') });
+          return { filename: signedAgreementFilename(doc, 'original') };
+        }
+      : undefined,
   });
+  const original = copy === 'original';
   return (
     <button
       type="button"
       onClick={() => void download()}
       disabled={downloading}
-      data-testid={`contract-document-download-${doc.id}`}
-      className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
+      data-testid={original ? `contract-document-download-original-${doc.id}` : `contract-document-download-${doc.id}`}
+      className={
+        original
+          ? 'rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted disabled:opacity-50'
+          : 'rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50'
+      }
     >
-      {downloading ? t('contracts.documentsTab.preparing') : t('contracts.documentsTab.download')}
+      {downloading
+        ? t('contracts.documentsTab.preparing')
+        : original ? t('agreements.signedPage.downloadOriginal') : t('contracts.documentsTab.download')}
     </button>
   );
 }
@@ -66,6 +94,15 @@ export default function SignedAgreementsPage({
   const { t } = useTranslation('billing');
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const locked = Boolean(lockedOrgId || lockedContractId);
+  const { can } = usePermissions();
+  // UX only — the record-signed route re-checks agreements:send server-side
+  // (#9075 W2a moved it off agreements:write, OD7 B).
+  const canRecord = can('agreements', 'send');
+  // Sending creates a draft (write) and then sends it (send); server re-checks both.
+  const canSendRequest = can('agreements', 'send') && can('agreements', 'write');
+  const [recordOpen, setRecordOpen] = useState(false);
+  const [sendOpen, setSendOpen] = useState(false);
+  const [requestsReload, setRequestsReload] = useState(0);
 
   // CLAUDE.md: hash for transient UI state, never query params. Embeds do NOT
   // read the hash — two lists on one page (org record) would fight over it.
@@ -73,10 +110,29 @@ export default function SignedAgreementsPage({
     defaultUnlinkedOnly,
     (h) => (locked ? undefined : new URLSearchParams(h).get('unlinked') === '1' || undefined),
   );
+  // `#status=pending|closed` (omitted for the default signed view), combined
+  // with `unlinked=1`, which only applies to the signed view. Embeds keep the
+  // chip state local for the same two-lists-fight-over-the-hash reason.
+  const [status, setStatus] = useHashState<StatusView>('signed', (h) => {
+    if (locked) return undefined;
+    const v = new URLSearchParams(h).get('status');
+    return STATUS_VIEWS.includes(v as StatusView) ? (v as StatusView) : undefined;
+  });
+  const writeHash = (nextStatus: StatusView, nextUnlinked: boolean) => {
+    if (locked) return;
+    const params = new URLSearchParams();
+    if (nextStatus !== 'signed') params.set('status', nextStatus);
+    else if (nextUnlinked) params.set('unlinked', '1');
+    window.location.hash = params.toString();
+  };
   const toggleUnlinked = () => {
     const next = !unlinkedOnly;
     setUnlinkedOnly(next);
-    if (!locked) window.location.hash = next ? 'unlinked=1' : '';
+    writeHash(status, next);
+  };
+  const selectStatus = (next: StatusView) => {
+    setStatus(next);
+    writeHash(next, unlinkedOnly);
   };
 
   const [documents, setDocuments] = useState<ContractDocument[]>([]);
@@ -93,6 +149,7 @@ export default function SignedAgreementsPage({
   const [linking, setLinking] = useState(false);
 
   const load = useCallback(async () => {
+    if (status !== 'signed') { setLoading(false); return; }
     try {
       setLoading(true);
       setError(undefined);
@@ -113,7 +170,7 @@ export default function SignedAgreementsPage({
     } finally {
       setLoading(false);
     }
-  }, [stableT, unlinkedOnly, lockedOrgId, lockedContractId]);
+  }, [stableT, status, unlinkedOnly, lockedOrgId, lockedContractId]);
 
   useEffect(() => {
     void load();
@@ -157,6 +214,26 @@ export default function SignedAgreementsPage({
     })();
   };
 
+  /** An MSP-recorded agreement is not the customer's own acceptance, so the row
+   *  must not read "Accepted with quote … by …". Method label reuses the
+   *  accept-on-behalf set (already translated); an unknown method is shown raw
+   *  rather than hidden. A PNG/JPEG upload is a photo or scan, not a PDF, so
+   *  say so. */
+  const onBehalfSubtitle = (doc: ContractDocument): string => {
+    const known = (QUOTE_ACCEPT_ON_BEHALF_METHODS as readonly string[]).includes(doc.acceptanceMethod ?? '');
+    const method = known
+      // i18n-dynamic: the key is built from the shared enum member.
+      ? t(/* i18n-dynamic */ `quotes.actions.acceptOnBehalf.method.${doc.acceptanceMethod}`)
+      : doc.acceptanceMethod ?? '—';
+    const parts = [t('agreements.signedPage.source.recorded', { method })];
+    if (doc.sourceKind === 'quote' && doc.quoteNumber) {
+      parts.push(t('agreements.signedPage.source.quote', { number: doc.quoteNumber }));
+    }
+    parts.push(doc.signerName ?? '—', doc.signedAt ? formatDate(doc.signedAt) : '—');
+    if (doc.mime?.startsWith('image/')) parts.push(t('agreements.signedPage.fileType.image'));
+    return parts.join(' · ');
+  };
+
   const confirmLink = async () => {
     if (!linkingDoc || !selectedContractId) {
       setLinkError(t('contracts.documentsTab.linkDialog.selectContract'));
@@ -183,16 +260,67 @@ export default function SignedAgreementsPage({
   return (
     <div className="space-y-4" data-testid="signed-agreements-tab">
       {/* Inside an embed the surrounding section already names this list (the
-          org record's <summary>, the contract page's own heading). */}
-      {!locked && (
-        <div>
-          <h2 className="text-lg font-semibold">{t('agreements.signedPage.title')}</h2>
-          <p className="text-sm text-muted-foreground">{t('agreements.signedPage.description')}</p>
+          org record's <summary>, the contract page's own heading), so the
+          header row there holds only the record button. The button lives in
+          this row on all three surfaces. */}
+      {(!locked || canRecord || canSendRequest) && (
+        <div className="flex items-start justify-between gap-3">
+          {!locked ? (
+            <div>
+              <h2 className="text-lg font-semibold">{t('agreements.signedPage.title')}</h2>
+              <p className="text-sm text-muted-foreground">{t('agreements.signedPage.description')}</p>
+            </div>
+          ) : (
+            <span />
+          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {canSendRequest && (
+              <button
+                type="button"
+                onClick={() => setSendOpen(true)}
+                data-testid="agreements-send-open"
+                className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90"
+              >
+                {t('agreements.signedPage.sendForSignature')}
+              </button>
+            )}
+            {canRecord && (
+              <button
+                type="button"
+                onClick={() => setRecordOpen(true)}
+                data-testid="agreements-record-open"
+                className={
+                  canSendRequest
+                    ? 'rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-muted'
+                    : 'rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90'
+                }
+              >
+                {t('agreements.signedPage.recordSigned')}
+              </button>
+            )}
+          </div>
         </div>
       )}
 
-      {!lockedContractId && (
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-2" data-testid="agreements-status-filter">
+          {STATUS_VIEWS.map((view) => (
+            <button
+              key={view}
+              type="button"
+              onClick={() => selectStatus(view)}
+              aria-pressed={status === view}
+              data-testid={`agreements-status-${view}`}
+              className={`rounded-full border px-3 py-1 text-xs font-medium ${
+                status === view ? 'border-primary bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              {/* i18n-dynamic: key built from the status view enum. */}
+              {t(/* i18n-dynamic */ `agreements.signedPage.filter.${view}`)}
+            </button>
+          ))}
+        </div>
+        {status === 'signed' && !lockedContractId && (
           <button
             type="button"
             onClick={toggleUnlinked}
@@ -204,10 +332,18 @@ export default function SignedAgreementsPage({
           >
             {t('agreements.signedPage.unlinkedOnly')}
           </button>
-        </div>
-      )}
+        )}
+      </div>
 
-      {loading ? (
+      {status !== 'signed' ? (
+        <AgreementRequestsTable
+          bucket={status}
+          lockedOrgId={lockedOrgId}
+          lockedContractId={lockedContractId}
+          orgNames={orgNames}
+          reloadKey={requestsReload}
+        />
+      ) : loading ? (
         <div className="flex items-center justify-center py-16" data-testid="contract-documents-loading">
           <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
         </div>
@@ -262,7 +398,11 @@ export default function SignedAgreementsPage({
                     {/* The no-quote variant exists because quoteId/quoteNumber are
                         left-joined and genuinely null for a deleted quote. */}
                     <div className="text-xs text-muted-foreground" data-testid="signed-agreement-subtitle">
-                      {doc.quoteNumber
+                      {doc.evidenceAvailable === false
+                        ? t('agreements.signedPage.evidenceUnavailable')
+                        : doc.acceptanceOrigin === 'on_behalf'
+                        ? onBehalfSubtitle(doc)
+                        : doc.quoteNumber
                         ? t('agreements.signedPage.rowSubtitle', {
                             quoteNumber: doc.quoteNumber,
                             signer: doc.signerName ?? '—',
@@ -277,7 +417,11 @@ export default function SignedAgreementsPage({
                   {!lockedOrgId && (
                     <td className="px-3 py-2 text-muted-foreground">{orgNames[doc.orgId] ?? '—'}</td>
                   )}
-                  <td className="px-3 py-2">{doc.signerName ?? '—'}</td>
+                  {/* Evidence snapshot (#8865 W1b): NULL only on a legacy quote row
+                      whose acceptance was deleted before the back-fill. */}
+                  <td className="px-3 py-2" data-testid="signed-agreement-signer">
+                    {doc.signerName ?? t('agreements.signedPage.evidenceUnavailable')}
+                  </td>
                   <td className="px-3 py-2">{doc.signedAt ? formatDate(doc.signedAt) : '—'}</td>
                   <td className="px-3 py-2">
                     {doc.quoteId ? (
@@ -312,7 +456,8 @@ export default function SignedAgreementsPage({
                   )}
                   <td className="px-3 py-2 text-right">
                     <div className="flex items-center justify-end gap-2">
-                      <DocumentDownloadButton doc={doc} />
+                      <DocumentDownloadButton doc={doc} copy="certified" />
+                      <DocumentDownloadButton doc={doc} copy="original" />
                       {!doc.contractId && !lockedContractId && (
                         <button
                           type="button"
@@ -330,6 +475,33 @@ export default function SignedAgreementsPage({
             </tbody>
           </table>
         </div>
+      )}
+
+      {canRecord && (
+        <RecordSignedAgreementDialog
+          open={recordOpen}
+          onClose={() => setRecordOpen(false)}
+          lockedOrgId={lockedOrgId}
+          lockedContractId={lockedContractId}
+          onRecorded={() => {
+            setRecordOpen(false);
+            void load();
+          }}
+        />
+      )}
+
+      {canSendRequest && (
+        <SendAgreementDialog
+          open={sendOpen}
+          onClose={() => setSendOpen(false)}
+          lockedOrgId={lockedOrgId}
+          lockedContractId={lockedContractId}
+          onSent={() => {
+            setSendOpen(false);
+            selectStatus('pending');
+            setRequestsReload((n) => n + 1);
+          }}
+        />
       )}
 
       {linkingDoc && (

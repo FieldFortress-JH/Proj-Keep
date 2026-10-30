@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Auf einem Gerät testen",
       "selectDevice": "Gerät",
-      "run": "Test ausführen"
+      "run": "Test ausführen",
+      "saveToTest": "Speichern, um Ihre Änderungen zu testen"
     },
     "deliveryPreview": {
       "selectOrg": "Wählen Sie eine Organisation für die Zustellungsvorschau.",
@@ -192,7 +193,8 @@
     "script": "Skriptprüfung",
     "network_check": "Netzwerkprüfung",
     "hardware_health": "Hardwarezustand",
-    "time_sync": "Zeitsynchronisierung"
+    "time_sync": "Zeitsynchronisierung",
+    "container_image_currency": "Aktualität von Container-Images"
   },
   "fields": {
     "operator": "Vergleich",
@@ -244,7 +246,9 @@
     "expectedValue": "Erwarteter Wert",
     "nameserver": "DNS-Server",
     "degradedIsFailure": "Beeinträchtigt als Ausfall werten",
-    "maxResponseMs": "Fehler bei Antwort langsamer als (ms)"
+    "maxResponseMs": "Fehler bei Antwort langsamer als (ms)",
+    "eventLogCollectionNoSource": "Anwendungsereignisse der Stufen Information und Warnung werden nur von {{providers}} erfasst. Ereignisse anderer Quellen entsprechen dieser Regel nur bei Fehler oder Kritisch, sofern die Quelle nicht in einer Ereignisprotokoll-Konfigurationsrichtlinie aufgeführt ist (Konfigurationsrichtlinie → Ereignisprotokolle → Anwendungsanbieter).",
+    "eventLogCollectionSourceNotCollected": "Der Agent erfasst keine Anwendungsereignisse der Stufen Information oder Warnung von „{{source}}“, sofern die Quelle nicht in einer Ereignisprotokoll-Konfigurationsrichtlinie aufgeführt ist (Konfigurationsrichtlinie → Ereignisprotokolle → Anwendungsanbieter). Andernfalls entspricht diese Regel nur ihren Fehler- oder kritischen Ereignissen. Integrierte Anbieter: {{providers}}."
   },
   "operators": {
     "gt": "größer als",
@@ -268,6 +272,7 @@
     "system": "System"
   },
   "eventLevels": {
+    "info": "Informationen",
     "warning": "Warnung",
     "error": "Fehler",
     "critical": "Kritisch"
@@ -328,10 +333,13 @@
     "cancel": "Abbrechen",
     "detachConfirm": "Von {{policy}} lösen?",
     "errors": {
+      "loadGroups": "Gerätegruppen konnten nicht geladen werden.",
       "attach": "Monitor konnte nicht angehängt werden",
       "detach": "Monitor konnte nicht gelöst werden",
       "linkedFeature": "Die Monitore dieser Richtlinie stammen aus einer gemeinsamen Funktionsrichtlinie. Bearbeiten Sie diese oder wählen Sie eine andere Richtlinie."
-    }
+    },
+    "partnerWideGroups": "Alle Org. (partnerweit)",
+    "organizationGroups": "Organisationsgruppen"
   },
   "policyTab": {
     "title": "Monitore",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Ältere Alarmregeln",
     "description": "Eigenständige Alarmregeln, die nicht von einem Monitor verwaltet werden. Konvertieren Sie sie, um Reaktionen, Zustellung und Eskalation an einem Ort zu erhalten.",
-    "empty": "Keine älteren Regeln.",
+    "empty": "Keine eigenständigen Alarmregeln müssen konvertiert werden.",
     "columns": {
       "name": "Name",
       "template": "Vorlage",
@@ -535,11 +543,13 @@
       "more": "Mehr laden",
       "empty": "Kein Konvertierungsverlauf.",
       "system": "Automatisches System",
+      "unknownUser": "Unbekannter Benutzer",
       "reverted": "Rückgängig gemacht",
       "deadline": "Rückgängig ist nach Entfernung der Quelllaufzeit durch die Stilllegung der Legacy-Benachrichtigungen nicht verfügbar."
     },
     "errorCodes": {
       "preview_stale": "Die Richtlinie wurde seit dieser Vorschau geändert. Erstellen Sie vor der Konvertierung erneut eine Vorschau.",
+      "conversion_contended": "Gleichzeitige Änderungen haben die Konvertierung unterbrochen. Es wurde nichts geändert. Versuchen Sie es erneut.",
       "preview_failed": "Die Vorschau konnte nicht erstellt werden. Versuchen Sie es später erneut.",
       "equivalence_delta": "Die konvertierten Monitore würden sich nicht auf jedem Gerät wie die Legacy-Regeln verhalten. Prüfen Sie die Vorschau vor der Konvertierung.",
       "CONVERSION_PREREQUISITE_MISSING": "Ein erforderliches Plattform-Update wurde noch nicht bereitgestellt, daher ist keine Konvertierung möglich.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "Zeitrichtlinie wurde nicht angewendet",
           "policy_conflict_gpo": "Gruppenrichtlinie steuert die Zeiteinstellungen"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Mindestanzahl Tage veraltet"
       }
     }
   },

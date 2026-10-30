@@ -160,6 +160,10 @@ type HelperLifecycleManager struct {
 	disconnectedSince map[uint32]time.Time
 	now               func() time.Time
 
+	// lockObserver hears Windows session lock / unlock (#10190 W05: the
+	// prompt host holds prompts for a locked session). Guarded by mu.
+	lockObserver func(winSession uint32, locked bool)
+
 	// mode is the resolved lifecycle mode. It is mutable: SetModeOverride can
 	// flip it live from a heartbeat while the run loop reads it concurrently, so
 	// every read/write of mode MUST hold m.mu (use currentMode() off the hot
@@ -178,6 +182,11 @@ type HelperLifecycleManager struct {
 
 	leases map[HelperKey]*helperLease
 	kickCh chan struct{}
+
+	// pamHold is set while UAC interception is enabled; in on-demand mode it
+	// adds a SYSTEM helper for every signed-in session to the desired set (see
+	// lifecycle_pam_hold.go). Guarded by m.mu.
+	pamHold bool
 }
 
 func newHelperLifecycleManager(broker *Broker, detector SessionDetector, scmCh <-chan SCMSessionEvent, spawner helperSpawner) *HelperLifecycleManager {
@@ -287,7 +296,8 @@ func (m *HelperLifecycleManager) detectedDesired() (map[HelperKey]bool, error) {
 }
 
 // computeDesired is the single desired-set entry point: detector-driven in
-// always-on mode (the historical behavior), lease-driven in on-demand mode.
+// always-on mode (the historical behavior), lease-driven in on-demand mode —
+// plus, while the PAM hold is on, a SYSTEM helper per signed-in session.
 func (m *HelperLifecycleManager) computeDesired() (map[HelperKey]bool, error) {
 	if m.currentMode() != LifecycleModeOnDemand {
 		return m.detectedDesired()
@@ -304,6 +314,9 @@ func (m *HelperLifecycleManager) computeDesired() (map[HelperKey]bool, error) {
 	for _, key := range expired {
 		log.Info("lease expired", "helperKey", key.String())
 		delete(m.leases, key)
+	}
+	if m.pamHold {
+		addPAMHeldKeys(desired, sessions)
 	}
 	m.mu.Unlock()
 	return desired, nil
@@ -631,4 +644,44 @@ func helperKeyFromSession(session *Session) (HelperKey, bool) {
 
 func (m *HelperLifecycleManager) String() string {
 	return fmt.Sprintf("HelperLifecycleManager(tracked=%d)", m.registry.len())
+}
+
+// SCM SessionChange codes that change whether a session's desktop can be
+// seen (winuser.h WTS_*; lifecycle.go names the full set, Windows-only).
+const (
+	scmSessionLogoff    = 0x6
+	scmSessionLock      = 0x7
+	scmSessionUnlock    = 0x8
+	scmSessionTerminate = 0xb
+)
+
+// SetSessionLockObserver installs the callback that hears a session being
+// locked (true) or unlocked (false). A logoff or terminate reports unlocked:
+// Windows reuses session ids, so a stale lock must not hold the next logon's
+// prompts. Called on the lifecycle goroutine; f must not block.
+func (m *HelperLifecycleManager) SetSessionLockObserver(f func(winSession uint32, locked bool)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lockObserver = f
+}
+
+// observeSessionLock forwards a lock-relevant SCM session event.
+func (m *HelperLifecycleManager) observeSessionLock(event SCMSessionEvent) {
+	if event.SessionID == 0 {
+		return
+	}
+	var locked bool
+	switch event.EventType {
+	case scmSessionLock:
+		locked = true
+	case scmSessionUnlock, scmSessionLogoff, scmSessionTerminate:
+	default:
+		return
+	}
+	m.mu.Lock()
+	f := m.lockObserver
+	m.mu.Unlock()
+	if f != nil {
+		f(event.SessionID, locked)
+	}
 }

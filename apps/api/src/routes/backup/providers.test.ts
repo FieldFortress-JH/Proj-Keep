@@ -12,13 +12,21 @@ const { authState, gates, adapterState, dbState } = vi.hoisted(() => ({
   gates: { permission: false, mfa: false },
   adapterState: {
     test: { ok: true, rootId: '1000', rootName: 'OliveTech', customerCount: 3 } as Record<string, unknown>,
+    /** Runs during the vendor round-trip — simulates a concurrent writer. */
+    onTest: null as null | (() => void),
+    customers: [] as Array<{ vendorCustomerId: string }>,
   },
   dbState: {
     connections: [] as Array<Record<string, unknown>>,
+    customers: [] as Array<Record<string, unknown>>,
     inserted: [] as Array<Record<string, unknown>>,
     updated: [] as Array<Record<string, unknown>>,
     deleted: 0,
     executed: [] as string[],
+    /** Count of `SELECT ... FOR UPDATE` row locks taken. */
+    locks: 0,
+    /** When set, the `FOR UPDATE` re-read throws (lock timeout, lost connection). */
+    lockError: null as Error | null,
     // Defense-in-depth: the hand-rolled mock below ignores the drizzle
     // condition it's given (ANY where clause returns every seeded row), so
     // deleting a tenant-scoping `eq(...partnerId...)` from a route query
@@ -48,6 +56,33 @@ function referencesColumn(node: unknown, marker: string): boolean {
 // select key, matching the row fixtures below); anything else (the `sql`
 // tagged-template `hasCredentials` expression) is drizzle's `SQL` class, not a
 // string, and is treated as the "does a ciphertext exist" computed column.
+/**
+ * A `db.select(...).from(...).where(...)` chain over the seeded rows that also
+ * supports `.limit()` and `.for('update')` in either order, counting the
+ * row locks so a test can assert the locked re-read happened.
+ */
+function selectChain(columns: Record<string, unknown> | undefined) {
+  return {
+    from: vi.fn((table: { vendorCustomerId?: string }) => ({
+      where: vi.fn((..._a: unknown[]) => {
+        dbState.capturedSelectWheres.push(_a[0]);
+        const rows = () => (table.vendorCustomerId ? dbState.customers : dbState.connections).map((row) => projectRow(columns, row));
+        const build = (): unknown => Object.assign(Promise.resolve(rows()), {
+          limit: vi.fn(() => build()),
+          orderBy: vi.fn(async () => rows()),
+          for: vi.fn((_strength: string) => {
+            if (dbState.lockError) return Object.assign(Promise.reject(dbState.lockError), { limit: vi.fn() });
+            dbState.locks += 1;
+            return build();
+          }),
+        });
+        return build();
+      }),
+      orderBy: vi.fn(async () => dbState.connections.map((row) => projectRow(columns, row))),
+    })),
+  };
+}
+
 function projectRow(columns: Record<string, unknown> | undefined, row: Record<string, unknown>) {
   if (!columns) return row;
   const out: Record<string, unknown> = {};
@@ -61,17 +96,7 @@ function projectRow(columns: Record<string, unknown> | undefined, row: Record<st
 
 vi.mock('../../db', () => ({
   db: {
-    select: vi.fn((columns?: Record<string, unknown>) => ({
-      from: vi.fn(() => ({
-        where: vi.fn((..._a: unknown[]) => {
-          dbState.capturedSelectWheres.push(_a[0]);
-          const rows = dbState.connections.map((row) => projectRow(columns, row));
-          const chain = { limit: vi.fn(async () => rows), orderBy: vi.fn(async () => rows) };
-          return Object.assign(Promise.resolve(rows), chain);
-        }),
-        orderBy: vi.fn(async () => dbState.connections.map((row) => projectRow(columns, row))),
-      })),
-    })),
+    select: vi.fn((columns?: Record<string, unknown>) => selectChain(columns)),
     insert: vi.fn(() => ({
       values: vi.fn((v: Record<string, unknown>) => {
         // Mirror the real `backup_provider_connections_partner_provider_name_uniq`
@@ -106,6 +131,7 @@ vi.mock('../../db', () => ({
       where: vi.fn(async (cond: unknown) => { dbState.capturedDeleteWheres.push(cond); dbState.deleted += 1; return []; }),
     })),
     transaction: vi.fn(async (cb: (tx: unknown) => Promise<unknown>) => cb({
+      select: vi.fn((columns?: Record<string, unknown>) => selectChain(columns)),
       update: vi.fn(() => ({
         set: vi.fn((v: Record<string, unknown>) => {
           // Same duplicate-name simulation for the PATCH rename path, which
@@ -165,7 +191,7 @@ vi.mock('../../db/schema', () => ({
     lastSyncLinkedDevices: 'last_sync_linked_devices', lastSyncAmbiguousDevices: 'last_sync_ambiguous_devices',
     createdBy: 'created_by', createdAt: 'created_at', updatedAt: 'updated_at',
   },
-  backupProviderCustomers: { id: 'id', connectionId: 'connection_id', partnerId: 'partner_id', orgId: 'org_id' },
+  backupProviderCustomers: { vendorCustomerId: 'vendor_customer_id', id: 'id', connectionId: 'connection_id', partnerId: 'partner_id', orgId: 'org_id' },
   backupProviderDevices: { id: 'id', connectionId: 'connection_id', orgId: 'org_id', portalShowProviderName: 'portal_show_provider_name' },
   organizations: { id: 'id', name: 'name', partnerId: 'partner_id' },
   devices: { id: 'id', orgId: 'org_id', hostname: 'hostname', displayName: 'display_name', siteId: 'site_id', status: 'status' },
@@ -209,24 +235,34 @@ vi.mock('../../services/permissions', () => ({
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
 
 vi.mock('../../services/backupProviders/registry', () => ({
-  BACKUP_PROVIDER_KEYS: ['cove'],
+  BACKUP_PROVIDER_KEYS: ['cove', 'dropsuite'],
   getBackupProvider: vi.fn((key: string) => {
-    if (key !== 'cove') throw new Error(`Unknown backup provider "${key}" (registered: cove)`);
+    if (key !== 'cove' && key !== 'dropsuite') throw new Error(`Unknown backup provider "${key}" (registered: cove)`);
     return {
-      key: 'cove',
-      label: 'Cove Data Protection',
+      key,
+      label: key === 'cove' ? 'Cove Data Protection' : 'NinjaOne SaaS Backup (Dropsuite)',
+      defaultBaseUrl: key === 'cove' ? 'https://api.backup.management/jsonapi' : undefined,
+      defaultSyncIntervalMinutes: key === 'cove' ? 30 : 60,
+      rootContinuity: key === 'dropsuite' ? 'customer_overlap' : undefined,
+      validateBaseUrl: key === 'dropsuite'
+        ? (url: string) => new URL(url).hostname === 'backup.dropsuite.com' ? null : 'Host is not allowed'
+        : undefined,
       credentialsSchema: {
         safeParse: (v: unknown) => {
-          const ok = !!v && typeof v === 'object'
-            && typeof (v as any).partnerName === 'string'
-            && typeof (v as any).username === 'string'
-            && typeof (v as any).password === 'string';
+          const ok = !!v && typeof v === 'object' && (key === 'dropsuite'
+            ? typeof (v as any).resellerToken === 'string' && typeof (v as any).authToken === 'string'
+            : typeof (v as any).partnerName === 'string'
+              && typeof (v as any).username === 'string'
+              && typeof (v as any).password === 'string');
           return ok ? { success: true, data: v } : { success: false, error: { message: 'bad creds' } };
         },
       },
-      testConnection: vi.fn(async () => adapterState.test),
-      listCustomers: vi.fn(async () => []),
-      listDevices: vi.fn(async () => []),
+      testConnection: vi.fn(async () => {
+        adapterState.onTest?.();
+        return adapterState.test;
+      }),
+      listCustomers: vi.fn(async () => adapterState.customers),
+      listDevices: vi.fn(async () => ({ devices: [], failedCustomerIds: [] })),
     };
   }),
 }));
@@ -262,6 +298,7 @@ vi.mock('../../services/backupProviders/mapping', () => ({
 }));
 
 import { authMiddleware } from '../../middleware/auth';
+import { writeRouteAudit } from '../../services/auditEvents';
 import { backupProviderRoutes } from './providers';
 
 const CONNECTION_ID = '33333333-3333-4333-8333-333333333333';
@@ -292,11 +329,16 @@ describe('backup provider connection routes', () => {
     authState.partnerOrgAccess = 'all';
     authState.accessibleOrgIds = [];
     adapterState.test = { ok: true, rootId: '1000', rootName: 'OliveTech', customerCount: 3 };
+    adapterState.onTest = null;
+    adapterState.customers = [];
+    dbState.customers = [];
     dbState.connections = [];
     dbState.inserted = [];
     dbState.updated = [];
     dbState.deleted = 0;
     dbState.executed = [];
+    dbState.locks = 0;
+    dbState.lockError = null;
     dbState.capturedSelectWheres = [];
     dbState.capturedUpdateWheres = [];
     dbState.capturedDeleteWheres = [];
@@ -364,6 +406,55 @@ describe('backup provider connection routes', () => {
       const payload = await res.json();
       expect(payload.data.hasCredentials).toBe(true);
       expect(JSON.stringify(payload)).not.toContain(CREDS.password);
+    });
+
+    it('keeps the Cove base URL and 30-minute sync defaults', async () => {
+      const res = await app.request('/backup/providers/connections', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(201);
+      expect(dbState.inserted[0]).toMatchObject({
+        baseUrl: 'https://api.backup.management/jsonapi', syncIntervalMinutes: 30,
+      });
+    });
+
+    const dropsuiteBody = {
+      provider: 'dropsuite', name: 'Example SaaS Backup', baseUrl: 'https://backup.dropsuite.com/api/',
+      credentials: { resellerToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', authToken: 'synthetic-admin' },
+    };
+
+    it('uses the Dropsuite supplied base URL and 60-minute sync default', async () => {
+      const res = await app.request('/backup/providers/connections', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(dropsuiteBody),
+      });
+      expect(res.status).toBe(201);
+      expect(dbState.inserted[0]).toMatchObject({
+        provider: 'dropsuite', baseUrl: dropsuiteBody.baseUrl, syncIntervalMinutes: 60,
+      });
+    });
+
+    it('preserves an explicit Dropsuite sync interval', async () => {
+      const res = await app.request('/backup/providers/connections', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...dropsuiteBody, syncIntervalMinutes: 120 }),
+      });
+      expect(res.status).toBe(201);
+      expect(dbState.inserted[0]?.syncIntervalMinutes).toBe(120);
+    });
+
+    it.each([
+      ['missing base URL', undefined],
+      ['non-allowlisted host', 'https://untrusted.example/api/'],
+    ])('rejects Dropsuite %s before calling the vendor or persisting credentials', async (_name, baseUrl) => {
+      adapterState.onTest = vi.fn();
+      const res = await app.request('/backup/providers/connections', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...dropsuiteBody, baseUrl }),
+      });
+      expect(res.status).toBe(400);
+      expect(adapterState.onTest).not.toHaveBeenCalled();
+      expect(dbState.inserted).toHaveLength(0);
+      expect(encryptMock).not.toHaveBeenCalled();
     });
 
     it('refuses with 422 and does NOT store anything when the vendor test fails', async () => {
@@ -490,6 +581,135 @@ describe('backup provider connection routes', () => {
       });
       expect(res.status).toBe(422);
       expect(dbState.updated).toHaveLength(0);
+    });
+
+    // #8656 (same class as #8352): a credential that resolves to a different
+    // vendor root would make the next sync delete every customer mapping of
+    // the old root. Refuse it; the operator creates a new connection.
+    const OTHER_ROOT = { ok: true, rootId: '2000', rootName: 'Other Console', customerCount: 1 };
+    const patchCreds = () => app.request(`/backup/providers/connections/${CONNECTION_ID}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ credentials: CREDS }),
+    });
+
+    describe('Dropsuite customer continuity', () => {
+      const newCredentials = { resellerToken: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', authToken: 'rotated-admin' };
+      const rotate = () => app.request(`/backup/providers/connections/${CONNECTION_ID}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ credentials: newCredentials }),
+      });
+      beforeEach(() => {
+        dbState.connections = [connectionRow({ provider: 'dropsuite', vendorRootId: 'old-token-hash' })];
+        adapterState.test = { ok: true, rootId: 'dropsuite', rootName: 'Dropsuite reseller', customerCount: 1 };
+      });
+
+      it('rotates Dropsuite credentials when a stored customer overlaps despite a changed root ID', async () => {
+        dbState.customers = [{ vendorCustomerId: 'customer-1' }, { vendorCustomerId: 'customer-2' }];
+        adapterState.customers = [{ vendorCustomerId: 'customer-2' }, { vendorCustomerId: 'customer-3' }];
+        expect((await rotate()).status).toBe(200);
+        expect(dbState.updated[0]).toMatchObject({ vendorRootId: 'dropsuite', status: 'connected' });
+        expect(dbState.locks).toBeGreaterThan(0);
+        expect(dbState.capturedSelectWheres.some(condition => referencesColumn(condition, 'connection_id') && referencesColumn(condition, 'partner_id'))).toBe(true);
+      });
+
+      it('rejects a different Dropsuite account with 409 even when the constant root IDs match', async () => {
+        dbState.connections[0]!.vendorRootId = 'dropsuite';
+        dbState.customers = [{ vendorCustomerId: 'customer-1' }];
+        adapterState.customers = [{ vendorCustomerId: 'customer-other' }];
+        const response = await rotate();
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ code: 'VENDOR_ROOT_MISMATCH' });
+        expect(dbState.updated).toHaveLength(0);
+        expect(encryptMock).not.toHaveBeenCalled();
+      });
+
+      it('rotates Dropsuite credentials for an empty connection', async () => {
+        expect((await rotate()).status).toBe(200);
+        expect(dbState.updated[0]).toMatchObject({ vendorRootId: 'dropsuite' });
+      });
+
+      it('tests existing Dropsuite credentials using customer continuity for a legacy root hash', async () => {
+        dbState.customers = [{ vendorCustomerId: 'customer-1' }];
+        adapterState.customers = [{ vendorCustomerId: 'customer-1' }];
+        const response = await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
+        expect(response.status).toBe(200);
+      });
+    });
+
+    it('credentials resolving to a DIFFERENT vendorRootId -> 409 VENDOR_ROOT_MISMATCH, nothing written, audited', async () => {
+      adapterState.test = OTHER_ROOT;
+      const res = await patchCreds();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        code: 'VENDOR_ROOT_MISMATCH', storedVendorRootId: '1000', newVendorRootId: '2000',
+      });
+      expect(dbState.updated).toHaveLength(0);
+      expect(encryptMock).not.toHaveBeenCalled();
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'backup_provider.connection.update.rejected',
+        resourceId: CONNECTION_ID,
+        result: 'denied',
+        details: expect.objectContaining({
+          reason: 'vendor_root_mismatch', storedVendorRootId: '1000', newVendorRootId: '2000',
+        }),
+      }));
+      expect(JSON.stringify(vi.mocked(writeRouteAudit).mock.calls)).not.toContain(CREDS.password);
+    });
+
+    it('credentials resolving to the SAME vendorRootId still rotate, re-checking the root under a row lock', async () => {
+      const res = await patchCreds();
+      expect(res.status).toBe(200);
+      expect(dbState.updated).toHaveLength(1);
+      expect(dbState.locks).toBeGreaterThan(0);
+    });
+
+    it('a stored connection with no vendorRootId yet may adopt the first resolved root', async () => {
+      dbState.connections = [connectionRow({ vendorRootId: null })];
+      expect((await patchCreds()).status).toBe(200);
+      expect(dbState.updated[0]).toMatchObject({ vendorRootId: '1000' });
+    });
+
+    it('a concurrent PATCH that set a different root during the vendor call -> 409 under the row lock, nothing written', async () => {
+      // Both PATCHes read a root-less row; the other one commits root 2000
+      // while this one is waiting on the vendor. The pre-check passes (null),
+      // so only the locked re-read inside the write transaction can catch it.
+      dbState.connections = [connectionRow({ vendorRootId: null })];
+      adapterState.onTest = () => { dbState.connections = [connectionRow({ vendorRootId: '2000' })]; };
+      const res = await patchCreds();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        code: 'VENDOR_ROOT_MISMATCH', storedVendorRootId: '2000', newVendorRootId: '1000',
+      });
+      expect(dbState.updated).toHaveLength(0);
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'backup_provider.connection.update.rejected',
+        result: 'denied',
+        details: expect.objectContaining({
+          reason: 'vendor_root_mismatch', storedVendorRootId: '2000', newVendorRootId: '1000',
+        }),
+      }));
+    });
+
+    it('a mismatched credential in a multi-field PATCH applies none of the other fields', async () => {
+      adapterState.test = OTHER_ROOT;
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed', isActive: false, credentials: CREDS }),
+      });
+      expect(res.status).toBe(409);
+      expect(dbState.updated).toHaveLength(0);
+      expect(resolveAlertsMock).not.toHaveBeenCalled();
+    });
+
+    it('does not take the row lock for a PATCH that leaves the credential alone', async () => {
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed' }),
+      });
+      expect(res.status).toBe(200);
+      expect(dbState.locks).toBe(0);
     });
 
     it('rewrites the denormalized portal flag on the device rows IN THE SAME transaction', async () => {
@@ -622,6 +842,56 @@ describe('backup provider connection routes', () => {
     it('does not write lastSyncError on a successful test', async () => {
       await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
       expect(dbState.updated[0]).not.toHaveProperty('lastSyncError');
+    });
+
+    it('a test that resolves a DIFFERENT vendorRootId -> 409 and does not overwrite the stored root', async () => {
+      adapterState.test = { ok: true, rootId: '2000', rootName: 'Other Console', customerCount: 1 };
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        code: 'VENDOR_ROOT_MISMATCH', storedVendorRootId: '1000', newVendorRootId: '2000',
+      });
+      expect(dbState.updated).toHaveLength(0);
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'backup_provider.connection.test.rejected',
+        result: 'denied',
+        details: expect.objectContaining({
+          reason: 'vendor_root_mismatch', storedVendorRootId: '1000', newVendorRootId: '2000',
+        }),
+      }));
+    });
+
+    it('a concurrent root change during the vendor call -> 409 under the row lock, nothing written', async () => {
+      dbState.connections = [connectionRow({ vendorRootId: null })];
+      adapterState.onTest = () => { dbState.connections = [connectionRow({ vendorRootId: '2000' })]; };
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'VENDOR_ROOT_MISMATCH', storedVendorRootId: '2000' });
+      expect(dbState.updated).toHaveLength(0);
+      const audits = vi.mocked(writeRouteAudit).mock.calls.map((call) => call[1]);
+      expect(audits).toEqual([expect.objectContaining({
+        action: 'backup_provider.connection.test.rejected',
+        result: 'denied',
+        details: expect.objectContaining({
+          reason: 'vendor_root_mismatch', storedVendorRootId: '2000', newVendorRootId: '1000',
+        }),
+      })]);
+    });
+
+    it('a failed locked re-read keeps the best-effort contract: test result returned, nothing written', async () => {
+      dbState.lockError = new Error('lock timeout');
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      expect(dbState.updated).toHaveLength(0);
+    });
+
+    it('a stored connection with no vendorRootId yet adopts the root on a successful test', async () => {
+      dbState.connections = [connectionRow({ vendorRootId: null })];
+      const res = await app.request(`/backup/providers/connections/${CONNECTION_ID}/test`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      expect(dbState.updated[0]).toMatchObject({ status: 'connected', vendorRootId: '1000' });
+      expect(dbState.locks).toBeGreaterThan(0);
     });
   });
 

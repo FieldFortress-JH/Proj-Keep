@@ -5,9 +5,11 @@ import { ticketsBulkRoutes } from './bulk';
 import { ticketExportRoutes } from './export';
 import { ticketPartsRoutes } from './parts';
 import { ticketMoveOrgRoutes } from './moveOrg';
+import { ticketMergeRoutes } from './merge';
 import { ticketAttachmentRoutes } from './attachments';
 import { ticketAiDraftsRoutes } from './aiDrafts';
 import { ticketChecklistRoutes } from './checklist';
+import { ticketLinkRoutes } from './links';
 
 export const ticketsRoutes = new Hono();
 
@@ -23,6 +25,9 @@ ticketsRoutes.route('/', ticketsBulkRoutes);   // /bulk before /:id
 // move-org BEFORE core /:id routes so POST /:id/move-org is not captured by
 // the generic /:id param matcher (mirrors devices/index.ts mount ordering).
 ticketsRoutes.route('/', ticketMoveOrgRoutes);
+// merge BEFORE core /:id routes for the same reason (#8972): /:id/merge and
+// /:id/merge-preview must not be captured by a shorter /:id route.
+ticketsRoutes.route('/', ticketMergeRoutes);
 // attachments BEFORE core /:id routes so /:id/attachments and
 // /:id/attachments/:attachmentId/content are not captured by the generic
 // /:id param matcher (W08 #3902).
@@ -35,4 +40,7 @@ ticketsRoutes.route('/', ticketAiDraftsRoutes);
 // the generic /:id param matcher, and /:id/checklist/reorder is not captured by
 // a shorter /:id route (#5783 W01).
 ticketsRoutes.route('/', ticketChecklistRoutes);
+// links BEFORE core /:id routes so /:id/links and /:id/links/:linkId are not
+// captured by a shorter /:id route (#7900 W02).
+ticketsRoutes.route('/', ticketLinkRoutes);
 ticketsRoutes.route('/', ticketsApiRoutes);

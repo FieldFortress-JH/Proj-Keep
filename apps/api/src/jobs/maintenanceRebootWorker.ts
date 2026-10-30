@@ -6,13 +6,15 @@
  * have a pending reboot, and for any whose effective maintenance policy is in an
  * active window with `rebootIfPending` enabled, it issues a reboot.
  *
- * Windows gets the rich warn-then-reboot manager (schedule_reboot): the agent
- * emits a warning the moment the reboot is scheduled and then a ladder of
- * reminders, plus the circuit-breaker. Linux still gets an OS-scheduled reboot
- * (`shutdown -r +N`, wall warning to logged-in terminal sessions) — migrating
- * this path onto schedule_reboot now that the agent's RebootManager is
- * cross-platform (#3197) is a deliberate follow-up, kept out of #3197 so a
- * regression in either behaviour stays attributable. macOS is never a candidate
+ * Windows and Linux both get the warn-then-reboot manager (schedule_reboot):
+ * the agent emits a warning the moment the reboot is scheduled and then a
+ * ladder of reminders, plus the circuit-breaker, the end-user deferral budget
+ * (#3207) and the operator's custom prompt text (#8030). Linux used to get an
+ * OS-scheduled `shutdown -r +N` instead, which could carry none of that; it
+ * moved onto schedule_reboot in #9181, matching the post-patch reboot path
+ * (patchRebootHandler), which already sent schedule_reboot on every OS. On
+ * Linux the agent draws the prompt in the signed-in graphical session and
+ * falls back to a `wall` broadcast when there is none. macOS is never a candidate
  * because `DetectPendingReboot()` is a deliberate no-op stub on macOS —
  * `pending_reboot` is therefore never true there.
  *
@@ -29,7 +31,7 @@ import { devices, deviceCommands } from '../db/schema';
 import { and, eq, gt, inArray, sql } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import { attachWorkerObservability } from './workerObservability';
-import { captureException } from '../services/sentry';
+import { captureException, captureMessage } from '../services/sentry';
 import {
   resolveMaintenanceConfigForDevice,
   isInMaintenanceWindow,
@@ -37,13 +39,16 @@ import {
 import { queueCommandForExecution } from '../services/commandQueue';
 import {
   computeRebootDeadline,
+  rebootPromptPayload,
   resolveRebootPlan,
   type RebootDeferralSettings,
+  type RebootPromptText,
 } from '../services/patchRebootHandler';
 import {
   REBOOT_PENDING_ALERT_THRESHOLD_DAYS,
   emitRebootPendingAlert,
   loadOldestRebootRequiredSince,
+  resolveClearedRebootPendingAlerts,
 } from '../services/patchAlerts';
 import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
@@ -56,9 +61,8 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 const REBOOT_QUEUE = 'maintenance-reboot';
 const DEDUP_WINDOW_MINUTES = 60;
 const REBOOT_COMMAND_TYPES = ['reboot', 'schedule_reboot', 'reboot_safe_mode'] as const;
-// 'completed' is intentionally included: schedule_reboot (Windows) and the
-// delayed reboot (Linux) report SUCCESS immediately after scheduling the
-// deferred OS reboot, so the row transitions to 'completed' within seconds
+// 'completed' is intentionally included: schedule_reboot reports SUCCESS
+// immediately after scheduling the deferred OS reboot, so the row transitions to 'completed' within seconds
 // while the device is still up. Without 'completed', the next 10-min tick
 // would miss the already-issued command and re-queue a second reboot.
 // 'failed', 'timeout', and 'cancelled' are excluded — a genuinely failed
@@ -75,7 +79,7 @@ export type RebootCandidate = {
   uptimeSeconds: number | null;
 };
 
-type WindowsRebootPayload = {
+type ScheduleRebootPayload = {
   delayMinutes: number;
   reason: string;
   source: string;
@@ -88,16 +92,14 @@ type WindowsRebootPayload = {
   allowDeferral: boolean;
   maxDeferrals: number;
   deferralMinutes: number;
+  /** #8030. Present only when the patch policy sets them; see rebootPromptPayload. */
+  promptTitle?: string;
+  promptBody?: string;
+  promptButton?: string;
 };
-// `delay` is the on-the-wire payload key the agent reads
-// (tools.ShutdownDelayMinutes parses payload["delay"]), and its unit is MINUTES
-// on every platform. Do NOT rename it to delayMinutes for symmetry with
-// WindowsRebootPayload above: these field names ARE the wire contract, so a
-// rename here would leave the agent parsing a missing key.
-type LinuxRebootPayload = { delay: number };
+// Field names are the wire contract the agent's handleScheduleReboot parses.
 export type RebootDecision =
-  | { type: 'schedule_reboot'; payload: WindowsRebootPayload }
-  | { type: 'reboot'; payload: LinuxRebootPayload }
+  | { type: 'schedule_reboot'; payload: ScheduleRebootPayload }
   | null;
 
 // ── Pure decision logic ──────────────────────────────────────────────────────
@@ -142,35 +144,34 @@ export function decideRebootCommand(params: {
    */
   deferral: RebootDeferralSettings;
   /**
+   * Restart-prompt text resolved from the same patch policy (#8030). Required
+   * for the same reason `deferral` is: a forgotten argument would silently
+   * ship the built-in English prompt on a policy that had set its own text.
+   */
+  promptText: RebootPromptText;
+  /**
    * Close of the maintenance window this reboot is firing inside. Caps the
    * deadline so a postponement cannot run past the end of the window.
    */
   windowEndsAt?: Date | null;
 }): RebootDecision {
-  const { rebootIfPending, windowActive, osType, delayMinutes, deferral, windowEndsAt } = params;
+  const { rebootIfPending, windowActive, osType, delayMinutes, deferral, promptText, windowEndsAt } = params;
+  // rebootWarranted admits only windows and linux, and both take the same
+  // command and payload (#9181).
   if (!rebootWarranted({ rebootIfPending, windowActive, osType })) return null;
-  if (osType === 'windows') {
-    return {
-      type: 'schedule_reboot',
-      payload: {
-        delayMinutes,
-        reason: 'Pending reboot — maintenance window',
-        source: 'maintenance_window',
-        deadline: computeRebootDeadline(new Date(), delayMinutes, deferral, windowEndsAt).toISOString(),
-        allowDeferral: deferral.allowDeferral,
-        maxDeferrals: deferral.maxDeferrals,
-        deferralMinutes: deferral.deferralMinutes,
-      },
-    };
-  }
-  if (osType === 'linux') {
-    // Deliberately NOT extended with the deferral keys: this is the OS-scheduled
-    // `shutdown -r +N` path, which has no prompt to defer from. Linux parity is
-    // W4 of #3207 and will move this onto schedule_reboot rather than bolt a
-    // budget onto a command that cannot honour it.
-    return { type: 'reboot', payload: { delay: delayMinutes } };
-  }
-  return null; // macOS / unknown — never rebooted
+  return {
+    type: 'schedule_reboot',
+    payload: {
+      delayMinutes,
+      reason: 'Pending reboot — maintenance window',
+      source: 'maintenance_window',
+      deadline: computeRebootDeadline(new Date(), delayMinutes, deferral, windowEndsAt).toISOString(),
+      allowDeferral: deferral.allowDeferral,
+      maxDeferrals: deferral.maxDeferrals,
+      deferralMinutes: deferral.deferralMinutes,
+      ...rebootPromptPayload(promptText),
+    },
+  };
 }
 
 // ── DB-backed helpers ────────────────────────────────────────────────────────
@@ -257,6 +258,7 @@ export async function processRebootCandidate(
     ...gate,
     delayMinutes: plan.delayMinutes,
     deferral: plan.deferral,
+    promptText: plan.promptText,
     windowEndsAt: windowStatus.windowEndsAt,
   });
   if (!decision) return { issued: false, reason: 'no-action' };
@@ -265,10 +267,20 @@ export async function processRebootCandidate(
     expectedOrgId: device.orgId,
   });
   if (result.error) {
-    console.warn(`[MaintenanceReboot] device ${device.id}: ${result.error}`);
-    captureException(
-      new Error(`[MaintenanceReboot] reboot dispatch failed for device ${device.id}: ${result.error}`),
+    // A refusal, not a throw: report it and let the sweep move on. The device
+    // stays a candidate and is re-evaluated on a later sweep. The device id and
+    // the free-text reason go to the console only: scrubEvent redacts every
+    // exception value and deletes the message, so the bounded tags below are
+    // all that reaches Sentry (#8022).
+    console.warn(
+      `[MaintenanceReboot] reboot dispatch refused for device ${device.id} `
+      + `(${result.refusal ?? 'unclassified'}): ${result.error}`,
     );
+    captureMessage('[MaintenanceReboot] reboot dispatch refused', {
+      eventCode: 'maintenance_reboot_dispatch_refused',
+      level: 'warning',
+      tags: { org_id: device.orgId, command_dispatch_refusal: result.refusal ?? 'unclassified' },
+    });
     return { issued: false, reason: result.error };
   }
   console.log(`[MaintenanceReboot] issued ${decision.type} to device ${device.id} (${device.osType})`);
@@ -283,8 +295,23 @@ export async function runMaintenanceRebootSweep(
     processRebootCandidate,
     emitRebootPendingAlert,
     loadOldestRebootRequiredSince,
+    resolveClearedRebootPendingAlerts,
   },
 ): Promise<{ issued: number; checked: number }> {
+  // A device that restarted reports pending_reboot = false and is never a
+  // candidate again, so its reboot-pending alert is cleared here, not in the
+  // loop below. A failure only delays the clear to the next tick.
+  try {
+    const resolved = await runWithSystemDbAccess(() => deps.resolveClearedRebootPendingAlerts());
+    if (resolved > 0) console.log(`[MaintenanceReboot] resolved ${resolved} reboot-pending alert(s) for restarted devices`);
+  } catch (err) {
+    console.error('[MaintenanceReboot] failed to resolve cleared reboot-pending alerts:', err);
+    captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+      worker: 'maintenanceRebootWorker',
+      stage: 'resolve-cleared-alerts',
+    });
+  }
+
   const candidates = await runWithSystemDbAccess(() => deps.getRebootCandidates());
   let issued = 0;
   for (const device of candidates) {
@@ -318,8 +345,14 @@ export async function runMaintenanceRebootSweep(
       });
       if (res.issued) issued++;
     } catch (err) {
+      // One candidate's failure never stops the sweep: the catch is per
+      // candidate and the loop continues. Tagged so the report survives
+      // scrubEvent with more than a stack trace (#8022).
       console.error(`[MaintenanceReboot] error processing device ${device.id}:`, err);
-      captureException(err instanceof Error ? err : new Error(String(err)));
+      captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+        worker: 'maintenanceRebootWorker',
+        org_id: device.orgId,
+      });
     }
   }
   console.log(`[MaintenanceReboot] sweep complete: ${issued} issued / ${candidates.length} candidate(s)`);

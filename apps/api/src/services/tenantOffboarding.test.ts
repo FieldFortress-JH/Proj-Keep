@@ -12,7 +12,13 @@ const {
   getEmailServiceMock,
   sendEmailMock,
   releaseSendingDomainsForPartnerMock,
+  findEvidenceHoldMock,
+  releaseEmptyEvidenceHoldsMock,
+  cancelDeviceCommandsMock,
 } = vi.hoisted(() => ({
+  // #9719 — every bulk cancel in this module must go through
+  // cancelDeviceCommands so the per-type cancellation hooks run.
+  cancelDeviceCommandsMock: vi.fn(),
   selectMock: vi.fn(),
   updateMock: vi.fn(),
   insertMock: vi.fn(),
@@ -31,6 +37,9 @@ const {
   sendEmailMock: vi.fn(),
   // Partner sending domains W02 (spec §3.5) — see the vi.mock below.
   releaseSendingDomainsForPartnerMock: vi.fn(async () => 0),
+  // PAM ownership epochs W5 (#8207) — evidence holds default to "none".
+  findEvidenceHoldMock: vi.fn(),
+  releaseEmptyEvidenceHoldsMock: vi.fn(),
 }));
 
 vi.mock('../db', () => {
@@ -45,6 +54,29 @@ vi.mock('../db', () => {
     getCurrentDbAccessContext: getCurrentDbAccessContextMock,
     runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
     withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  };
+});
+
+// The real helper is covered by commandCancelPropagation.bulk.test.ts. Here it is
+// replaced by a recorder that still performs the same builder-chain UPDATE, so
+// this suite's positional update/returning assertions keep seeing the cancel.
+vi.mock('./commandCancelPropagation', async () => {
+  const schema = await import('../db/schema');
+  const dbModule = await import('../db');
+  return {
+    cancelDeviceCommands: async (args: {
+      where: unknown;
+      result: Record<string, unknown>;
+      executor?: { update: (t: unknown) => any };
+    }) => {
+      cancelDeviceCommandsMock(args);
+      const ex = args.executor ?? (dbModule.db as unknown as { update: (t: unknown) => any });
+      return ex
+        .update(schema.deviceCommands)
+        .set({ status: 'cancelled', completedAt: new Date(), result: args.result })
+        .where(args.where)
+        .returning();
+    },
   };
 });
 
@@ -115,6 +147,12 @@ vi.mock('./auditEvents', () => ({
   writeAuditEvent: vi.fn(),
   requestLikeFromSnapshot: vi.fn(() => ({})),
   ANONYMOUS_ACTOR_ID: '00000000-0000-0000-0000-000000000000',
+}));
+
+vi.mock('./orgEvidenceHold', async (importActual) => ({
+  ...(await importActual<typeof import('./orgEvidenceHold')>()),
+  findEvidenceHold: (...args: unknown[]) => findEvidenceHoldMock(...(args as [])),
+  releaseEmptyEvidenceHolds: () => releaseEmptyEvidenceHoldsMock(),
 }));
 
 vi.mock('./sentry', () => ({ captureException: vi.fn() }));
@@ -406,6 +444,16 @@ describe('beginOrganizationOffboarding', () => {
     ]);
     expect(result.devicesTargeted).toBe(2);
     expect(result.uninstallsQueued).toBe(1);
+    // #9719 — the other pending commands are cancelled through the shared
+    // helper, inside the drain transaction, so per-type hooks run.
+    expect(cancelDeviceCommandsMock).toHaveBeenCalledTimes(1);
+    expect(cancelDeviceCommandsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        result: { reason: 'tenant_offboarding' },
+        executor: expect.anything(),
+        isolateFailures: true,
+      }),
+    );
   });
 
   it('queues nothing for an org with no (non-decommissioned) devices', async () => {
@@ -567,6 +615,10 @@ describe('abortOrganizationOffboarding', () => {
     expect(JSON.stringify(strip!.values.uninstallReasons)).toContain('array_remove');
     expect(cancel!.values.status).toBe('cancelled');
     expect(cancel!.values.result).toEqual({ reason: 'organization_offboarding_aborted' });
+    // #9719 — cancelled through the shared helper so per-type hooks run.
+    expect(cancelDeviceCommandsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ result: { reason: 'organization_offboarding_aborted' } }),
+    );
     expect(invalidateAgentTenantCache).toHaveBeenCalledWith(['org-1']);
   });
 
@@ -967,6 +1019,12 @@ describe('finalizeOrganizationOffboarding', () => {
     );
     expect(cancel!.values.status).toBe('cancelled');
     expect((cancel!.values.result as Record<string, unknown>).reason).toBe('offboarding_window_closed');
+    // #9719 — cancelled through the shared helper so per-type hooks run.
+    expect(cancelDeviceCommandsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        result: expect.objectContaining({ reason: 'offboarding_window_closed' }),
+      }),
+    );
     // The cancel step is bounded to the ids the strip actually emptied.
     expect(JSON.stringify(cancel!.where)).toContain(
       '"inArray":["deviceCommands.id",["cmd-1","cmd-2"]]'
@@ -1180,6 +1238,9 @@ describe('sweepOffboardingTenants', () => {
     // Task 4 defaults: no committed-merge erasure backlog, no stuck fences,
     // and (when a case does reach the liveness check) no live BullMQ job.
     enqueueTenantErasureMock.mockResolvedValue({ id: 'tenant-erasure-org-x' });
+    // PAM ownership epochs W5 (#8207): no evidence holds unless a test says so.
+    findEvidenceHoldMock.mockResolvedValue(null);
+    releaseEmptyEvidenceHoldsMock.mockResolvedValue([]);
     getMergeJobMock.mockResolvedValue(null);
     getOrgMergeQueueMock.mockReturnValue({ getJob: getMergeJobMock });
     sendEmailMock.mockResolvedValue(undefined);
@@ -1811,6 +1872,38 @@ describe('sweepOffboardingTenants', () => {
     });
   });
 
+  describe('evidence-hold release (PAM ownership epochs W5)', () => {
+    it('hands a released hold shell to erasure and writes a chain_empty release audit', async () => {
+      queueCandidates([], [], [], []);
+      releaseEmptyEvidenceHoldsMock.mockResolvedValueOnce([
+        {
+          loserOrgId: 'org-held-loser',
+          partnerId: 'partner-1',
+          survivorOrgId: 'org-survivor',
+          mergeEventId: 'merge-event-1',
+          reason: 'pam_evidence',
+        },
+      ]);
+
+      const result = await sweepOffboardingTenants(NOW);
+
+      expect(enqueueTenantErasureMock).toHaveBeenCalledWith(
+        expect.objectContaining({ orgId: 'org-held-loser' })
+      );
+      expect(result.evidenceHoldsReleased).toBe(1);
+      expect(result.failures).toBe(0);
+      expect(writeAuditEvent).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          orgId: null,
+          action: 'tenant.erasure.evidence_hold_released',
+          resourceId: 'org-held-loser',
+          details: expect.objectContaining({ trigger: 'chain_empty', survivorOrgId: 'org-survivor' }),
+        })
+      );
+    });
+  });
+
   // Task 4 — org-merge sweeper backstop. Two independent recovery cases the
   // job (jobs/orgMerge.ts) cannot self-heal once it's dead: Phase B committed
   // (loser deleted_at stamped) but Phase C (erasure enqueue) never ran; or
@@ -2050,6 +2143,33 @@ describe('sweepOffboardingTenants', () => {
         );
         expect(result.mergeShellsStamped).toBe(0);
         expect(result.failures).toBe(0);
+      });
+
+      it('stamps a held shell and hands it to (scoped) erasure, and says so in the audit', async () => {
+        queueCandidates([], [], [], [], [{ id: 'org-held-1', partnerId: 'partner-1' }]);
+        executeQueue.push([{ id: 'org-held-1' }]);
+        findEvidenceHoldMock.mockResolvedValue({ survivorOrgId: 'survivor-9', reason: 'pam_evidence' });
+
+        const result = await sweepOffboardingTenants(NOW);
+
+        expect(executedSqlLog.join(' ')).toContain('SET deleted_at = now(), updated_at = now()');
+        expect(findEvidenceHoldMock).toHaveBeenCalledWith('org-held-1');
+        // #8746: cascadeDeleteOrg scopes a held shell's erasure; the stamp
+        // path no longer keeps it out.
+        expect(enqueueTenantErasureMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org-held-1' }));
+        expect(result.mergeShellsStamped).toBe(1);
+        expect(result.failures).toBe(0);
+        expect(writeAuditEvent).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            action: 'org.merge.stamped_by_sweeper',
+            resourceId: 'org-held-1',
+            details: expect.objectContaining({
+              note: expect.stringContaining('keeps the privileged-access evidence under its evidence hold'),
+              evidenceHold: { survivorOrgId: 'survivor-9', reason: 'pam_evidence' },
+            }),
+          })
+        );
       });
 
       it('isolates a failing erasure handoff from other stamp candidates', async () => {

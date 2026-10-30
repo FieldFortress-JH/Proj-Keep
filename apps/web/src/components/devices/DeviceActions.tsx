@@ -1,8 +1,11 @@
-import { useState } from "react";
+import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
+import { useMenuKeyboard } from "../billing/shared/menuKeyboard";
 import { usePermissions } from "../../lib/permissions";
 import {
   Play,
   RotateCcw,
+  RotateCw,
   RefreshCw,
   Monitor,
   Settings,
@@ -23,9 +26,14 @@ import type { Device, DeviceStatus } from "./DeviceList";
 import ConnectDesktopButton from "../remote/ConnectDesktopButton";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import RemoveDeviceDialog from "./RemoveDeviceDialog";
+import ForceRebootDialog from "./ForceRebootDialog";
+import { showToast } from "../shared/Toast";
+import { agentSupportsForceReboot, FORCE_REBOOT_MIN_AGENT_VERSION } from "@breeze/shared";
 import { DelegateToOperatorButton } from "../aiOperator/DelegateToOperatorButton";
 import { isInMaintenance } from "../../lib/maintenanceResource";
 import { useCanMoveDeviceOrg } from "@/lib/moveOrgCapability";
+import { useMediaQuery } from "@/lib/useMediaQuery";
+import { formatDateTime } from "@/lib/dateTimeFormat";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
 
@@ -73,6 +81,13 @@ import "../../lib/i18n";
 // missing gate by adding one; gate queued commands on `decommissioned`
 // (see DeviceList.tsx). Wake (Wake-on-LAN) targets offline devices by design
 // and is never gated.
+// Header button variants (#9026): one height for the whole row; the filled
+// variant is reserved for the single primary action.
+const HEADER_BUTTON =
+  "inline-flex h-9 items-center gap-2 rounded-md px-4 text-sm font-medium transition";
+const FILLED_BUTTON = `${HEADER_BUTTON} bg-primary text-primary-foreground hover:opacity-90 aria-disabled:cursor-progress`;
+const OUTLINE_BUTTON = `${HEADER_BUTTON} border bg-background hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:text-muted-foreground aria-disabled:hover:bg-background`;
+
 function isDeviceOnline(device: Device): boolean {
   return device.status === "online";
 }
@@ -101,6 +116,23 @@ function unavailableTitle(status: DeviceStatus, t: DeviceTranslation): string {
   }
 }
 
+// Mirrors WATCHDOG_STALE_MS in apps/api/src/services/commandQueue.ts: past
+// this the API refuses a watchdog command because nothing will claim it.
+const WATCHDOG_STALE_MS = 10 * 60 * 1000;
+
+/** What the confirm for "Restart agent" says about the watchdog (#9234). */
+function watchdogStateSentence(device: Device, t: DeviceTranslation): string {
+  if (!device.watchdogLastSeen) {
+    return t("deviceActions.confirm.restartAgent.watchdogNeverSeen");
+  }
+  const seenAt = new Date(device.watchdogLastSeen).getTime();
+  const date = formatDateTime(device.watchdogLastSeen);
+  if (Number.isNaN(seenAt) || Date.now() - seenAt > WATCHDOG_STALE_MS) {
+    return t("deviceActions.confirm.restartAgent.watchdogStale", { date });
+  }
+  return t("deviceActions.confirm.restartAgent.watchdogLastSeen", { date });
+}
+
 /**
  * Extra answers a confirm dialog collected from the operator (#3987). Today
  * only Remove has one: whether to queue the agent uninstall. Passed through to
@@ -121,6 +153,10 @@ type DeviceActionsProps = {
   device: Device;
   onAction?: (action: string, device: Device, opts?: DeviceActionOptions) => void | Promise<void>;
   compact?: boolean;
+  /** Page-level secondary actions (e.g. the Wisp link) rendered in the same
+   *  wrapping row as the device actions, so they never sit in a separate column
+   *  that squeezes into a two-line button. */
+  extraActions?: ReactNode;
 };
 
 type ModalType =
@@ -131,7 +167,8 @@ type ModalType =
   | "maintenance"
   | "decommission"
   | "clear-sessions"
-  | "install-homebrew";
+  | "install-homebrew"
+  | "restart-agent";
 
 type ModalConfigEntry = {
   title: string;
@@ -202,6 +239,17 @@ function getModalConfig(
         confirmLabel: t("deviceActions.confirm.installHomebrew.confirm"),
         variant: "warning",
       };
+    case "restart-agent":
+      // #9234: name the machine and say what the watchdog last told us, so the
+      // tech knows before confirming whether anything is there to take it.
+      return {
+        title: t("deviceActions.confirm.restartAgent.title"),
+        message: `${t("deviceActions.confirm.restartAgent.message", {
+          hostname: device.hostname,
+        })} ${watchdogStateSentence(device, t)}`,
+        confirmLabel: t("deviceActions.confirm.restartAgent.confirm"),
+        variant: "warning",
+      };
     case "clear-sessions":
       return {
         title: t("deviceActions.confirm.clearSessions.title"),
@@ -214,10 +262,163 @@ function getModalConfig(
   }
 }
 
+// Menu-button pattern shared by the "…" and Power menus (#9025), built on the
+// same useMenuKeyboard hook the other action menus use: aria-expanded/haspopup
+// live on the trigger (the first [aria-haspopup] inside the root), the popup is
+// role="menu", focus moves in on open, arrows/Home/End/Tab are handled, and
+// Escape or an outside mousedown closes (Escape also returns focus).
+const DropdownContext = createContext<{
+  open: boolean;
+  listRef: RefObject<HTMLDivElement | null>;
+  rootRef: RefObject<HTMLDivElement | null>;
+  onKeyDown: (e: ReactKeyboardEvent) => void;
+}>({ open: false, listRef: { current: null }, rootRef: { current: null }, onKeyDown: () => {} });
+
+function DropdownRoot({
+  open,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const { listRef, onKeyDown: onMenuKeyDown } = useMenuKeyboard(open, onClose);
+
+  useEffect(() => {
+    if (!open) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      // The popup is portalled out of the root (#9030), so check it too —
+      // otherwise a press on an item closes the menu before its click lands.
+      if (rootRef.current?.contains(target) || listRef.current?.contains(target)) return;
+      onClose();
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [open, onClose]);
+
+  const onKeyDown = (e: ReactKeyboardEvent) => {
+    if (!open) return;
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      onClose();
+      rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]")?.focus();
+      return;
+    }
+    // The popup is portalled to the end of <body> (#9030), so a natural Tab
+    // from an item would leave the page. Hand focus to the trigger first (no
+    // preventDefault): the browser's Tab / Shift+Tab then moves on from there.
+    if (e.key === "Tab") {
+      rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]")?.focus();
+      onClose();
+      return;
+    }
+    onMenuKeyDown(e);
+  };
+
+  return (
+    <DropdownContext.Provider value={{ open, listRef, rootRef, onKeyDown }}>
+      <div ref={rootRef} className="relative" onKeyDown={onKeyDown}>
+        {children}
+      </div>
+    </DropdownContext.Provider>
+  );
+}
+
+// #9030: Refresh's explanation used to be a 150-character `title`, which a
+// keyboard or touch user never sees; it is now a short visible second line.
+function RefreshLabel() {
+  const { t } = useTranslation("devices");
+  return (
+    <span className="flex flex-col">
+      <span>{t("deviceActions.refresh")}</span>
+      <span className="text-xs text-muted-foreground">{t("deviceActions.reRunAgentInventoryCollectorsSo")}</span>
+    </span>
+  );
+}
+
+const MENU_GAP_PX = 4;
+
+// #9030: the popup renders through a portal with `position: fixed`, anchored
+// below its trigger (flipping above when there is no room), so it floats over
+// the tab strip instead of being stacked under or clipped by it, and is wide
+// enough that no item label wraps. React events still bubble through the
+// portal to DropdownRoot, so its keyboard handling is unchanged. `sheet` is
+// the phone bottom sheet (#9028), which positions itself.
+function DropdownPopup({
+  children,
+  sheetClassName,
+  testId,
+  label,
+}: {
+  children: ReactNode;
+  /** Render as a self-positioned sheet with these classes instead of anchoring. */
+  sheetClassName?: string;
+  testId?: string;
+  label?: string;
+}) {
+  const { open, listRef, rootRef } = useContext(DropdownContext);
+  const [style, setStyle] = useState<CSSProperties>({ position: "fixed", top: 0, right: 0 });
+
+  useLayoutEffect(() => {
+    if (!open || sheetClassName) return;
+    const place = () => {
+      const trigger = rootRef.current?.querySelector<HTMLElement>("[aria-haspopup]");
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const menuHeight = listRef.current?.offsetHeight ?? 0;
+      const below = rect.bottom + MENU_GAP_PX;
+      const flip =
+        below + menuHeight > window.innerHeight && rect.top > window.innerHeight - rect.bottom;
+      setStyle({
+        position: "fixed",
+        top: flip ? Math.max(MENU_GAP_PX, rect.top - MENU_GAP_PX - menuHeight) : below,
+        right: Math.max(0, window.innerWidth - rect.right),
+      });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, sheetClassName, listRef, rootRef]);
+
+  if (!open || typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      ref={listRef}
+      role="menu"
+      aria-label={label}
+      data-testid={testId}
+      // aria-disabled items stay focusable so their reason (title) is
+      // reachable by keyboard; their activation is swallowed here.
+      onClickCapture={(e) => {
+        if ((e.target as HTMLElement).closest('[aria-disabled="true"]')) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }}
+      style={sheetClassName ? undefined : style}
+      className={
+        sheetClassName ??
+        "fixed z-50 min-w-[14rem] rounded-md border bg-card py-1 shadow-lg"
+      }
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
 export default function DeviceActions({
   device,
   onAction,
   compact = false,
+  extraActions,
 }: DeviceActionsProps) {
   const { t } = useTranslation("devices");
   const { can } = usePermissions();
@@ -227,11 +428,26 @@ export default function DeviceActions({
   // and registry listings) runs a live command on the device and requires
   // devices.execute, so read-only roles are not offered Remote Tools.
   const canUseRemoteTools = can("devices", "execute");
+  // UX gate; POST /devices/:id/agent-recovery requires devices:recover_agent
+  // (#9234). Deliberately NOT gated on `online`: a silent agent is exactly when
+  // the watchdog restart is needed.
+  const canRecoverAgent =
+    can("devices", "recover_agent") && device.status !== "decommissioned";
   const canMoveOrg = useCanMoveDeviceOrg();
+  // #8729: POST /devices/:id/force-reboot requires devices.execute (plus an
+  // interactive session, MFA and a step-up the dialog collects).
+  const canForceReboot = can("devices", "execute");
+  const [forceRebootOpen, setForceRebootOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [powerMenuOpen, setPowerMenuOpen] = useState(false);
+  const moreTriggerRef = useRef<HTMLButtonElement>(null);
+  const powerTriggerRef = useRef<HTMLButtonElement>(null);
   const [modalType, setModalType] = useState<ModalType>("none");
   const [loading, setLoading] = useState(false);
+  const offlineReasonId = useId();
+  const remoteToolsReasonId = useId();
+  // #9028: at phone width the header keeps one primary plus an "Actions" sheet.
+  const isPhone = useMediaQuery("(max-width: 767px)");
 
   // NOTE: `online` gates BOTH live-session buttons (correctly) and queued
   // commands (more strictly than the API requires) — see the category note at
@@ -246,6 +462,16 @@ export default function DeviceActions({
   };
 
   const handleAction = async (action: string) => {
+    // #8729: owned here, not by the page: the dialog collects the typed
+    // hostname and the step-up itself.
+    if (action === "force_reboot") {
+      openForceReboot();
+      return;
+    }
+    // Return focus to the open menu's trigger before the item unmounts, so a
+    // dialog opened by the action restores focus there rather than to <body>.
+    if (menuOpen) moreTriggerRef.current?.focus();
+    else if (powerMenuOpen) powerTriggerRef.current?.focus();
     if (
       action === "reboot" ||
       action === "reboot_safe_mode" ||
@@ -255,7 +481,8 @@ export default function DeviceActions({
       (action === "maintenance" && isInMaintenance(device)) ||
       action === "decommission" ||
       action === "clear-sessions" ||
-      action === "install-homebrew"
+      action === "install-homebrew" ||
+      action === "restart-agent"
     ) {
       setModalType(action);
       closeMenus();
@@ -288,6 +515,50 @@ export default function DeviceActions({
     }
   };
 
+  // #8729: disabled with its reason, so nobody starts the MFA step for a device
+  // that cannot do it. The server's 409s (DEVICE_OFFLINE,
+  // AGENT_UPGRADE_REQUIRED) stay the real check.
+  const forceRebootSupported = agentSupportsForceReboot(device.agentVersion);
+  const forceRebootTitle = !online
+    ? offlineTitle
+    : !forceRebootSupported
+      ? t("deviceActions.forceRebootAgentUpgradeRequired", { version: FORCE_REBOOT_MIN_AGENT_VERSION })
+      : t("deviceActions.forceRebootHint");
+  const openForceReboot = () => {
+    if (menuOpen) moreTriggerRef.current?.focus();
+    else if (powerMenuOpen) powerTriggerRef.current?.focus();
+    closeMenus();
+    setForceRebootOpen(true);
+  };
+  const forceRebootMenuItem = canForceReboot && (
+    <button
+      type="button"
+      data-testid="device-power-action-force-reboot"
+      onClick={openForceReboot}
+      aria-disabled={(!online || !forceRebootSupported) || undefined}
+      title={forceRebootTitle}
+      role="menuitem"
+      tabIndex={-1}
+      className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
+    >
+      <RotateCcw className="h-4 w-4" />
+      {t("deviceActions.forceRebootNow")}
+    </button>
+  );
+  const forceRebootDialog = forceRebootOpen && (
+    <ForceRebootDialog
+      open
+      device={{ id: device.id, hostname: device.hostname, os: device.os }}
+      onClose={() => setForceRebootOpen(false)}
+      onCompleted={() =>
+        showToast({
+          type: "success",
+          message: t("deviceActions.forceRebootQueued", { hostname: device.hostname }),
+        })
+      }
+    />
+  );
+
   const closeModal = () => {
     if (!loading) {
       setModalType("none");
@@ -308,7 +579,9 @@ export default function DeviceActions({
           type="button"
           data-testid="device-action-restore"
           onClick={() => handleAction("restore")}
-          className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-success hover:bg-success/10"
+          role="menuitem"
+          tabIndex={-1}
+          className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-success hover:bg-success/10"
         >
           <RotateCcw className="h-4 w-4" />
           {t("deviceActions.restore")}
@@ -317,7 +590,9 @@ export default function DeviceActions({
           type="button"
           data-testid="device-action-permanent-delete"
           onClick={() => handleAction("permanent-delete")}
-          className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+          role="menuitem"
+          tabIndex={-1}
+          className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
         >
           <Trash2 className="h-4 w-4" />
           {t("deviceActions.permanentlyDelete")}
@@ -328,32 +603,56 @@ export default function DeviceActions({
         type="button"
         data-testid="device-action-remove"
         onClick={() => handleAction("decommission")}
-        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+        role="menuitem"
+        tabIndex={-1}
+        className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
       >
         <Trash2 className="h-4 w-4" />
         {t("deviceActions.decommission")}{" "}
       </button>
     );
 
+  // One copy for the compact and desktop "…" menus (the phone sheet builds its
+  // own via sheetItem), so the two cannot drift.
+  const restartAgentMenuItem = canRecoverAgent ? (
+    <button
+      type="button"
+      data-testid="device-action-restart-agent"
+      onClick={() => handleAction("restart-agent")}
+      role="menuitem"
+      tabIndex={-1}
+      className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
+    >
+      <RotateCw className="h-4 w-4" />
+      {t("deviceActions.restartAgent")}
+    </button>
+  ) : null;
+
   if (compact) {
     return (
       <>
-        <div className="relative">
+        <DropdownRoot open={menuOpen} onClose={closeMenus}>
           <button
             type="button"
+            ref={moreTriggerRef}
             data-testid="device-actions-menu"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            aria-label={t("deviceActions.moreActions")}
+            title={t("deviceActions.moreActions")}
             onClick={() => setMenuOpen(!menuOpen)}
             className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted"
           >
-            <MoreHorizontal className="h-4 w-4" />
+            <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
           </button>
-          {menuOpen && (
-            <div className="absolute right-0 top-full z-10 mt-1 w-48 rounded-md border bg-card shadow-lg">
+          <DropdownPopup>
               <button
                 type="button"
                 onClick={() => handleAction("run-script")}
-                disabled={!online}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <Play className="h-4 w-4" />
                 {t("deviceActions.runScript")}{" "}
@@ -372,8 +671,10 @@ export default function DeviceActions({
                 <button
                   type="button"
                   onClick={() => handleAction("remote-tools")}
-                  disabled={
+                  aria-disabled={
                     !online || device.remoteAccessPolicy?.remoteTools === false
+                      ? true
+                      : undefined
                   }
                   title={
                     offlineTitle ??
@@ -381,7 +682,9 @@ export default function DeviceActions({
                       ? `Remote tools disabled by policy${device.remoteAccessPolicy?.policyName ? ` "${device.remoteAccessPolicy.policyName}"` : ""}`
                       : undefined)
                   }
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                 >
                   <Wrench className="h-4 w-4" />
                   {t("deviceActions.remoteTools")}{" "}
@@ -390,27 +693,33 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("refresh")}
-                disabled={!online}
-                title={t("deviceActions.reRunAgentInventoryCollectorsSo")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <RefreshCw className="h-4 w-4" />
-                {t("deviceActions.refresh")}{" "}
+                <RefreshLabel />{" "}
               </button>
               <button
                 type="button"
                 onClick={() => handleAction("reboot")}
-                disabled={!online}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <RotateCcw className="h-4 w-4" />
                 {t("deviceActions.reboot")}{" "}
               </button>
+              {forceRebootMenuItem}
               {canWake && device.status === "offline" && (
                 <button
                   type="button"
                   onClick={() => handleAction("wake")}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
                 >
                   <Zap className="h-4 w-4" />
                   {t("deviceActions.wake")}{" "}
@@ -420,8 +729,10 @@ export default function DeviceActions({
                 <button
                   type="button"
                   onClick={() => handleAction("reboot_safe_mode")}
-                  disabled={!online}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-warning hover:bg-warning/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-disabled={(!online) || undefined}
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-warning hover:bg-warning/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                 >
                   <Shield className="h-4 w-4" />
                   {t("deviceActions.rebootToSafeMode")}{" "}
@@ -430,7 +741,9 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("deploy-software")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Package className="h-4 w-4" />
                 {t("deviceActions.deploySoftware")}{" "}
@@ -440,7 +753,9 @@ export default function DeviceActions({
                   type="button"
                   data-testid="device-install-homebrew"
                   onClick={() => handleAction("install-homebrew")}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
                 >
                   <Beer className="h-4 w-4" />
                   {t("deviceActions.installHomebrew")}{" "}
@@ -449,16 +764,21 @@ export default function DeviceActions({
                             <button
                 type="button"
                 onClick={() => handleAction("clear-sessions")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <XCircle className="h-4 w-4" />
                 {t("deviceActions.clearSessions")}{" "}
               </button>
+              {restartAgentMenuItem}
               <hr className="my-1" />
               <button
                 type="button"
                 onClick={() => handleAction("change-site")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <MapPin className="h-4 w-4" />
                 {t("deviceActions.changeSite")}{" "}
@@ -466,7 +786,9 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("maintenance")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Shield className="h-4 w-4" />
                 {isInMaintenance(device)
@@ -475,10 +797,10 @@ export default function DeviceActions({
               </button>
               <hr className="my-1" />
               {removeOrRestoreMenuItems}
-            </div>
-          )}
-        </div>
+            </DropdownPopup>
+        </DropdownRoot>
 
+        {forceRebootDialog}
         {modalType === "decommission" ? (
           <RemoveDeviceDialog
             open
@@ -504,32 +826,306 @@ export default function DeviceActions({
     );
   }
 
-  return (
+  // #9026: exactly one filled primary — Run Script while online, Wake while
+  // offline. Anything unavailable renders as the outline variant (never a
+  // faded filled button) and stays focusable via aria-disabled, with its reason
+  // wired through aria-describedby so keyboard and screen-reader users get it.
+  const showWake = canWake && device.status === "offline";
+  const remoteToolsPolicyTitle =
+    device.remoteAccessPolicy?.remoteTools === false
+      ? `Remote tools disabled by policy${device.remoteAccessPolicy?.policyName ? ` "${device.remoteAccessPolicy.policyName}"` : ""}`
+      : undefined;
+  const remoteToolsTitle = offlineTitle ?? remoteToolsPolicyTitle;
+  const remoteToolsUnavailable =
+    !online || device.remoteAccessPolicy?.remoteTools === false;
+
+  const reasonSpans = (
     <>
-      <div className="flex flex-wrap items-center gap-2">
-        {/* When the device is offline, Wake is the one action that matters —
-            promote it to a primary header button instead of burying it in the
-            Power dropdown, where every other action is disabled anyway. */}
-        {canWake && device.status === "offline" && (
+      {offlineTitle && (
+        <span id={offlineReasonId} className="sr-only">
+          {offlineTitle}
+        </span>
+      )}
+      {remoteToolsTitle && remoteToolsTitle !== offlineTitle && (
+        <span id={remoteToolsReasonId} className="sr-only">
+          {remoteToolsTitle}
+        </span>
+      )}
+    </>
+  );
+
+  // #9028: phone width — the same primary rule, then one "Actions" button that
+  // opens a bottom sheet listing every other header action. A disabled item
+  // shows its reason as a visible second line (no hover on touch screens).
+  const renderPhoneRow = () => {
+    const sheetItem = (opts: {
+      action: string;
+      label: string;
+      icon: ReactNode;
+      reason?: string;
+      tone?: "warning" | "destructive";
+      testId?: string;
+    }) => (
+      <button
+        key={opts.action}
+        type="button"
+        role="menuitem"
+        tabIndex={-1}
+        data-testid={opts.testId}
+        aria-disabled={opts.reason ? true : undefined}
+        onClick={() => {
+          if (!opts.reason) void handleAction(opts.action);
+        }}
+        className={`flex min-h-11 w-full items-start gap-3 px-4 py-2.5 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:text-muted-foreground aria-disabled:hover:bg-transparent ${
+          opts.tone === "destructive"
+            ? "text-destructive"
+            : opts.tone === "warning"
+              ? "text-warning"
+              : ""
+        }`}
+      >
+        <span className="mt-0.5 shrink-0" aria-hidden="true">
+          {opts.icon}
+        </span>
+        <span className="min-w-0">
+          <span className="block">{opts.label}</span>
+          {opts.reason && <span className="block text-xs text-muted-foreground">{opts.reason}</span>}
+        </span>
+      </button>
+    );
+    const queuedReason = online ? undefined : offlineTitle;
+    return (
+      <div data-testid="device-header-actions" className="flex w-full flex-wrap items-center gap-2">
+        {reasonSpans}
+        {showWake ? (
           <button
             type="button"
-            onClick={() => handleAction("wake")}
-            disabled={loading}
+            onClick={() => {
+              if (!loading) void handleAction("wake");
+            }}
+            aria-disabled={loading || undefined}
             title={t("deviceActions.sendAWakeOnLanPacket")}
-            className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            className={`${FILLED_BUTTON} flex-1 justify-center`}
           >
-            <Zap className="h-4 w-4" />
+            <Zap className="h-4 w-4" aria-hidden="true" />
+            {t("deviceActions.wake")}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              if (online && !loading) void handleAction("run-script");
+            }}
+            aria-disabled={!online || loading ? true : undefined}
+            title={offlineTitle}
+            aria-describedby={offlineTitle ? offlineReasonId : undefined}
+            className={`${online ? FILLED_BUTTON : OUTLINE_BUTTON} flex-1 justify-center`}
+          >
+            <Play className="h-4 w-4" aria-hidden="true" />
+            {t("deviceActions.runScript")}
+          </button>
+        )}
+        <DropdownRoot open={menuOpen} onClose={closeMenus}>
+          <button
+            type="button"
+            ref={moreTriggerRef}
+            data-testid="device-actions-sheet-trigger"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={() => {
+              if (loading) return;
+              setMenuOpen(!menuOpen);
+            }}
+            aria-disabled={loading ? true : undefined}
+            className={OUTLINE_BUTTON}
+          >
+            <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+            {t("common:labels.actions")}
+          </button>
+          {menuOpen && (
+            <div
+              aria-hidden="true"
+              className="fixed inset-0 z-40 bg-background/60"
+              onClick={closeMenus}
+            />
+          )}
+          <DropdownPopup
+            testId="device-actions-sheet"
+            label={t("common:labels.actions")}
+            sheetClassName="fixed inset-x-0 bottom-0 z-50 max-h-[75vh] overflow-y-auto rounded-t-xl border-t bg-card pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] shadow-lg"
+          >
+            {showWake &&
+              sheetItem({
+                action: "run-script",
+                label: t("deviceActions.runScript"),
+                icon: <Play className="h-4 w-4" />,
+                reason: queuedReason,
+              })}
+            <ConnectDesktopButton
+              deviceId={device.id}
+              compact
+              disabled={!online}
+              disabledTitle={offlineTitle}
+              isHeadless={device.isHeadless}
+              desktopAccess={device.desktopAccess}
+              remoteAccessPolicy={device.remoteAccessPolicy}
+              helperLifecycleMode={device.helperLifecycleMode}
+            />
+            {canUseRemoteTools &&
+              sheetItem({
+                action: "remote-tools",
+                label: t("deviceActions.remoteTools"),
+                icon: <Wrench className="h-4 w-4" />,
+                reason: remoteToolsUnavailable ? remoteToolsTitle : undefined,
+              })}
+            <DelegateToOperatorButton
+              orgId={device.orgId}
+              deviceId={device.id}
+              deviceLabel={device.displayName || device.hostname}
+              orgLabel={device.orgName}
+              source={{ kind: "device", id: device.id }}
+              className="flex min-h-11 w-full items-center gap-3 px-4 py-2.5 text-left text-sm hover:bg-muted"
+            />
+            <hr className="my-1" />
+            {sheetItem({
+              action: "reboot",
+              label: t("deviceActions.reboot"),
+              icon: <RotateCcw className="h-4 w-4" />,
+              reason: queuedReason,
+            })}
+            {canForceReboot &&
+              sheetItem({
+                action: "force_reboot",
+                label: t("deviceActions.forceRebootNow"),
+                icon: <RotateCcw className="h-4 w-4" />,
+                reason: !online || !forceRebootSupported ? forceRebootTitle : undefined,
+                tone: "destructive",
+                testId: "device-power-action-force-reboot",
+              })}
+            {device.os === "windows" &&
+              sheetItem({
+                action: "reboot_safe_mode",
+                label: t("deviceActions.rebootToSafeMode"),
+                icon: <Shield className="h-4 w-4" />,
+                reason: queuedReason,
+                tone: "warning",
+              })}
+            {sheetItem({
+              action: "shutdown",
+              label: t("deviceActions.shutdown"),
+              icon: <Power className="h-4 w-4" />,
+              reason: queuedReason,
+              tone: "destructive",
+            })}
+            {sheetItem({
+              action: "refresh",
+              label: t("deviceActions.refresh"),
+              icon: <RefreshCw className="h-4 w-4" />,
+              reason: queuedReason,
+            })}
+            {sheetItem({
+              action: "maintenance",
+              label: isInMaintenance(device)
+                ? t("deviceActions.exitMaintenance")
+                : t("deviceActions.enterMaintenance"),
+              icon: <Shield className="h-4 w-4" />,
+            })}
+            <hr className="my-1" />
+            {sheetItem({
+              action: "deploy-software",
+              label: t("deviceActions.deploySoftware"),
+              icon: <Package className="h-4 w-4" />,
+            })}
+            {device.os === "macos" &&
+              sheetItem({
+                action: "install-homebrew",
+                label: t("deviceActions.installHomebrew"),
+                icon: <Beer className="h-4 w-4" />,
+                testId: "device-install-homebrew",
+              })}
+            {sheetItem({
+              action: "clear-sessions",
+              label: t("deviceActions.clearSessions"),
+              icon: <XCircle className="h-4 w-4" />,
+            })}
+            {canRecoverAgent &&
+              sheetItem({
+                action: "restart-agent",
+                label: t("deviceActions.restartAgent"),
+                icon: <RotateCw className="h-4 w-4" />,
+                testId: "device-action-restart-agent",
+              })}
+            {sheetItem({
+              action: "change-site",
+              label: t("deviceActions.changeSite"),
+              icon: <MapPin className="h-4 w-4" />,
+            })}
+            {canMoveOrg &&
+              sheetItem({
+                action: "move-org",
+                label: t("deviceActions.moveOrg"),
+                icon: <ArrowRightLeft className="h-4 w-4" />,
+                testId: "device-action-move-org",
+              })}
+            {sheetItem({
+              action: "settings",
+              label: t("deviceActions.deviceSettings"),
+              icon: <Settings className="h-4 w-4" />,
+            })}
+            <hr className="my-1" />
+            {removeOrRestoreMenuItems}
+          </DropdownPopup>
+        </DropdownRoot>
+        {/* Touch has no hover: when the primary itself is unavailable, say why
+            in plain sight instead of leaving a tap that does nothing. */}
+        {!showWake && offlineTitle && (
+          <p data-testid="device-phone-primary-reason" className="w-full text-xs text-muted-foreground">
+            {offlineTitle}
+          </p>
+        )}
+        {/* Secondary page actions come after the primary + menu pair so the
+            primary keeps the first row to itself. */}
+        {extraActions}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      {/* Desktop row is right-aligned so a second row of buttons ends flush
+          with the first instead of leaving a ragged right edge beside the title. */}
+      {isPhone ? renderPhoneRow() : (
+      <div data-testid="device-header-actions" className="flex flex-wrap items-center gap-2 2xl:justify-end">
+        {reasonSpans}
+        {extraActions}
+        {/* When the device is offline, Wake is the one action that matters —
+            promote it to the primary header button instead of burying it in the
+            Power dropdown, where every other action is disabled anyway. */}
+        {showWake && (
+          <button
+            type="button"
+            onClick={() => {
+              if (!loading) void handleAction("wake");
+            }}
+            aria-disabled={loading || undefined}
+            title={t("deviceActions.sendAWakeOnLanPacket")}
+            className={FILLED_BUTTON}
+          >
+            <Zap className="h-4 w-4" aria-hidden="true" />
             {t("deviceActions.wake")}{" "}
           </button>
         )}
         <button
           type="button"
-          onClick={() => handleAction("run-script")}
-          disabled={!online || loading}
+          onClick={() => {
+            if (online && !loading) void handleAction("run-script");
+          }}
+          aria-disabled={!online || loading ? true : undefined}
           title={offlineTitle}
-          className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          aria-describedby={offlineTitle ? offlineReasonId : undefined}
+          className={online ? FILLED_BUTTON : OUTLINE_BUTTON}
         >
-          <Play className="h-4 w-4" />
+          <Play className="h-4 w-4" aria-hidden="true" />
           {t("deviceActions.runScript")}{" "}
         </button>
         {/* W08 of #5205 (#5246). Renders nothing unless the AI Operator flags
@@ -544,6 +1140,7 @@ export default function DeviceActions({
           deviceLabel={device.displayName || device.hostname}
           orgLabel={device.orgName}
           source={{ kind: "device", id: device.id }}
+          className={OUTLINE_BUTTON}
         />
         <ConnectDesktopButton
           deviceId={device.id}
@@ -557,58 +1154,66 @@ export default function DeviceActions({
         {canUseRemoteTools && (
           <button
             type="button"
-            onClick={() => handleAction("remote-tools")}
-            disabled={
-              !online ||
-              loading ||
-              device.remoteAccessPolicy?.remoteTools === false
+            onClick={() => {
+              if (!remoteToolsUnavailable && !loading) void handleAction("remote-tools");
+            }}
+            aria-disabled={remoteToolsUnavailable || loading ? true : undefined}
+            title={remoteToolsTitle}
+            aria-describedby={
+              remoteToolsTitle
+                ? remoteToolsTitle === offlineTitle
+                  ? offlineReasonId
+                  : remoteToolsReasonId
+                : undefined
             }
-            title={
-              offlineTitle ??
-              (device.remoteAccessPolicy?.remoteTools === false
-                ? `Remote tools disabled by policy${device.remoteAccessPolicy?.policyName ? ` "${device.remoteAccessPolicy.policyName}"` : ""}`
-                : undefined)
-            }
-            className="flex items-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            className={OUTLINE_BUTTON}
           >
-            <Wrench className="h-4 w-4" />
+            <Wrench className="h-4 w-4" aria-hidden="true" />
             {t("deviceActions.remoteTools")}{" "}
           </button>
         )}
-        <div className="relative">
+        <DropdownRoot open={powerMenuOpen} onClose={closeMenus}>
           <button
             type="button"
             onClick={() => {
+              if (!online || loading) return;
               setPowerMenuOpen(!powerMenuOpen);
               setMenuOpen(false);
             }}
-            disabled={!online || loading}
+            aria-disabled={!online || loading ? true : undefined}
             title={offlineTitle}
-            aria-haspopup="true"
+            aria-describedby={offlineTitle ? offlineReasonId : undefined}
+            ref={powerTriggerRef}
+            data-testid="device-power-menu"
+            aria-haspopup="menu"
             aria-expanded={powerMenuOpen}
-            className="flex items-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            className={OUTLINE_BUTTON}
           >
             <Power className="h-4 w-4" />
             {t("deviceActions.power")}{" "}
             <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
-          {powerMenuOpen && (
-            <div className="absolute right-0 top-full z-10 mt-1 w-48 rounded-md border bg-card shadow-lg">
+          <DropdownPopup>
               <button
                 type="button"
                 onClick={() => handleAction("reboot")}
-                disabled={!online}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <RotateCcw className="h-4 w-4" />
                 {t("deviceActions.reboot")}{" "}
               </button>
+              {forceRebootMenuItem}
               {device.os === "windows" && (
                 <button
                   type="button"
                   onClick={() => handleAction("reboot_safe_mode")}
-                  disabled={!online}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-warning hover:bg-warning/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-disabled={(!online) || undefined}
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-warning hover:bg-warning/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
                 >
                   <Shield className="h-4 w-4" />
                   {t("deviceActions.rebootToSafeMode")}{" "}
@@ -617,8 +1222,10 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("shutdown")}
-                disabled={!online}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <Power className="h-4 w-4" />
                 {t("deviceActions.shutdown")}{" "}
@@ -636,45 +1243,54 @@ export default function DeviceActions({
                 type="button"
                 data-testid="device-power-action-maintenance"
                 onClick={() => handleAction("maintenance")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Shield className="h-4 w-4" />
                 {isInMaintenance(device)
                   ? t("deviceActions.exitMaintenance")
                   : t("deviceActions.enterMaintenance")}
               </button>
-            </div>
-          )}
-        </div>
-        <div className="relative">
+            </DropdownPopup>
+        </DropdownRoot>
+        <DropdownRoot open={menuOpen} onClose={closeMenus}>
           <button
             type="button"
+            ref={moreTriggerRef}
             data-testid="device-actions-menu"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            aria-label={t("deviceActions.moreActions")}
+            title={t("deviceActions.moreActions")}
             onClick={() => {
+              if (loading) return;
               setMenuOpen(!menuOpen);
               setPowerMenuOpen(false);
             }}
-            disabled={loading}
-            className="flex h-10 w-10 items-center justify-center rounded-md border bg-background transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            aria-disabled={loading ? true : undefined}
+            className="flex h-9 w-9 items-center justify-center rounded-md border bg-background transition hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-60"
           >
-            <MoreHorizontal className="h-4 w-4" />
+            <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
           </button>
-          {menuOpen && (
-            <div className="absolute right-0 top-full z-10 mt-1 w-48 rounded-md border bg-card shadow-lg">
+          <DropdownPopup>
               <button
                 type="button"
                 onClick={() => handleAction("refresh")}
-                disabled={!online || loading}
-                title={t("deviceActions.reRunAgentInventoryCollectorsSo")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                aria-disabled={(!online || loading) || undefined}
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               >
                 <RefreshCw className="h-4 w-4" />
-                {t("deviceActions.refresh")}{" "}
+                <RefreshLabel />{" "}
               </button>
               <button
                 type="button"
                 onClick={() => handleAction("maintenance")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Shield className="h-4 w-4" />
                 {isInMaintenance(device)
@@ -684,7 +1300,9 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("deploy-software")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Package className="h-4 w-4" />
                 {t("deviceActions.deploySoftware")}{" "}
@@ -694,7 +1312,9 @@ export default function DeviceActions({
                   type="button"
                   data-testid="device-install-homebrew"
                   onClick={() => handleAction("install-homebrew")}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
                 >
                   <Beer className="h-4 w-4" />
                   {t("deviceActions.installHomebrew")}{" "}
@@ -703,15 +1323,20 @@ export default function DeviceActions({
                             <button
                 type="button"
                 onClick={() => handleAction("clear-sessions")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <XCircle className="h-4 w-4" />
                 {t("deviceActions.clearSessions")}{" "}
               </button>
+              {restartAgentMenuItem}
               <button
                 type="button"
                 onClick={() => handleAction("change-site")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <MapPin className="h-4 w-4" />
                 {t("deviceActions.changeSite")}{" "}
@@ -723,7 +1348,9 @@ export default function DeviceActions({
                   type="button"
                   data-testid="device-action-move-org"
                   onClick={() => handleAction("move-org")}
-                  className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
                 >
                   <ArrowRightLeft className="h-4 w-4" />
                   {t("deviceActions.moveOrg")}{" "}
@@ -732,18 +1359,21 @@ export default function DeviceActions({
               <button
                 type="button"
                 onClick={() => handleAction("settings")}
-                className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                role="menuitem"
+                tabIndex={-1}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-4 py-2 text-left text-sm hover:bg-muted"
               >
                 <Settings className="h-4 w-4" />
                 {t("deviceActions.deviceSettings")}{" "}
               </button>
               <hr className="my-1" />
               {removeOrRestoreMenuItems}
-            </div>
-          )}
-        </div>
+            </DropdownPopup>
+        </DropdownRoot>
       </div>
+      )}
 
+      {forceRebootDialog}
       {modalType === "decommission" ? (
         <RemoveDeviceDialog
           open

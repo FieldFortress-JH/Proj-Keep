@@ -39,9 +39,10 @@
     },
     "confirm": {
       "title": "Patch-Freigabe bestätigen",
-      "selectedOrganization": "der ausgewählten Organisation",
-      "messageOne": "Patch auf {{count}} Gerät in {{org}} freigeben?",
-      "messageMany": "Patch auf {{count}} Geräten in {{org}} freigeben?"
+      "selectedRing": "(unbenannt)",
+      "messageRingOne": "Patch auf {{count}} Gerät in allen Organisationen im Ring {{ring}} freigeben?",
+      "messageRingMany": "Patch auf {{count}} Geräten in allen Organisationen im Ring {{ring}} freigeben?",
+      "messagePartnerWide": "Patch für alle Organisationen Ihres Partners freigeben?"
     },
     "checkingAccess": "Zugriff wird geprüft..."
   },
@@ -83,14 +84,19 @@
       "pendingDevices": "Bei {{count}} Geräten stehen Patches aus",
       "approved": "{{count}} freigegeben",
       "pendingApproval": "{{count}} Freigaben ausstehend",
+      "failedInstalls_one": "{{count}} fehlgeschlagene Installation",
+      "failedInstalls_other": "{{count}} fehlgeschlagene Installationen",
       "critical": "{{count}} kritisch",
-      "reboot": "{{count}} mit ausstehendem Neustart"
+      "reboot": "{{count}} mit ausstehendem Neustart",
+      "imagesNotChecked_one": "{{count}} Container-Image nicht geprüft",
+      "imagesNotChecked_other": "{{count}} Container-Images nicht geprüft"
     },
     "filters": {
       "allDevices": "Alle Geräte ({{count}})",
       "statusFilterLabel": "Compliance-Status filtern",
       "pendingPatches": "Ausstehende Patches ({{count}})",
       "critical": "Kritisch ({{count}})",
+      "failed": "Fehlgeschlagene Installationen ({{count}})",
       "pendingReboot": "Ausstehender Neustart ({{count}})",
       "thirdPartyPending": "Ausstehende Drittanbieter-Patches ({{count}})",
       "compliant": "Konform ({{count}})"
@@ -109,6 +115,8 @@
       "approvedTitle": "Ausstehende Patches, die zur Installation freigegeben sind",
       "pendingApproval": "Freigabe ausstehend",
       "pendingApprovalTitle": "Ausstehende Patches, deren Freigabe noch aussteht",
+      "failed": "Fehlgeschlagen",
+      "failedTitle": "Ausstehende Patches, deren letzter Installationsversuch fehlgeschlagen ist",
       "osPatches": "OS-Patches",
       "osPatchesTitle": "Ausstehende Updates von Windows Update, Apple oder Linux-Paketmanagern",
       "thirdParty": "Drittanbieter",
@@ -153,6 +161,11 @@
       "messageOne": "Aktion „{{action}}“ auf {{count}} Gerät in {{org}} ausführen?",
       "messageMany": "Aktion „{{action}}“ auf {{count}} Geräten in {{org}} ausführen?",
       "messageMultiOrg": "Aktion „{{action}}“ auf {{count}} Geräten in {{orgCount}} Organisationen ({{orgNames}}) ausführen?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} von {{total}}",
+      "previous": "Vorherige Seite",
+      "next": "Nächste Seite"
     }
   },
   "patchInstallHistory": {
@@ -253,7 +266,9 @@
       "moderate": "Moderat",
       "low": "Niedrig",
       "unrated": "Unbewertet",
-      "unratedNote": "Wird nicht automatisch genehmigt"
+      "unratedNote": "Wird nicht automatisch genehmigt",
+      "derivedNote": "Abgeleitete Bewertung",
+      "derivedTooltip": "Der Hersteller hat für dieses Update keine Bewertung veröffentlicht. Dieser Schweregrad wurde aus Klassifizierung und Titel abgeleitet."
     },
     "approval": {
       "pending": "Ausstehend",
@@ -301,6 +316,7 @@
       "os": "Betriebssystem",
       "release": "Veröffentlichung",
       "approval": "Freigabe",
+      "devices": "Geräte",
       "actions": "Aktionen"
     },
     "releaseUnknown": "Unbekannt",
@@ -313,6 +329,23 @@
       "badgeDevices_other": "Installation auf {{count}} Geräten fehlgeschlagen",
       "noReason": "Kein Grund vom Agent gemeldet",
       "failedAt": "Letzter Installationsversuch fehlgeschlagen: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} Gerät",
+      "badge_other": "{{count}} Geräte",
+      "none": "Kein Gerät im Bereich benötigt diesen Patch noch",
+      "open": "Geräte anzeigen, die {{title}} noch benötigen",
+      "heading": "Geräte, die {{title}} noch benötigen",
+      "loading": "Geräte werden geladen…",
+      "error": "Die Geräteliste konnte nicht geladen werden.",
+      "showing": "{{shown}} von {{total}} angezeigt",
+      "loadMore": "Mehr laden",
+      "lastChecked": "Zuletzt geprüft: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Paketversion {{version}}",
+      "id": "Katalog-ID {{id}}",
+      "title": "Ein anderer Katalogeintrag hat denselben Titel. Jeder wird separat freigegeben."
     }
   },
   "patchesPage": {
@@ -353,7 +386,8 @@
       "createRing": "Updatering konnte nicht erstellt werden",
       "deleteRing": "Ring konnte nicht gelöscht werden",
       "approveUnknown": "Freigabestatus unbekannt — die Serverantwort konnte nicht gelesen werden. Aktualisieren Sie, um zu prüfen, welche Patches freigegeben wurden.",
-      "approveAbortedWithFailures": "{{message}} ({{count}} Patches wurden zuvor außerdem vom Server abgelehnt.)"
+      "approveAbortedWithFailures": "{{message}} ({{count}} Patches wurden zuvor außerdem vom Server abgelehnt.)",
+      "checkRingLinks": "Richtlinien, die diesen Ring verwenden, konnten nicht geprüft werden – es wurde nichts gelöscht"
     },
     "toast": {
       "ringSaved": "Updatering gespeichert",
@@ -383,10 +417,18 @@
       "createTitle": "Updatering erstellen"
     },
     "truncatedNotice": "Es werden {{shown}} von {{total}} Patches angezeigt. Die Filter hier grenzen nur das bereits Geladene ein, der Rest ist über diese Ansicht nicht erreichbar — verwenden Sie die Patches-API für den vollständigen Katalog.",
-    "shiftedNotice": "Es werden {{shown}} von {{total}} Patches angezeigt — der Katalog hat sich während des Ladens geändert. Laden Sie neu, um den Rest zu sehen."
+    "emptyRingSeverityNotice": "Diesem Ring sind noch keine Geräte zugewiesen. Von Geräten gemeldete Schweregrade erscheinen erst nach der Zuweisung von Geräten, daher sind die meisten Patches bis dahin „Unbewertet“.",
+    "shiftedNotice": "Es werden {{shown}} von {{total}} Patches angezeigt — der Katalog hat sich während des Ladens geändert. Laden Sie neu, um den Rest zu sehen.",
+    "ringDelete": {
+      "messageNone": "Keine Richtlinie verwendet diesen Ring. Seine Genehmigungsregeln und Zeitplaneinstellungen werden gelöscht und können nicht wiederhergestellt werden.",
+      "title": "{{name}} löschen?",
+      "messageOne": "1 Richtlinie führt keine geplanten Patches mehr aus, bis Sie einen anderen Ring wählen.",
+      "messageMany": "{{count}} Richtlinien führen keine geplanten Patches mehr aus, bis Sie einen anderen Ring wählen.",
+      "confirm": "Ring löschen"
+    }
   },
   "patchJobsList": {
-    "empty": "Noch keine Patch-Jobs. Von Richtlinien, Update-Ringen oder dem KI-Assistenten erstellte Jobs werden hier angezeigt.",
+    "empty": "Noch keine Patch-Aufträge. Aufträge, die durch Richtlinien, Update-Ringe oder Breeze AI erstellt werden, erscheinen hier.",
     "loading": "Patch-Jobs werden geladen...",
     "columns": {
       "name": "Job",
@@ -509,6 +551,22 @@
       "title": "Durchsetzung der Installation",
       "description": "Legt fest, wie lange Geräte freigegebene Patches installieren müssen und wie lange Benutzer den Neustart zurückstellen können. Das Neustartverhalten selbst wird pro Richtlinie auf der Registerkarte „Patch“ festgelegt."
     },
+    "featureUpdates": {
+      "title": "Windows-Funktionsupdates",
+      "description": "Ob Geräte in diesem Ring Windows-Funktionsversionen erhalten (zum Beispiel 25H2). Breeze installiert sie nur über die Freigaberegeln unten; fügen Sie eine Überschreibung für Funktionsupdates hinzu, um sie automatisch freizugeben.",
+      "modeBlock": "Blockieren",
+      "modeAllow": "Neueste Version zulassen",
+      "modePin": "An eine Version anheften",
+      "productLabel": "Windows-Version",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Version",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Windows Update wird auf jedem Gerät auf diese Version ausgerichtet (Windows Update for Business-Zielversionsrichtlinie). Sofern die Einstellung „Breeze ist die einzige Windows Update-Quelle“ der Richtlinie nicht aktiv ist, kann Windows die Version nach eigenem Zeitplan außerhalb der Breeze-Freigabe herunterladen und installieren.",
+      "validation": {
+        "release": "Geben Sie eine Version wie 25H2 ein."
+      }
+    },
     "approvalPolicy": {
       "title": "Freigaberichtlinie",
       "description": "Legt fest, welche Patches in diesem Ring automatisch freigegeben und wie lange sie nach der Veröffentlichung durch den Anbieter zurückgehalten werden. Der Standard gilt für jede Kategorie; mit einer Überschreibung kann eine Kategorie abweichend behandelt werden.",
@@ -564,7 +622,47 @@
     "badges": {
       "manual": "Manuell",
       "os": "OS: {{severities}}",
-      "thirdParty": "Drittanbieter-Apps"
+      "thirdParty": "Drittanbieter-Apps",
+      "appRules_one": "{{count}} App-Regel",
+      "appRules_other": "{{count}} App-Regeln",
+      "featureUpdatesNewest": "Funktionsupdates: neueste",
+      "featureUpdatesPinned": "Funktionsupdates: {{release}}"
+    }
+  },
+  "ringAppRules": {
+    "applicationRules": "Anwendungsregeln",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Blockieren Sie bestimmte Anwendungen vom automatischen Patchen oder heften Sie sie an eine maximale Version.",
+    "blocked": "Blockiert",
+    "pinned": "Angepinnt",
+    "maxVersion": "Max-Version",
+    "pinnedApplicationsNeedAVersion": "Angepinnte Anwendungen benötigen eine Version.",
+    "addApplication": "Anwendung hinzufügen",
+    "searchCatalogAndDetectedApplications": "Katalog und erkannte Anwendungen durchsuchen...",
+    "searching": "Suche...",
+    "catalog": "Katalog",
+    "couldnTLoadApplicationsYouCanStill": "Anwendungen konnten nicht geladen werden. Sie können sie trotzdem über die Paket-ID unten hinzufügen.",
+    "noMatches": "Keine Übereinstimmungen.",
+    "orEnterAPackageIDManually": "Oder geben Sie manuell eine Paket-ID ein",
+    "removeRuleFor": "Regel für {{application}} entfernen",
+    "scopeNote": "Diese Regeln gelten für jedes Gerät, dessen Konfigurationsrichtlinie mit diesem Ring verknüpft ist."
+  },
+  "patchDetails": {
+    "unknown": "Unbekannt",
+    "source": "Quelle",
+    "packageId": "KB-/Paket-ID",
+    "severity": "Schweregrad",
+    "releaseDate": "Veröffentlichungsdatum",
+    "firstSeen": "Erstmals im Katalog gesehen",
+    "rings": {
+      "title": "Update-Ringe",
+      "note": "Wann jeder Ring diesen Patch automatisch genehmigt (Regel auf Ringebene; Kategorie-Überschreibungen werden nicht angezeigt).",
+      "none": "Keine Update-Ringe konfiguriert.",
+      "manual": "Nicht automatisch genehmigt — manuelle Genehmigung erforderlich",
+      "immediate": "Wird sofort automatisch genehmigt",
+      "needsDate": "Zurückgehalten — kein Veröffentlichungsdatum, um das {{count}}-Tage-Fenster zu starten",
+      "autoApproves": "Wird am {{date}} automatisch genehmigt",
+      "hold_one": "{{count}} Tag Verzögerung",
+      "hold_other": "{{count}} Tage Verzögerung"
     }
   }
 }

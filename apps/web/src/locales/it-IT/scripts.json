@@ -3,7 +3,8 @@
     "errors": {
       "fetch": "Impossibile recuperare l'automazione",
       "generic": "Si è verificato un errore",
-      "save": "Impossibile salvare l'automazione"
+      "save": "Impossibile salvare l'automazione",
+      "invalidTarget": "La destinazione dei dispositivi non è valida: {{detail}}"
     },
     "loading": "Caricamento automazione...",
     "breadcrumb": {
@@ -210,7 +211,9 @@
     },
     "empty": {
       "noActions": "Nessuna azione definita. Fai clic su \"Aggiungi azione\" per crearne una."
-    }
+    },
+    "partnerGroupsNote": "Le automazioni a livello di partner non possono avere come destinazione gruppi di dispositivi o dispositivi specifici, perché ciascuno appartiene a una sola organizzazione. Usa Tutti i dispositivi o un filtro avanzato.",
+    "partnerTargetBlocked": "Questa automazione a livello di partner ha come destinazione gruppi di dispositivi o dispositivi specifici, il che non è supportato. Cambia la destinazione in Tutti i dispositivi o in un filtro avanzato prima di salvare."
   },
   "automationList": {
     "elevated": "Privilegi elevati",
@@ -420,12 +423,17 @@
     "empty": {
       "noPolicies": "Nessun criterio configurato",
       "allCompliant": "Tutti i dispositivi sono conformi!",
+      "notEvaluated": "Nessun dispositivo è ancora stato valutato.",
+      "noViolationsPending_one": "Nessuna violazione trovata; {{count}} dispositivo è ancora in attesa di valutazione.",
+      "noViolationsPending_other": "Nessuna violazione trovata; {{count}} dispositivi sono ancora in attesa di valutazione.",
       "noMatchingDevices": "Nessun dispositivo corrispondente trovato."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} conformi",
     "searchDevices": "Cerca dispositivi...",
-    "violationCount": "{{count}} violazione",
-    "moreViolations": "+{{count}} altre violazioni",
+    "violationCount_one": "{{count}} violazione",
+    "violationCount_other": "{{count}} violazioni",
+    "moreViolations_one": "+{{count}} altra violazione",
+    "moreViolations_other": "+{{count}} altre violazioni",
     "lastChecked": "Ultimo controllo: {{date}}",
     "pagination": {
       "showing": "Visualizzazione da {{start}} a {{end}} di {{total}}",
@@ -712,6 +720,8 @@
       "timeout": "Esecuzione script scaduta",
       "pending": "Lo script è in attesa di essere eseguito",
       "queued": "Lo script è in coda per l'invio al dispositivo",
+      "queuedAwaitingPickup": "Nessuna sessione attiva dell'agente lo ha ancora preso in carico. Lo script verrà consegnato al prossimo contatto dell'agente del dispositivo.",
+      "deviceOffline": "Il dispositivo è offline. Lo script verrà consegnato quando si riconnetterà.",
       "cancelling": "Interruzione richiesta: in attesa di conferma dal dispositivo.",
       "cancelled": "È stato interrotto sul dispositivo"
     },
@@ -735,7 +745,8 @@
       "failedCancelTooLate": "Non riuscito — la richiesta di interruzione è arrivata troppo tardi",
       "timeoutCancelTooLate": "Timeout — la richiesta di interruzione è arrivata troppo tardi",
       "cancelFailed": "Interruzione non riuscita — il dispositivo non è riuscito a interrompere il processo",
-      "queuedOffline": "In coda — dispositivo offline"
+      "queuedOffline": "In coda — dispositivo offline",
+      "queuedAwaitingPickup": "In coda — in attesa che il dispositivo lo prenda in carico"
     }
   },
   "executionHistory": {
@@ -766,7 +777,8 @@
       "failedCancelTooLate": "Non riuscito — la richiesta di interruzione è arrivata troppo tardi",
       "timeoutCancelTooLate": "Timeout — la richiesta di interruzione è arrivata troppo tardi",
       "cancelFailed": "Interruzione non riuscita — il dispositivo non è riuscito a interrompere il processo",
-      "queuedOffline": "In coda — dispositivo offline"
+      "queuedOffline": "In coda — dispositivo offline",
+      "queuedAwaitingPickup": "In coda — in attesa di presa in carico"
     },
     "summary": "{{shown}} di {{total}}",
     "headers": {
@@ -795,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "Descrivi lo script di cui hai bisogno...",
-      "opening": "Apertura assistente IA..."
+      "opening": "Apertura di Breeze AI..."
     },
     "actions": {
       "stopGenerating": "Interrompi generazione",
@@ -814,12 +826,12 @@
       "reject": "Rifiuta"
     },
     "empty": {
-      "title": "Assistente IA per script",
-      "description": "Descrivi ciò di cui hai bisogno e scriverò lo script per te."
+      "title": "Breeze AI",
+      "description": "Chiedi a Breeze AI di scrivere o rivedere questo script."
     }
   },
   "scriptAiPanel": {
-    "title": "Assistente IA per script",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "Riapplica modifica IA",
       "redo": "Ripeti",
@@ -958,11 +970,20 @@
       "allAdmitted": "Tutti i dispositivi selezionati sono stati ammessi e messi in coda.",
       "partiallyAdmitted": "Alcuni dispositivi sono stati ammessi e messi in coda. Esamina le destinazioni rimanenti.",
       "rejected": "Nessun dispositivo è stato ammesso. Esamina i motivi qui sotto.",
-      "queued": "In coda"
+      "queued": "In coda",
+      "reasons": {
+        "not_found_or_inaccessible": "Dispositivo non trovato o non accessibile",
+        "site_access_denied": "Non hai accesso al sito di questo dispositivo",
+        "script_org_mismatch": "Lo script appartiene a un'organizzazione diversa da quella del dispositivo",
+        "os_incompatible": "Lo script non è compatibile con il sistema operativo di questo dispositivo",
+        "device_decommissioned": "Il dispositivo è stato dismesso",
+        "maintenance_suppressed": "Saltato: il dispositivo è in una finestra di manutenzione"
+      }
     },
     "confirm": {
       "title": "Conferma esecuzione",
-      "description": "Esegui \"{{name}}\" su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati e iniziano l'esecuzione immediatamente."
+      "description": "Esegui \"{{name}}\" su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati e iniziano l'esecuzione immediatamente.",
+      "descriptionOffline": "Esegui “{{name}}” su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati ora: i dispositivi online iniziano subito e {{offline}} dispositivo/i offline verranno eseguiti quando tornano online."
     },
     "selectedCount": "{{count}} dispositivo/i selezionato/i",
     "executeBlocked": "L’esecuzione non è disponibile: un dispositivo selezionato non può eseguire questo script qui (potrebbe appartenere a un’organizzazione diversa da quella mostrata o non essere più accessibile).",
@@ -979,6 +1000,44 @@
     },
     "toasts": {
       "runsWhenOnline": "Viene eseguito quando il dispositivo è online"
+    },
+    "targetMode": {
+      "label": "Esegui su",
+      "devices": "Dispositivi",
+      "groups": "Gruppi di dispositivi"
+    },
+    "groups": {
+      "title": "Seleziona gruppi di dispositivi",
+      "searchPlaceholder": "Cerca gruppi",
+      "selectedCount": "{{count}} gruppo/i selezionato/i",
+      "dynamic": "Dinamico",
+      "deviceCount": "{{count}} dispositivo/i",
+      "refusedReason": "Non disponibile come destinazione di esecuzione: le regole di questo gruppo si basano su campi che il dispositivo stesso segnala ({{fields}}).",
+      "loading": "Caricamento dei gruppi di dispositivi...",
+      "loadFailed": "Impossibile caricare i gruppi di dispositivi.",
+      "retry": "Riprova",
+      "empty": "Nessun gruppo di dispositivi trovato.",
+      "tooManyGroups": "Un'esecuzione può avere al massimo {{max}} gruppi come destinazione.",
+      "countingMembers": "Conteggio dei membri...",
+      "countFailed": "Impossibile contare i membri dei gruppi selezionati. Il server verifica il limite durante l'esecuzione.",
+      "summaryUnique": "{{count}} dispositivo/i univoco/i nei gruppi selezionati",
+      "summaryCompatible": "{{count}} possono eseguire questo script (sistema operativo compatibile)",
+      "summaryOffline": "{{count}} di questi sono offline e verranno eseguiti quando il dispositivo sarà online",
+      "membershipNote": "L'appartenenza ai gruppi dinamici è quella dell'ultima valutazione e viene riletta all'avvio dell'esecuzione.",
+      "overCap": "Questi gruppi contengono {{count}} dispositivi univoci, oltre il limite di {{max}} per esecuzione. Deseleziona un gruppo o suddividi l'esecuzione.",
+      "submitting": "Invio a {{count}} gruppo/i...",
+      "warningsTitle": "Note del server",
+      "confirmDescription": "Esegui “{{name}}” su {{groups}} gruppo/i di dispositivi come {{runAs}}. Gli script vengono messi in coda e iniziano subito.",
+      "confirmDescriptionOffline": "Esegui “{{name}}” su {{groups}} gruppo/i di dispositivi come {{runAs}}. Gli script vengono accodati ora: i dispositivi online iniziano subito e {{offline}} dispositivo/i offline verranno eseguiti quando tornano online.",
+      "confirmMembers": "In questo momento {{count}} dispositivo/i univoco/i fanno parte di questi gruppi; l'appartenenza viene riletta alla conferma.",
+      "confirmMembersUnknown": "Il numero di dispositivi non è ancora noto; l'appartenenza viene letta alla conferma.",
+      "errors": {
+        "selectGroup": "Seleziona almeno un gruppo di dispositivi",
+        "tooManyTargets": "Questi gruppi corrispondono a {{count}} dispositivi, oltre il limite di {{max}} per esecuzione. Deseleziona un gruppo o suddividi l'esecuzione.",
+        "perGroup": "Dispositivi per gruppo: {{groups}}.",
+        "groupNotFound": "{{count}} gruppo/i selezionato/i non esiste/esistono più o non è/sono accessibile/i. Ricarica l'elenco e riprova.",
+        "noTargets": "I gruppi selezionati non contengono dispositivi che questa esecuzione possa raggiungere; non è stato eseguito nulla."
+      }
     }
   },
   "secretParameters": {
@@ -1077,8 +1136,8 @@
       "exitCodeSeverity": "Gravità codice di uscita"
     },
     "ai": {
-      "toggleTitle": "Attiva/disattiva assistente IA per script (⌘⇧I)",
-      "button": "Assistente IA"
+      "toggleTitle": "Attiva/disattiva Breeze AI (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "Non ci sono ancora parametri. I parametri consentono agli utenti di fornire valori in fase di esecuzione - referenziali nello script come",

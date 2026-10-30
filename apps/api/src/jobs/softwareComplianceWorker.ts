@@ -1,10 +1,15 @@
 import { Job, Queue, Worker } from 'bullmq';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import * as dbModule from '../db';
 import {
   devices,
+  organizations,
+  serviceProcessCheckResults,
+  softwareCatalog,
   softwareComplianceStatus,
   softwarePolicies,
+  softwareVersions,
+  type SoftwarePolicyRuleDefinition,
   type SoftwarePolicyViolation,
 } from '../db/schema';
 import {
@@ -14,7 +19,7 @@ import {
 } from '../routes/metrics';
 import { getBullMQConnection } from '../services/redis';
 import {
-  evaluateSoftwarePolicyAgainstInventory,
+  evaluateSoftwareInventoryDetailed,
   evaluateSoftwarePolicyArming,
   getSoftwareInventoryByDeviceIds,
   normalizeSoftwarePolicyRules,
@@ -28,6 +33,16 @@ import {
 } from '../services/softwarePolicyService';
 import { resolveDeviceIdsForSoftwarePolicy } from '../services/featureConfigResolver';
 import { readLatestPolicyOwnedInstallByDevice } from '../services/softwarePolicyInstallRemediation';
+import { repairManagedSoftwarePolicies } from '../services/securityAgents/managedPolicyGenerator';
+import {
+  pruneAllForPolicy,
+  recordManagedPolicyApplicability,
+  type ManagedApplicabilityEntry,
+} from '../services/securityAgents/coverageStatusStore';
+import {
+  loadManagedRuleApplicability,
+  type ManagedRuleApplicability,
+} from '../services/securityAgents/managedRuleApplicability';
 import {
   scheduleSoftwareInstallRemediation,
   scheduleSoftwareRemediation,
@@ -40,6 +55,16 @@ import {
 import { captureException } from '../services/sentry';
 import { attachWorkerObservability } from './workerObservability';
 import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { detectionRulesSchema } from '@breeze/shared';
+import { agentSupportsServiceRunningRule } from '../services/softwareInstallAgentSupport';
+import {
+  applyServiceRules,
+  MAX_DERIVED_SERVICE_WATCHES,
+  SERVICE_STATE_FRESHNESS_MS,
+  serviceNamesForOs,
+  serviceObservationKey,
+  type ServiceObservation,
+} from '../services/softwarePolicyServiceRules';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -503,7 +528,21 @@ export function getSoftwareComplianceQueue(): Queue<SoftwareComplianceJobData> {
   return softwareComplianceQueue;
 }
 
-async function processScanPolicies(): Promise<{ queued: number }> {
+/** Exported for tests and for the BullMQ processor switch. */
+export async function processScanPolicies(): Promise<{ queued: number }> {
+  // #6960: re-derive every security_agents link's generated software policy
+  // first, so drift is repaired and a policy activated by the repair is in this
+  // scan. Best effort: the scan of every other policy must not depend on it.
+  try {
+    const repair = await repairManagedSoftwarePolicies();
+    if (repair.failed > 0) {
+      console.error('[SoftwareComplianceWorker] Generated software policy repair failed for some links', repair);
+    }
+  } catch (error) {
+    console.error('[SoftwareComplianceWorker] Generated software policy repair sweep failed', error);
+    captureException(error);
+  }
+
   const activePolicies = await db
     .select({ id: softwarePolicies.id })
     .from(softwarePolicies)
@@ -536,12 +575,216 @@ async function processScanPolicies(): Promise<{ queued: number }> {
   return { queued: activePolicies.length };
 }
 
+// ---- #6958 PR E: service_running compliance bridge (inputs) ----------------
+
+/** A latest catalog version, once per device org that can reach its catalog item. */
+type ServiceBridgeVersion = { catalogId: string; supportedOs: unknown; detectionRules: unknown; orgId: string };
+
+/**
+ * The latest catalog version of every catalog item an ALLOWLIST rule points at
+ * (one read per chunk of catalog ids; system context, as the whole pass runs).
+ * Null — and no read at all — when the policy is not an allowlist or no rule
+ * carries a catalogId: such a policy can derive no service names.
+ *
+ * Reachability is the install path's (softwarePolicyInstallRemediation.ts
+ * readReachableCatalogItem): the item is not deleted/archived and is owned by
+ * the device's org, or is partner-wide and owned by that org's partner. A rule
+ * naming another tenant's catalog id therefore derives nothing — the system
+ * context must not turn a foreign catalog's detection rules into watches. One
+ * row comes back per (version, reachable device org).
+ */
+export async function loadServiceBridgeVersions(
+  mode: string,
+  rules: SoftwarePolicyRuleDefinition[],
+  deviceOrgIds: string[],
+): Promise<ServiceBridgeVersion[] | null> {
+  if (mode !== 'allowlist') return null;
+  const catalogIds = Array.from(new Set(
+    rules.map((rule) => rule.catalogId).filter((id): id is string => typeof id === 'string' && id.length > 0),
+  ));
+  if (catalogIds.length === 0 || deviceOrgIds.length === 0) return null;
+  const versions: ServiceBridgeVersion[] = [];
+  for (const chunk of chunkArray(catalogIds)) {
+    const rows = await db
+      .select({
+        catalogId: softwareVersions.catalogId,
+        supportedOs: softwareVersions.supportedOs,
+        detectionRules: softwareVersions.detectionRules,
+        orgId: organizations.id,
+      })
+      .from(softwareVersions)
+      .innerJoin(softwareCatalog, eq(softwareCatalog.id, softwareVersions.catalogId))
+      .innerJoin(organizations, and(
+        inArray(organizations.id, deviceOrgIds),
+        or(
+          eq(softwareCatalog.orgId, organizations.id),
+          and(isNull(softwareCatalog.orgId), eq(softwareCatalog.partnerId, organizations.partnerId)),
+        ),
+      ))
+      .where(and(
+        inArray(softwareVersions.catalogId, chunk),
+        eq(softwareVersions.isLatest, true),
+        isNull(softwareCatalog.deletedAt),
+      ));
+    versions.push(...rows);
+  }
+  return versions;
+}
+
+/** Service names per reachable catalog id for one (device org, OS), memoised for the pass. */
+function serviceNamesByCatalogFor(
+  versions: ServiceBridgeVersion[],
+  orgId: string,
+  osType: string,
+  memo: Map<string, Map<string, string[]>>,
+): Map<string, string[]> {
+  const key = `${orgId}|${osType.toLowerCase()}`;
+  const cached = memo.get(key);
+  if (cached) return cached;
+  const byCatalog = new Map<string, string[]>();
+  for (const version of versions) {
+    if (version.orgId !== orgId) continue;
+    const names = serviceNamesForOs(version.detectionRules, version.supportedOs, osType);
+    if (names.length > 0) byCatalog.set(version.catalogId, names);
+  }
+  memo.set(key, byCatalog);
+  return byCatalog;
+}
+
+/**
+ * serviceNamesForOs reads stored detection rules that no longer parse as
+ * "no service clauses". Writes are validated, so this means stored-data drift
+ * (a hand edit, or a schema tightened later) — make it visible, once per
+ * catalog item per pass, instead of letting the bridge silently go dark.
+ */
+function warnUnparseableDetectionRules(policyId: string, versions: ServiceBridgeVersion[]): void {
+  const warned = new Set<string>();
+  for (const version of versions) {
+    if (warned.has(version.catalogId)) continue;
+    const rules = version.detectionRules;
+    if (rules === null || rules === undefined || (Array.isArray(rules) && rules.length === 0)) continue;
+    if (detectionRulesSchema.safeParse(rules).success) continue;
+    warned.add(version.catalogId);
+    console.warn('[SoftwareComplianceWorker] latest catalog version has unparseable detection rules; its service_running clauses are ignored (#6958)', {
+      policyId,
+      catalogId: version.catalogId,
+    });
+  }
+}
+
+/**
+ * The device's service names per catalog id, narrowed to the rules that apply
+ * to it (#10126). A generated (security agents) policy's rule that is not
+ * applicable to the device — org not mapped, tenant variable missing, platform
+ * unsupported, … — derives no watch for it and takes no part in the bridge, so
+ * the heartbeat never asks that device to monitor the vendor's service. An
+ * authored policy (no applicability) keeps every reachable, OS-matched name.
+ */
+function applicableServiceNamesByCatalog(
+  namesByCatalog: Map<string, string[]>,
+  deviceId: string,
+  applicability: ManagedRuleApplicability | null,
+): Map<string, string[]> {
+  if (!applicability || namesByCatalog.size === 0) return namesByCatalog;
+  const applicable = new Map<string, string[]>();
+  for (const [catalogId, names] of namesByCatalog) {
+    if (applicability.isRuleApplicable(deviceId, catalogId)) applicable.set(catalogId, names);
+  }
+  return applicable;
+}
+
+/**
+ * The watch list stored for one (policy, device): every derived name, deduped
+ * case-insensitively, sorted case-insensitively, then capped. Null when the
+ * policy derives nothing for this device, which clears a stale list.
+ */
+function derivedServiceWatches(
+  rules: SoftwarePolicyRuleDefinition[],
+  namesByCatalog: Map<string, string[]>,
+): Array<{ name: string }> | null {
+  const byKey = new Map<string, string>();
+  for (const rule of rules) {
+    if (!rule.catalogId) continue;
+    for (const name of namesByCatalog.get(rule.catalogId) ?? []) {
+      const key = name.toLowerCase();
+      if (!byKey.has(key)) byKey.set(key, name);
+    }
+  }
+  if (byKey.size === 0) return null;
+  if (byKey.size > MAX_DERIVED_SERVICE_WATCHES) {
+    console.warn('[SoftwareComplianceWorker] derived service watches truncated; the dropped services stay service_unverified (#6958)', {
+      derived: byKey.size,
+      cap: MAX_DERIVED_SERVICE_WATCHES,
+    });
+  }
+  return Array.from(byKey.entries())
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, MAX_DERIVED_SERVICE_WATCHES)
+    .map(([, name]) => ({ name }));
+}
+
+/**
+ * The newest fresh `service` check result per (device, lower(name)), one
+ * DISTINCT ON read per chunk of devices. Keyed per device by
+ * serviceObservationKey(name) (= watchKey('service', name)).
+ */
+async function loadServiceObservations(
+  deviceIds: string[],
+  lowerNames: string[],
+  agentVersionByDevice: Map<string, string>,
+  now: Date,
+): Promise<Map<string, Map<string, ServiceObservation>>> {
+  const byDevice = new Map<string, Map<string, ServiceObservation>>();
+  if (deviceIds.length === 0 || lowerNames.length === 0) return byDevice;
+  const lowerName = sql<string>`lower(${serviceProcessCheckResults.name})`;
+  const since = new Date(now.getTime() - SERVICE_STATE_FRESHNESS_MS);
+  for (const chunk of chunkArray(deviceIds)) {
+    const rows = await db
+      .selectDistinctOn([serviceProcessCheckResults.deviceId, lowerName], {
+        deviceId: serviceProcessCheckResults.deviceId,
+        name: serviceProcessCheckResults.name,
+        status: serviceProcessCheckResults.status,
+        timestamp: serviceProcessCheckResults.timestamp,
+      })
+      .from(serviceProcessCheckResults)
+      .where(and(
+        inArray(serviceProcessCheckResults.deviceId, chunk),
+        eq(serviceProcessCheckResults.watchType, 'service'),
+        inArray(lowerName, lowerNames),
+        gte(serviceProcessCheckResults.timestamp, since),
+      ))
+      .orderBy(asc(serviceProcessCheckResults.deviceId), asc(lowerName), desc(serviceProcessCheckResults.timestamp));
+    for (const row of rows) {
+      let observations = byDevice.get(row.deviceId);
+      if (!observations) {
+        observations = new Map();
+        byDevice.set(row.deviceId, observations);
+      }
+      observations.set(serviceObservationKey(row.name), {
+        status: row.status,
+        observedAt: row.timestamp,
+        agentSupportsAbsence: agentSupportsServiceRunningRule(agentVersionByDevice.get(row.deviceId)),
+      });
+    }
+  }
+  return byDevice;
+}
+
 export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
   policyId: string;
   devicesEvaluated: number;
   violations: number;
   remediationQueued: number;
   installRemediationQueued: number;
+  /**
+   * #6960, generated (security agents) policies only: devices with at least one
+   * rule that is not applicable to them (org not mapped, platform unsupported,
+   * …), and the (device, rule) pairs per reason. W03 persists the per-(device,
+   * vendor) reasons in `security_agent_device_status`; these counts remain for
+   * the pass log.
+   */
+  notApplicable?: number;
+  notApplicableByReason?: Record<string, number>;
 }> {
   const [policy] = await db
     .select()
@@ -602,16 +845,29 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
   // then narrowing deviceIds to what it returned keeps them out of compliance
   // evaluation AND out of the remediation (software install/uninstall) queue.
   const orgByDevice = new Map<string, string>();
+  const osTypeByDevice = new Map<string, string>();
+  // #6958 PR E: gates whether a `not_found` service result means "absent".
+  const agentVersionByDevice = new Map<string, string>();
   for (const chunk of chunkArray(deviceIds)) {
     const rows = await db
-      .select({ id: devices.id, orgId: devices.orgId })
+      .select({ id: devices.id, orgId: devices.orgId, osType: devices.osType, agentVersion: devices.agentVersion })
       .from(devices)
       .where(and(inArray(devices.id, chunk), eq(devices.isEphemeral, false), notParkedDeviceCondition()));
-    for (const row of rows) orgByDevice.set(row.id, row.orgId);
+    for (const row of rows) {
+      orgByDevice.set(row.id, row.orgId);
+      osTypeByDevice.set(row.id, row.osType);
+      agentVersionByDevice.set(row.id, row.agentVersion);
+    }
   }
   deviceIds = deviceIds.filter((id) => orgByDevice.has(id));
+  const isFullPass = !(Array.isArray(data.deviceIds) && data.deviceIds.length > 0);
 
   if (deviceIds.length === 0) {
+    // #6960 W03: a generated policy that reaches nobody any more owns no
+    // coverage rows either.
+    if (policy.managedByLinkId && isFullPass) {
+      await reportCoverageFailure(policy.id, () => pruneAllForPolicy(policy.id));
+    }
     return {
       policyId: policy.id,
       devicesEvaluated: 0,
@@ -623,6 +879,25 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
 
   const normalizedRules = normalizeSoftwarePolicyRules(policy.rules);
   const remediationOptions = readRemediationOptions(policy.remediationOptions);
+  // #6960: a policy generated from a security_agents link installs a vendor's
+  // agent with per-org keys. A (device, rule) the vendor cannot serve (org not
+  // mapped, platform unsupported, …) is NOT APPLICABLE: its `missing` violation
+  // is dropped before anything below reads it, so the device is not reported
+  // non-compliant, nothing is queued for it, and it never consumes the
+  // (policy, device) attempt budget or cooldown another vendor relies on.
+  const managedApplicability: ManagedRuleApplicability | null = policy.managedByLinkId
+    ? await loadManagedRuleApplicability(
+      { id: policy.id, managedByLinkId: policy.managedByLinkId, rules: normalizedRules },
+      deviceIds.map((deviceId) => ({
+        deviceId,
+        orgId: orgByDevice.get(deviceId)!,
+        osType: osTypeByDevice.get(deviceId) ?? '',
+      })),
+    )
+    : null;
+  const notApplicableByReason: Record<string, number> = {};
+  const notApplicableSample: Array<{ deviceId: string; reasons: string[] }> = [];
+  let notApplicableDevices = 0;
   // Contract D11: ONE arming truth, shared with softwareRemediationWorker.ts and
   // the AI compliance tool. Evaluated once per pass — the policy row cannot
   // change mid-loop, and the generation gate above already refused a job whose
@@ -649,6 +924,73 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
     : new Map<string, Date>();
   // ---- end reconcile sweep, part 1 ----------------------------------------
   const inventoryByDevice = await getSoftwareInventoryByDeviceIds(deviceIds);
+  const now = new Date();
+
+  // ---- #6958 PR E: service_running bridge inputs --------------------------
+  // Allowlist rules whose catalog item's latest version declares a
+  // `service_running` clause for the device's OS: those names become the
+  // device's derived service watches, and their fresh check results stand in
+  // for (or qualify) inventory evidence in applyServiceRules. Two reads per
+  // pass at most (versions, then observations), and none for a policy that
+  // cannot derive a name. #10126: on a generated policy only the rules
+  // applicable to the device derive names (applicableServiceNamesByCatalog).
+  //
+  // A failed bridge read must not fail the pass: inventory compliance and the
+  // uninstall verb predate the bridge and still run. The pass then says
+  // nothing about service_watches (undefined: the stored list and its
+  // last_checked-driven delivery survive), applies no service rules, and
+  // HOLDS the install verb — without the bridge a zip-installed client reads
+  // `missing`, and reinstalling a running client on a read error is worse
+  // than waiting one cycle.
+  let bridgeVersions: ServiceBridgeVersion[] | null = null;
+  const namesByOrgOsMemo = new Map<string, Map<string, string[]>>();
+  const serviceNamesByDevice = new Map<string, Map<string, string[]>>();
+  const serviceWatchesByDevice = new Map<string, Array<{ name: string }> | null>();
+  let observationsByDevice = new Map<string, Map<string, ServiceObservation>>();
+  let bridgeUnavailable = false;
+  try {
+    bridgeVersions = await loadServiceBridgeVersions(
+      policy.mode,
+      normalizedRules.software ?? [],
+      Array.from(new Set(deviceIds.map((id) => orgByDevice.get(id)!))),
+    );
+    if (bridgeVersions) warnUnparseableDetectionRules(policy.id, bridgeVersions);
+    const derivedLowerNames = new Set<string>();
+    const devicesWithWatches: string[] = [];
+    for (const deviceId of deviceIds) {
+      let watches: Array<{ name: string }> | null = null;
+      if (bridgeVersions) {
+        const names = applicableServiceNamesByCatalog(
+          serviceNamesByCatalogFor(bridgeVersions, orgByDevice.get(deviceId)!, osTypeByDevice.get(deviceId) ?? '', namesByOrgOsMemo),
+          deviceId,
+          managedApplicability,
+        );
+        serviceNamesByDevice.set(deviceId, names);
+        watches = derivedServiceWatches(normalizedRules.software ?? [], names);
+      }
+      serviceWatchesByDevice.set(deviceId, watches);
+      if (watches) {
+        devicesWithWatches.push(deviceId);
+        for (const watch of watches) derivedLowerNames.add(watch.name.toLowerCase());
+      }
+    }
+    observationsByDevice = await loadServiceObservations(
+      devicesWithWatches,
+      Array.from(derivedLowerNames),
+      agentVersionByDevice,
+      now,
+    );
+  } catch (error) {
+    bridgeUnavailable = true;
+    serviceWatchesByDevice.clear();
+    serviceNamesByDevice.clear();
+    console.error('[SoftwareComplianceWorker] service_running bridge inputs failed; evaluating inventory only and holding installs this pass (#6958)', {
+      policyId: policy.id,
+      error,
+    });
+    captureException(error);
+  }
+  // ---- end bridge inputs ----------------------------------------------------
 
   let violations = 0;
   const remediationTargets = new Set<string>();
@@ -658,16 +1000,52 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
   const installMaxAttempts = resolveInstallRemediationMaxAttempts();
   const installTargets: InstallRemediationTarget[] = [];
   const complianceUpserts: Parameters<typeof upsertSoftwareComplianceStatuses>[0] = [];
-  const now = new Date();
 
   for (const deviceId of deviceIds) {
     const startedAt = Date.now();
     try {
       const existing = existingByDevice.get(deviceId);
       const inventory = inventoryByDevice.get(deviceId) ?? [];
-      const evaluated = evaluateSoftwarePolicyAgainstInventory(policy, inventory);
+      const evaluated = evaluateSoftwareInventoryDetailed(policy.mode, normalizedRules, inventory);
+      let evaluatedViolations = evaluated.violations;
+      // #6958 PR E: the bridge sees only the names of rules applicable to this
+      // device (#10126), so a not-applicable rule's `missing` passes through it
+      // untouched — never converted to `service_unverified` — and is dropped
+      // by the filter below.
+      const serviceWatches = serviceWatchesByDevice.get(deviceId) ?? null;
+      if (serviceWatches) {
+        evaluatedViolations = applyServiceRules({
+          mode: policy.mode,
+          violations: evaluatedViolations,
+          rules: normalizedRules.software ?? [],
+          inventoryMatchedRuleNames: evaluated.matchedRuleNames,
+          serviceNamesByCatalogId: serviceNamesByDevice.get(deviceId) ?? new Map(),
+          observations: observationsByDevice.get(deviceId) ?? new Map(),
+          now,
+        });
+      }
+      // #6960 / #10126: the managed-applicability filter runs AFTER the bridge,
+      // over everything the pass will store. The bridge ADDS a not_running /
+      // service_unverified for an inventory-matched rule (no `missing` to
+      // drop); filtering before it let those through unfiltered. With the
+      // names narrowed above the bridge cannot produce one for a
+      // not-applicable rule any more; this ordering keeps that true if the
+      // narrowing ever regresses.
+      if (managedApplicability) {
+        const filtered = managedApplicability.filterViolations(deviceId, evaluatedViolations);
+        evaluatedViolations = filtered.violations;
+        if (filtered.notApplicable.length > 0) {
+          notApplicableDevices += 1;
+          if (notApplicableSample.length < 10) {
+            notApplicableSample.push({ deviceId, reasons: filtered.notApplicable.map((entry) => entry.reason) });
+          }
+          for (const entry of filtered.notApplicable) {
+            notApplicableByReason[entry.reason] = (notApplicableByReason[entry.reason] ?? 0) + 1;
+          }
+        }
+      }
       const violationsWithStableTimestamps = withStableViolationTimestamps(
-        evaluated.violations,
+        evaluatedViolations,
         existing?.violations ?? null
       );
       const status = violationsWithStableTimestamps.length > 0 ? 'violation' : 'compliant';
@@ -691,10 +1069,19 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
       // because of unauthorized software while having nothing missing, and the
       // two verbs must not read each other's condition.
       const hasMissingViolation = violationsWithStableTimestamps.some((v) => v.type === 'missing');
+      // #6958 PR E: a no-inventory rule whose `missing` became
+      // `service_unverified` is a telemetry gap, not "desired state reached".
+      // Settling/resetting here would let a rule that alternates missing ↔
+      // unverified reset the #5505 consecutive-attempt loop guard forever, so
+      // the install axis is HELD (neither settled nor reset) until the
+      // service is observed. An inventory-matched rule's unverified does not
+      // hold: inventory already proves the install.
+      const installAxisHeld = bridgeUnavailable || violationsWithStableTimestamps.some((v) =>
+        v.type === 'service_unverified' && !evaluated.matchedRuleNames.has(v.rule?.name ?? ''));
 
       let installRemediationStatus: SoftwarePolicyInstallRemediationStatus | undefined;
       let installRemediationAttempts: number | undefined;
-      if (!hasMissingViolation) {
+      if (!hasMissingViolation && !installAxisHeld) {
         // Desired state reached. Mirrors the uninstall transition above: a
         // working status settles to 'completed', and the CONSECUTIVE counter
         // resets so a future recurrence starts with a full attempt budget.
@@ -711,13 +1098,13 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
         if ((existing?.installRemediationAttempts ?? 0) > 0) {
           installRemediationAttempts = 0;
         }
-      } else if (existing?.installRemediationStatus === 'completed') {
+      } else if (hasMissingViolation && !bridgeUnavailable && existing?.installRemediationStatus === 'completed') {
         // It came back. Clear the stale success so the next decision is not read
         // against a status describing a previous cycle.
         installRemediationStatus = 'none';
       }
 
-      if (hasMissingViolation && installArming.armed) {
+      if (hasMissingViolation && installArming.armed && !bridgeUnavailable) {
         // #5505 W03 reconcile sweep, part 2 of 2. This device still wants
         // software AND the policy is armed, so a live-but-orphaned status here
         // is exactly the stuck state: shouldQueueAutoRemediation would read it
@@ -798,6 +1185,8 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
         remediationStatus,
         installRemediationStatus,
         installRemediationAttempts,
+        // undefined when the bridge failed: leave the stored list alone.
+        serviceWatches: bridgeUnavailable ? undefined : serviceWatches,
       });
       recordSoftwarePolicyEvaluation(policy.mode, status, Date.now() - startedAt, 'evaluated');
 
@@ -966,13 +1355,67 @@ export async function processCheckPolicy(data: CheckPolicyJobData): Promise<{
     recordSoftwareRemediationDecision('install_scheduled', installRemediationQueued);
   }
 
+  if (managedApplicability) {
+    // #6960 W03: durable per-(device, vendor) applicability, keyed on the
+    // DEVICE's org (orgByDevice), never the policy owner's.
+    const applicability = managedApplicability;
+    await reportCoverageFailure(policy.id, () => {
+      const entries: ManagedApplicabilityEntry[] = [];
+      for (const deviceId of deviceIds) {
+        for (const readiness of applicability.evaluateDevice(deviceId)) {
+          entries.push({
+            deviceId,
+            orgId: orgByDevice.get(deviceId)!,
+            vendor: readiness.vendor,
+            notApplicableReason: readiness.result.ok ? null : readiness.result.reason,
+          });
+        }
+      }
+      return recordManagedPolicyApplicability({
+        policyId: policy.id,
+        entries,
+        prune: isFullPass ? { deviceIds, vendors: applicability.vendors() } : null,
+      });
+    });
+  }
+
+  if (managedApplicability && notApplicableDevices > 0) {
+    console.info('[SoftwareComplianceWorker] Managed security-agent rules not applicable to some devices', {
+      policyId: policy.id,
+      managedByLinkId: policy.managedByLinkId,
+      devices: notApplicableDevices,
+      byReason: notApplicableByReason,
+      sample: notApplicableSample,
+    });
+  }
+
   return {
     policyId: policy.id,
     devicesEvaluated: deviceIds.length,
     violations,
     remediationQueued,
     installRemediationQueued,
+    ...(managedApplicability ? { notApplicable: notApplicableDevices, notApplicableByReason } : {}),
   };
+}
+
+/**
+ * Coverage state is observability for the security-agents feature, not part of
+ * compliance enforcement: a failed write is reported (and retried by the next
+ * pass) but never fails the compliance pass that already queued installs.
+ * The store runs in its own transaction, so it cannot poison this one.
+ */
+async function reportCoverageFailure(policyId: string, write: () => Promise<unknown>): Promise<void> {
+  try {
+    await write();
+  } catch (error) {
+    console.error('[SoftwareComplianceWorker] Failed to persist security-agent coverage applicability', { policyId, error });
+    captureException(error instanceof Error ? error : new Error(String(error)), undefined, {
+      service: 'securityAgentCoverage',
+      operation: 'recordManagedPolicyApplicability',
+      policyId,
+    });
+  }
 }
 
 export function createSoftwareComplianceWorker(): Worker<SoftwareComplianceJobData> {

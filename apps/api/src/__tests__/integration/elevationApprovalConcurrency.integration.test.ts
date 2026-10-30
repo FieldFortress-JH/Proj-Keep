@@ -47,6 +47,7 @@ import {
 import { approvalRoutes } from '../../routes/approvals';
 import { pamRoutes } from '../../routes/pam';
 import { expireSupersededMobileApprovals } from '../../services/pamMobileApprovals';
+import { currentOwnershipEpochSql } from '../../services/deviceOwnershipEpoch';
 
 const RUN = !!process.env.DATABASE_URL;
 // Superuser connections for the lock holder, the probe and the pg_stat_activity
@@ -77,7 +78,8 @@ async function seedScenario(): Promise<Scenario> {
   const org = await createOrganization({ partnerId: partner.id });
   const site = await createSite({ orgId: org.id });
   const role = await createRole({ scope: 'organization', orgId: org.id });
-  await grantRolePermissions(role.id, [PERMISSIONS.PAM_APPROVE]);
+  // UAC approvals must satisfy both PAM decision and device execution grants.
+  await grantRolePermissions(role.id, [PERMISSIONS.PAM_APPROVE, PERMISSIONS.DEVICES_EXECUTE]);
   const approver = async (label: string): Promise<Approver> => {
     const user = await createUser({
       partnerId: partner.id,
@@ -128,6 +130,7 @@ async function seedElevation(
         siteId: s.siteId,
         partnerId: s.partnerId,
         deviceId: s.deviceId,
+        deviceEpoch: currentOwnershipEpochSql(s.deviceId),
         flowType: 'uac_intercept',
         subjectUsername: 'CONCURRENCY\\enduser',
         reason: 'install setup.exe',

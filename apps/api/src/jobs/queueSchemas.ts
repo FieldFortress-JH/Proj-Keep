@@ -303,6 +303,11 @@ export const automationQueueJobDataSchema = z.discriminatedUnion('type', [
     automationId: z.string().min(1),
     slotKey: z.string().min(1),
     scanAt: z.string().min(1),
+    // #5221 B2 (Decision 6): `false` only when the scan read the row as
+    // SWITCHED. Absent ⇒ true: the scan read it unswitched, or the job predates
+    // the field (no row could be switched before this field existed). Legacy
+    // attempts such a job; the occurrence claim dedupes it against the flow.
+    enqueuedWhileUnswitched: z.boolean().optional(),
   }).strict(),
   z.object({
     type: z.literal('trigger-event'),
@@ -311,6 +316,8 @@ export const automationQueueJobDataSchema = z.discriminatedUnion('type', [
     eventId: z.string().min(1).optional(),
     eventPayload: z.record(z.string(), z.unknown()).optional(),
     eventTimestamp: z.string().min(1),
+    // #5221 B2 — as trigger-schedule's: false only from the switched-row fan-out.
+    enqueuedWhileUnswitched: z.boolean().optional(),
   }).strict(),
   z.object({
     type: z.literal('execute-run'),
@@ -443,9 +450,23 @@ export const securityScanQueueJobDataSchema = z.union([
     configPolicyId: z.string().uuid(),
     occurrenceIso: z.string().min(1),
   }).strict(),
+  // #6263 W05 — a sweep scan admitted by the pump. The claim re-reads the
+  // sweep row (state, expiry, org) under the partner lock before dispatching.
+  z.object({
+    type: z.literal('dispatch-scan'),
+    scanId: z.string().uuid(),
+    origin: z.literal('sweep'),
+    sweepId: z.string().uuid(),
+  }).strict(),
   z.object({
     type: z.literal('schedule-policies'),
     scanAt: z.string().min(1),
+  }).strict(),
+  // #6263 W05 — the single-flight sweep pump (repeatable + one coalescing
+  // immediate job after a create).
+  z.object({
+    type: z.literal('pump-sweeps'),
+    tickAt: z.string().min(1),
   }).strict(),
 ]);
 
@@ -482,6 +503,12 @@ const breezeEventMetadataJobSchema = z.object({
   causationId: z.string().optional(),
   userId: z.string().optional(),
   timestamp: z.string().min(1),
+  // Tool catalog W04 (#5219), Decision 14: flow ancestry stamped by
+  // publishEvent from the flowExecutionContext frame. Without these two keys
+  // this .strict() schema would drop every event a flow step causes at dequeue
+  // in 'enforce' mode (eventDispatchWorker).
+  flowRunId: z.string().uuid().optional(),
+  flowChainDepth: z.number().int().min(0).max(3).optional(),
 }).strict();
 
 const breezeEventEnvelopeSchema = z.object({
@@ -591,3 +618,22 @@ export function withQueueMeta<T extends Record<string, unknown>>(
     meta,
   };
 }
+
+/**
+ * Tool catalog W04 (#5219): the `flow-runs` queue (jobs/flowRunQueue.ts). One
+ * job = one run slice. A typed reference only: the runner re-reads the run row
+ * (status, lease, resume_seq) and never trusts anything else on the wire.
+ */
+export const flowRunJobDataSchema = z.object({
+  runId: z.string().uuid(),
+}).strict();
+export type FlowRunJobData = z.infer<typeof flowRunJobDataSchema>;
+
+// The delivery row owns the payload and retry state; Redis carries references only.
+export const webhookAttemptJobDataSchema = z.object({
+  deliveryId: z.string().uuid(),
+  webhookId: z.string().uuid(),
+  generation: z.number().int().min(0),
+  attemptsMade: z.number().int().min(0),
+}).strict();
+export type WebhookAttemptJobData = z.infer<typeof webhookAttemptJobDataSchema>;

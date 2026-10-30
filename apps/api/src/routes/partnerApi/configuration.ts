@@ -12,10 +12,6 @@ import { requirePartnerApiScope, type PartnerApiPrincipalContext } from '../../m
 import { acquirePartnerExportReadLocks } from './consistency';
 import { getPartnerExportFetchLimit } from './pagination';
 import {
-  normalizePatchInlineSettings,
-  tryNormalizePatchInlineSettings,
-} from '../../services/configPolicyPatching';
-import {
   bindPartnerExportSnapshot,
   buildEnvelope,
   clientError,
@@ -44,10 +40,12 @@ interface DesiredConfigurationRow extends Record<string, unknown> {
   definition: Record<string, unknown>;
 }
 
+// Exactly the keys breeze_partner_export_policy_settings_pre_patch emits for a
+// patch link (latest definition: 2026-12-31-160000-drop-policy-patch-auto-approve.sql).
+// The retired policy-level approval keys are not here (#8188): a projection
+// that still emits one fails the policy closed below.
 const PATCH_NORMALIZED_MATERIAL_KEYS = [
   'sources',
-  'autoApprove',
-  'autoApproveSeverities',
   'scheduleFrequency',
   'scheduleTime',
   'scheduleDayOfWeek',
@@ -58,6 +56,9 @@ const PATCH_NORMALIZED_MATERIAL_KEYS = [
   'rebootAllowDeferral',
   'rebootMaxDeferrals',
   'rebootDeferralMinutes',
+  'rebootPromptTitle',
+  'rebootPromptBody',
+  'rebootPromptButton',
   'exclusiveWindowsUpdate',
 ] as const;
 const PATCH_NORMALIZED_MATERIAL_KEY_SET = new Set<string>(PATCH_NORMALIZED_MATERIAL_KEYS);
@@ -131,13 +132,10 @@ function canonicalizePolicyPatchSettings(
     const normalizedMaterial = patchInlineSettingsSchema.safeParse(materialized);
     if (!normalizedMaterial.success) return { safe: false };
 
-    const canonicalMirror = tryNormalizePatchInlineSettings(rawMirror).settings;
-    const settings = normalizePatchInlineSettings({
-      ...normalizedMaterial.data,
-      autoApproveDeferralDays: canonicalMirror.autoApproveDeferralDays,
-      apps: canonicalMirror.apps,
-    });
-    features.push({ ...feature, settings });
+    // Every exported patch setting comes from the relational material; the raw
+    // mirror is only inspected for the reserved key above, never exported
+    // (#8188 retired the mirror-only autoApproveDeferralDays/apps keys).
+    features.push({ ...feature, settings: normalizedMaterial.data });
   }
 
   return { safe: true, definition: { ...definition, features } };
@@ -227,7 +225,8 @@ function assignmentEffectiveOrgSql(partnerId: string): SQL {
           SELECT 1 FROM public.sites st WHERE st.id = a.target_id AND st.org_id = eo.id
         ))
         OR (a.level = 'device_group' AND EXISTS (
-          SELECT 1 FROM public.device_groups dg WHERE dg.id = a.target_id AND dg.org_id = eo.id
+          SELECT 1 FROM public.device_groups dg WHERE dg.id = a.target_id
+            AND (dg.org_id = eo.id OR (dg.org_id IS NULL AND dg.partner_id = ${partnerId}::uuid))
         ))
         OR (a.level = 'device' AND EXISTS (
           SELECT 1 FROM public.devices dv WHERE dv.id = a.target_id AND dv.org_id = eo.id
@@ -368,7 +367,8 @@ function automationSource(principal: PartnerApiPrincipalContext, query: ExportQu
         'name', a.name, 'description', a.description, 'enabled', a.enabled,
         'trigger', a.trigger, 'conditions', a.conditions, 'actions', a.actions,
         'onFailure', a.on_failure, 'notificationTargets', a.notification_targets,
-        'dependencies', COALESCE(deps.items, '[]'::jsonb)
+        'dependencies', COALESCE(deps.items, '[]'::jsonb),
+        'conversion', conv.summary
       ) AS definition
     FROM public.automations a
     JOIN effective_orgs eo ON a.org_id = eo.id
@@ -382,6 +382,14 @@ function automationSource(principal: PartnerApiPrincipalContext, query: ExportQu
         WHERE action->>'scriptId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
       ) dependencies
     ) deps ON true
+    -- W06 (#5221, Decision 9): additive conversion { id, state, flowId } | null, the newest generation.
+    LEFT JOIN LATERAL (
+      SELECT jsonb_build_object('id', fac.id, 'state', fac.state, 'flowId', fac.flow_id) AS summary
+      FROM public.flow_automation_conversions fac
+      WHERE fac.automation_id = a.id
+      ORDER BY fac.created_at DESC, fac.id DESC
+      LIMIT 1
+    ) conv ON true
   `;
 }
 

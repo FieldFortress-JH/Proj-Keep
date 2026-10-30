@@ -57,11 +57,12 @@ vi.mock('./aiAgent', () => ({
 
 vi.mock('./aiCostTracker', () => ({
   checkAiRateLimit: vi.fn(),
-  checkBudget: vi.fn(),
+  checkBudgetDetailed: vi.fn(),
   getRemainingBudgetUsd: vi.fn(),
 }));
 
-vi.mock('./aiInputSanitizer', () => ({
+vi.mock('./aiInputSanitizer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./aiInputSanitizer')>()),
   sanitizeUserMessage: vi.fn(),
   sanitizePageContext: vi.fn(),
 }));

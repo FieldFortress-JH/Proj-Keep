@@ -79,6 +79,11 @@ const defaultSelectChain = () => ({
   }))
 });
 
+// The heartbeat's own-row read is `.limit(1).for('no key update')` (#8318 §6.4,
+// selectOwnDeviceRowForUpdate); every other read awaits `.limit()` directly.
+const lockableRows = (rows: unknown) => Object.assign(Promise.resolve(rows), { for: vi.fn(() => Promise.resolve(rows)) });
+const lockableLimit = (rows: unknown) => vi.fn(() => lockableRows(rows));
+
 const defaultInsertChain = () => ({
   values: vi.fn(() => ({
     onConflictDoNothing: vi.fn(() => ({
@@ -242,6 +247,7 @@ vi.mock('../services/topology/flags', () => ({
 
 vi.mock('../services/sentry', () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
 }));
 
 vi.mock('./backup/verificationService', () => ({
@@ -278,6 +284,7 @@ vi.mock('../middleware/auth', () => ({
 vi.mock('../middleware/agentAuth', () => ({
   agentAuthMiddleware: vi.fn((c: any, next: any) => {
     c.set('agent', {
+      installIncarnation: 1,
       deviceId: 'device-123',
       agentId: 'agent-123',
       orgId: 'org-123',
@@ -809,7 +816,7 @@ describe('agent routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{
+            limit: lockableLimit([{
               id: 'device-123',
               agentId: 'agent-123',
               orgId: 'org-123'
@@ -841,7 +848,7 @@ describe('agent routes', () => {
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{
+              limit: lockableLimit([{
                 id: 'device-123',
                 agentId: 'agent-123'
               }])
@@ -915,9 +922,9 @@ describe('agent routes', () => {
       // resolvers await it directly).
       const rowsChain = (rows: unknown[]) => ({
         where: vi.fn(() => Object.assign(Promise.resolve(rows), {
-          limit: vi.fn(() => Promise.resolve(rows)),
+          limit: vi.fn(() => lockableRows(rows)),
           orderBy: vi.fn(() => Object.assign(Promise.resolve(rows), {
-            limit: vi.fn(() => Promise.resolve(rows))
+            limit: vi.fn(() => lockableRows(rows))
           }))
         }))
       });
@@ -990,11 +997,13 @@ describe('agent routes', () => {
       const body = await res.json();
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],
           minimum_level: 'info',
           collection_interval_minutes: 15,
+          application_providers: [],
         },
         policy_registry_state_probes: [
           { registry_path: 'HKLM\\SOFTWARE\\Policies\\Alpha', value_name: 'Flag' },
@@ -1004,6 +1013,7 @@ describe('agent routes', () => {
           { file_path: '/etc/ssh/sshd_config', config_key: 'PermitRootLogin' }
         ],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        feature_update_settings: { mode: 'block' },
         hardware_monitoring_settings: { enabled: true, poll_interval_minutes: 10, disk_health_interval_minutes: 60 },
         // #5511 W02: a resolved absent warranty policy delivers an explicit
         // false (the revoke-on-unassign contract), exactly like patch_source.
@@ -1022,7 +1032,7 @@ describe('agent routes', () => {
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([])
+            limit: lockableLimit([])
           })
         })
       } as any);
@@ -1051,7 +1061,7 @@ describe('agent routes', () => {
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{
+              limit: lockableLimit([{
                 id: 'device-123',
                 agentId: 'agent-123',
                 orgId: 'org-123',
@@ -1064,7 +1074,7 @@ describe('agent routes', () => {
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
               orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn().mockResolvedValue([])
+                limit: lockableLimit([])
               })
             })
           })
@@ -1073,7 +1083,7 @@ describe('agent routes', () => {
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
               orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn().mockResolvedValue([])
+                limit: lockableLimit([])
               })
             })
           })
@@ -1118,15 +1128,18 @@ describe('agent routes', () => {
       expect(body.commands[0].type).toBe('filesystem_analysis');
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],
           minimum_level: 'info',
           collection_interval_minutes: 15,
+          application_providers: [],
         },
         policy_registry_state_probes: [],
         policy_config_state_probes: [],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        feature_update_settings: { mode: 'block' },
         hardware_monitoring_settings: { enabled: true, poll_interval_minutes: 10, disk_health_interval_minutes: 60 },
         warranty_settings: { hp_cmsl_enabled: false },
         require_manifest_signing_key_id: false
@@ -1179,6 +1192,7 @@ describe('agent routes', () => {
     it('rejects a watchdog credential through the primary-agent role gate', async () => {
       vi.mocked(agentAuthMiddleware).mockImplementationOnce((c: any, next: any) => {
         c.set('agent', {
+          installIncarnation: 1,
           deviceId: 'device-123',
           agentId: 'agent-123',
           orgId: 'org-123',

@@ -1,17 +1,23 @@
 import { randomUUID } from 'node:crypto';
-import type { M365ReadAction, ReadActionFailureCode, ReadActionResult } from '@breeze/shared/m365';
+import type {
+  M365InteractiveReadAction,
+  M365ReadAction,
+  ReadActionFailureCode,
+  ReadActionResult,
+} from '@breeze/shared/m365';
 import {
   isM365SyncActionId,
+  m365ReadActionSchema,
   type M365SyncActionResult,
   type M365SyncDomain,
   type M365SyncFailureCode,
 } from '@breeze/shared/m365';
 import { and, eq } from 'drizzle-orm';
-import { db, withDbAccessContext } from '../../db';
+import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
 import { m365Connections, type M365ConnectionRow, type M365ConnectionStatus } from '../../db/schema';
 import { dbAccessContextFromAuth, type AuthContext } from '../../middleware/auth';
 import { requestLikeFromSnapshot, type RequestLike } from '../auditEvents';
-import { resolveWritableToolOrgId } from '../aiTools';
+import { resolveWritableToolOrgId } from '../aiToolWriteOrg';
 import {
   createGraphReadExecutorClient,
   GraphReadExecutorClientError,
@@ -20,10 +26,11 @@ import {
 import { recordM365ReadActionEvent } from './readActionMetrics';
 import type { M365ReadActionAuditInput } from './readActionMetrics';
 import {
-  isM365GraphReadToolsEnabledForOrg,
+  m365GraphReadToolsAvailability,
   loadM365CustomerGraphReadRuntimeConfig,
   type M365CustomerGraphReadRuntimeConfig,
 } from './runtimeConfig';
+import { m365ToolsDisabledMessage, type M365DisabledReason } from './availability';
 import { consumeM365ReadActionBudget, consumeM365SyncBudget } from './readActionBudget';
 import { recordM365SyncExecutorSeconds } from '../m365Sync/metrics'; // added in Task 5
 
@@ -37,7 +44,8 @@ export type M365ReadActionRefusalCode =
 export type M365ReadActionServiceResult =
   | { ok: true; kind: 'collection'; items: Record<string, unknown>[]; truncated: boolean }
   | { ok: true; kind: 'resource'; resource: Record<string, unknown> }
-  | { ok: false; code: M365ReadActionRefusalCode | ReadActionFailureCode; message: string; retryAfterSeconds?: number };
+  // `reason` is set only on `tools_disabled` gate refusals: which switch is off (#9319).
+  | { ok: false; code: M365ReadActionRefusalCode | ReadActionFailureCode; message: string; retryAfterSeconds?: number; reason?: M365DisabledReason };
 
 /** One plain sentence per executor failure code. Never echoes Graph error detail. */
 const FAILURE_MESSAGES: Record<ReadActionFailureCode, string> = {
@@ -75,6 +83,23 @@ function connectionNotReadyState(
   }
   if (connection.tenantId === null) return 'no-tenant';
   return null;
+}
+
+/**
+ * The tools gate, with the switch that is off named (#9319). Same gate as the
+ * boolean helper — `null` means enabled; anything else is a refusal.
+ */
+function toolsGateRefusal(
+  orgId: string,
+): { ok: false; code: 'tools_disabled'; reason: M365DisabledReason; message: string } | null {
+  const availability = m365GraphReadToolsAvailability(orgId);
+  if (availability === 'enabled') return null;
+  return {
+    ok: false,
+    code: 'tools_disabled',
+    reason: availability,
+    message: m365ToolsDisabledMessage(availability),
+  };
 }
 
 const CONNECT_NEXT_STEP = 'Connect Microsoft 365 in Integrations settings.';
@@ -153,7 +178,7 @@ export type M365SyncCallResult =
 
 /**
  * Messages for the codes FAILURE_MESSAGES does not cover: the six refusal codes
- * (which the read path answers inline rather than through a map) plus the two
+ * (which the read path answers inline rather than through a map) plus the three
  * sync-only codes. Typed as a total Record over exactly that complement, so
  * adding a member to M365SyncCallFailureCode is a COMPILE error here rather
  * than an "undefined" shown to an operator and written into last_error.
@@ -164,6 +189,14 @@ const SYNC_ONLY_MESSAGES: Record<
 > = {
   sync_capacity: 'The Microsoft 365 sync executor is at capacity. The sync will retry shortly.',
   continuation_invalid: 'The Microsoft 365 sign-in activity page cursor expired. The next run restarts the walk.',
+  // #9393: Graph answered with an error status that graphClient's readFailure
+  // does not split out — 400 (e.g. an unsupported $filter), 401, 405, 410, or
+  // a 5xx other than the retried 503. Distinct from graph_response_invalid,
+  // which means Graph answered with a body Breeze could not parse. A 400 repeats
+  // every run, so the message promises no recovery; the Sentry alert
+  // (outcomeForFailure's default branch) is the operator signal. Never echoes
+  // Graph detail.
+  graph_provider_rejected: 'Microsoft Graph refused the sync request with an error response (not a permission, not-found, or throttling error).',
   read_rate_limited: 'Microsoft 365 sync is rate limited for this connection. It will retry shortly.',
   executor_unavailable: 'Microsoft 365 Graph read is temporarily unavailable. Try again shortly.',
   tools_disabled: 'Microsoft 365 tenant sync is not enabled for this organization.',
@@ -358,13 +391,8 @@ export async function executeM365ReadAction(
   }
   const orgId = resolved.orgId;
 
-  if (!isM365GraphReadToolsEnabledForOrg(orgId)) {
-    return {
-      ok: false,
-      code: 'tools_disabled',
-      message: 'Microsoft 365 Graph read tools are not enabled for this organization.',
-    };
-  }
+  const gateRefusal = toolsGateRefusal(orgId);
+  if (gateRefusal) return gateRefusal;
 
   if (isM365SyncActionId(action.type)) {
     return {
@@ -412,5 +440,143 @@ export async function executeM365ReadAction(
     correlationId: randomUUID(),
     actorId: auth.user.id,
     auditRequest,
+  }) as Promise<M365ReadActionServiceResult>;
+}
+
+/**
+ * Org-keyed read entry, for callers that already hold a db access context and
+ * have no live auth — the Operator's effect probes (effectProbes.ts) and any
+ * background verification. Mirrors writeActionService.executeM365WriteActionByOrg
+ * exactly: the connection load runs under the AMBIENT context, never a system
+ * context, because a contextless read is a denial rather than a bypass and a
+ * system context would bypass RLS outright.
+ */
+export async function executeM365ReadActionByOrg(
+  orgId: string,
+  action: M365InteractiveReadAction,
+  opts?: { actorId?: string },
+): Promise<M365ReadActionServiceResult> {
+  const gateRefusal = toolsGateRefusal(orgId);
+  if (gateRefusal) return gateRefusal;
+  // Belt over the type: a sync action is a whole-tenant crawl, never a probe.
+  if (isM365SyncActionId(action.type)) {
+    return {
+      ok: false,
+      code: 'tools_disabled',
+      message: 'Whole-tenant sync actions are not available to interactive Graph read tools.',
+    };
+  }
+
+  const rows = await db.select().from(m365Connections).where(and(
+    eq(m365Connections.orgId, orgId),
+    eq(m365Connections.profile, PROFILE),
+  )).limit(1);
+  const connection = rows[0];
+  // Defense-in-depth over RLS + the eq(orgId) filter: a mismatch means one of
+  // them is broken, so fail closed rather than read another org's tenant.
+  const notReady = connection && connection.orgId !== orgId ? 'missing' : connectionNotReadyState(connection);
+  const snapshot = notReady ? null : connectionExecutionSnapshot(connection as M365ConnectionRow);
+  if (!snapshot) {
+    return {
+      ok: false,
+      code: 'connection_not_ready',
+      message: connectionNotReadyMessage(notReady ?? 'missing'),
+    };
+  }
+
+  return callGraphReadExecutor(snapshot, action, {
+    route: 'read',
+    correlationId: randomUUID(),
+    ...(opts?.actorId ? { actorId: opts.actorId } : {}),
+  }) as Promise<M365ReadActionServiceResult>;
+}
+
+export type M365MailboxReadResult =
+  | M365ReadActionServiceResult
+  | { ok: false; code: 'tenant_mismatch' | 'invalid_subject'; message: string };
+
+/**
+ * Caller verification (#6354 W03): the target's canonical mailbox set through
+ * the customer-graph-read control plane — an INTERNAL read for the release
+ * gate, never an AI tool, so it takes no AuthContext (none exists on the
+ * headless gate path) and fabricates none. `actorId` is the technician the
+ * gate is acting for, recorded on the per-call audit event.
+ *
+ * Runs with no ambient DB context: only the org-filtered connection read
+ * elects a short system scope, and it closes before the executor call. No
+ * executor call happens on an invalid object id, disabled tools, a missing /
+ * not-ready connection, a tenant other than the subject's pinned tenant, or an
+ * exhausted read budget.
+ */
+export async function executeM365MailboxReadByOrg(
+  orgId: string,
+  subject: { entraTenantId: string; entraOid: string },
+  actorId: string,
+): Promise<M365MailboxReadResult> {
+  const action = m365ReadActionSchema.safeParse({ type: 'm365.user.mailboxes', userId: subject.entraOid });
+  if (!action.success) {
+    return { ok: false, code: 'invalid_subject', message: 'A Microsoft 365 user object id is required.' };
+  }
+  const gateRefusal = toolsGateRefusal(orgId);
+  if (gateRefusal) return gateRefusal;
+  const [connection] = await withSystemDbAccessContext(() => db.select().from(m365Connections).where(and(
+    eq(m365Connections.orgId, orgId),
+    eq(m365Connections.profile, PROFILE),
+  )).limit(1), 'callerVerification.mailboxes.readConnection');
+  const notReady = connectionNotReadyState(connection);
+  const snapshot = notReady ? null : connectionExecutionSnapshot(connection);
+  if (!snapshot || snapshot.orgId !== orgId) {
+    return { ok: false, code: 'connection_not_ready', message: connectionNotReadyMessage(notReady ?? 'missing') };
+  }
+  if (snapshot.tenantId.toLowerCase() !== subject.entraTenantId.toLowerCase()) {
+    return { ok: false, code: 'tenant_mismatch', message: 'The Microsoft 365 connection no longer matches the subject tenant.' };
+  }
+  return callGraphReadExecutor(snapshot, action.data, {
+    route: 'read',
+    correlationId: randomUUID(),
+    actorId,
+  }) as Promise<M365ReadActionServiceResult>;
+}
+
+export type M365CallerTargetLookupResult =
+  | M365ReadActionServiceResult
+  | { ok: false; code: 'tenant_mismatch' | 'invalid_subject'; message: string };
+
+/**
+ * Caller verification W05 (#6354): resolve the user a protected identity
+ * action names (UPN or object id) to its canonical resource through the
+ * customer-graph-read profile, refusing BEFORE any executor call when the read
+ * connection's tenant is not the tenant of the actions connection the intent
+ * will be pinned to (`expectedTenantId`). Runs under the AMBIENT db context
+ * (the creation path opens the requester's org scope) — never a system scope.
+ */
+export async function executeM365UserLookupForCallerTarget(
+  orgId: string,
+  identifier: string,
+  expectedTenantId: string,
+  actorId: string,
+): Promise<M365CallerTargetLookupResult> {
+  const action = m365ReadActionSchema.safeParse({ type: 'm365.user.get', userIdOrUpn: identifier });
+  if (!action.success) {
+    return { ok: false, code: 'invalid_subject', message: 'A Microsoft 365 user principal name or object id is required.' };
+  }
+  const gateRefusal = toolsGateRefusal(orgId);
+  if (gateRefusal) return gateRefusal;
+  const [connection] = await db.select().from(m365Connections).where(and(
+    eq(m365Connections.orgId, orgId),
+    eq(m365Connections.profile, PROFILE),
+  )).limit(1);
+  const notReady = connection && connection.orgId !== orgId ? 'missing' : connectionNotReadyState(connection);
+  const snapshot = notReady ? null : connectionExecutionSnapshot(connection);
+  if (!snapshot) {
+    return { ok: false, code: 'connection_not_ready', message: connectionNotReadyMessage(notReady ?? 'missing') };
+  }
+  if (snapshot.tenantId.toLowerCase() !== expectedTenantId.toLowerCase()) {
+    return { ok: false, code: 'tenant_mismatch', message: 'The Microsoft 365 read and actions connections are in different tenants.' };
+  }
+  return callGraphReadExecutor(snapshot, action.data, {
+    route: 'read',
+    correlationId: randomUUID(),
+    actorId,
   }) as Promise<M365ReadActionServiceResult>;
 }

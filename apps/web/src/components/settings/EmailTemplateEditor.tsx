@@ -41,6 +41,7 @@ const SAMPLE_VARS: Record<string, string> = {
   resolution_note: 'Replaced the failing drive.',
   quote_number: 'Q-2026-0001',
   quote_title: 'Office Network Refresh',
+  agreement_name: 'Business Associate Agreement',
   total: '$1,200.00',
   expiry_date: '2026-07-01',
   accept_url: 'https://portal.example.com/quote/TOKEN',
@@ -60,6 +61,10 @@ const SAMPLE_VARS: Record<string, string> = {
   action_link: 'https://portal.example.com/invoice/TOKEN',
   action_label: 'View invoice',
   days_overdue: '7',
+  approval_ask: 'Up to 2 h 30 m (USD 375.00) more',
+  approval_snapshot: 'Budget 10 h, used 9 h 45 m',
+  approval_expires: 'Dec 3, 2026',
+  approval_status: 'approved',
   pay_link: 'https://portal.example.com/invoice/TOKEN',
   client_name:'Example client',
   setup_link:'https://portal.example.test/autopay/example-token',
@@ -186,7 +191,6 @@ interface Props {
 
 export default function EmailTemplateEditor({ templateId, value, onBack, onSaved }: Props) {
   const { t } = useTranslation('settings');
-  const { t: tBilling } = useTranslation('billing');
   const hasCta = emailTemplateHasCta(templateId);
   const insertVariables = [...new Set([...varsForEmailTemplate(templateId), ...(hasCta ? ['cta_button'] : [])])];
   const initial = shownFields(templateId, value);
@@ -250,10 +254,9 @@ export default function EmailTemplateEditor({ templateId, value, onBack, onSaved
   return (
     <div className="space-y-4" data-testid="email-template-editor">
       <div className="flex items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold">{templateId === 'payment_reminder' ? tBilling('reminders.templates.paymentReminder')
-          : templateId === 'payment_overdue' ? tBilling('reminders.templates.paymentOverdue')
-          : templateId === 'invoice_autopay' ? tBilling('autopay.noticeTemplate')
-          : t(/* i18n-dynamic */ `emailTemplates.labels.${templateId}`, { defaultValue: emailTemplateLabel(templateId) })}</h2>
+        <h2 className="text-sm font-semibold">
+          {t(/* i18n-dynamic */ `emailTemplates.labels.${templateId}`, { defaultValue: emailTemplateLabel(templateId) })}
+        </h2>
         <button
           type="button"
           onClick={onBack}

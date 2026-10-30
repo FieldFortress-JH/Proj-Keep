@@ -1,7 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { readdirSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
-import { getRouteScope, isGlobalScopeRoute, isSingleDocumentRoute, ROUTE_SCOPES } from './routeScope';
+import { getRouteScope, isGlobalScopeRoute, isScopeInHeadingRoute, isSingleDocumentRoute, ROUTE_SCOPES } from './routeScope';
+
+// #9035: pages whose own heading names the scope, so the layout's scope line
+// would be a third confirmation of the same thing.
+describe('isScopeInHeadingRoute', () => {
+  it('matches the devices list (with or without a trailing slash)', () => {
+    expect(isScopeInHeadingRoute('/devices')).toBe(true);
+    expect(isScopeInHeadingRoute('/devices/')).toBe(true);
+  });
+  it('does not match device records or other fleet pages', () => {
+    expect(isScopeInHeadingRoute('/devices/dev-1')).toBe(false);
+    expect(isScopeInHeadingRoute('/devices/groups')).toBe(false);
+    expect(isScopeInHeadingRoute('/alerts')).toBe(false);
+  });
+  it('leaves the org-or-all classification untouched', () => {
+    expect(getRouteScope('/devices')).toBe('org-or-all');
+  });
+});
 
 describe('isSingleDocumentRoute', () => {
   it('matches quote and invoice DETAIL pages only', () => {
@@ -65,6 +82,11 @@ describe('getRouteScope', () => {
     expect(getRouteScope('/monitoring')).toBe('org-required');
     expect(getRouteScope('/settings/organizations')).toBe('partner-settings');
     expect(getRouteScope('/settings/organizations/abc-123')).toBe('org-required');
+    // #9794: the Sites list and a site's detail work fleet-wide or in one org,
+    // not as MSP-level settings (which would hide the fleet scope line).
+    expect(getRouteScope('/settings/sites')).toBe('org-or-all');
+    expect(getRouteScope('/settings/sites/abc')).toBe('org-or-all');
+    expect(getRouteScope('/settings/sites/abc/extra')).toBe('partner-settings');
     expect(getRouteScope('/settings/users')).toBe('partner-settings');
     expect(getRouteScope('/integrations')).toBe('partner-settings');
     expect(getRouteScope('/remote/terminal/dev-1')).toBe('device');
@@ -90,6 +112,28 @@ describe('getRouteScope', () => {
     // would strip ?orgId= from every ambient caller mounted inside it, silently
     // widening those reads to "all accessible orgs" instead of pinning one.
     expect(isGlobalScopeRoute('/organizations/abc123')).toBe(false);
+  });
+
+  it('classifies /flows (Tool Catalog W3) as org-or-all', () => {
+    expect(getRouteScope('/flows')).toBe('org-or-all');
+    expect(getRouteScope('/flows/9f1c0f4e-0000-4000-8000-000000000000')).toBe('org-or-all');
+    expect(getRouteScope('/flows/runs/9f1c0f4e-0000-4000-8000-000000000000')).toBe('org-or-all');
+  });
+
+  it('classifies the Wisp thread page (W06 #9918) as partner-settings — its subject is the grant, not the switcher', () => {
+    expect(getRouteScope('/ai/wisp/thread/9f1c0f4e-0000-4000-8000-000000000000')).toBe('partner-settings');
+    expect(getRouteScope('/ai/wisp/thread')).toBeNull();
+    // Not catalog: the page opts out of ambient orgId per request instead.
+    expect(isGlobalScopeRoute('/ai/wisp/thread/abc')).toBe(false);
+  });
+
+  it('classifies the Wisp home (W08 #9921) as partner-settings like the thread page, and the Breeze AI chat (/ai/chat) as org-or-all', () => {
+    expect(getRouteScope('/wisp')).toBe('partner-settings');
+    expect(isGlobalScopeRoute('/wisp')).toBe(false);
+    expect(getRouteScope('/ai/chat')).toBe('org-or-all');
+    // /wisp/chat and /workspace only redirect to /ai/chat now; keep classifying the redirect hop.
+    expect(getRouteScope('/wisp/chat')).toBe('org-or-all');
+    expect(getRouteScope('/workspace')).toBe('org-or-all');
   });
 
   it('returns null for routes outside the registry', () => {

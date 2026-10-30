@@ -1,13 +1,24 @@
 import { createHash } from 'node:crypto';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, or } from 'drizzle-orm';
 import { AI_AGENT_KINDS, type AiAgentKind } from '@breeze/shared';
 import type { Database } from '../../db';
 import {
   quotes, quoteLines, invoices, invoicePayments, contracts, organizations,
   tickets, drPlans, partners, aiAgents, configPolicyFeatureLinks, devices,
+  notificationChannels, ticketForms, ticketResponseTemplates,
+  ticketChecklistTemplates, ticketChecklistTemplateItems,
+  softwareCatalog, softwareVersions, softwareInstallMethods,
 } from '../../db/schema';
+import {
+  fingerprintSoftwareInstallMethodDependency, fingerprintSoftwareVersionDependency,
+} from '../softwareDependencyIdentity';
+import { aiOperatorPlanApprovalEffects } from '../../db/schema/aiOperatorPlanApprovals';
+import { yaraRuleSets } from '../../db/schema/yara';
+import { canonicalizeArguments } from './canonicalize';
+import { canonicalizeEffectSet } from '@breeze/shared/canonicalize/effectSet';
 import { scriptProposals, type ScriptProposalRow } from '../../db/schema/scriptProposals';
 import { buildRunScriptSnapshot, runScriptDigestMaterial } from './runScriptSnapshot';
+import { fleetEffectMaterial } from './fleetEffectDigest';
 import { resolvePatchInstallEligibility } from '../patchEligibility';
 import type { ToolExecutionContext, VerifiedRunScript } from '../toolExecutionContext';
 import type { VerifiedTopologyDiagnostic } from '../topology/aiDiagnosticEffect';
@@ -237,6 +248,36 @@ const EFFECT_DIGEST_RESOLVERS: Record<
     };
   },
 
+  // run_script_on_targets — Tool Catalog W06 (#5221, plan Decision 5): the
+  // flow fleet built-in, parked for approval with its device list FROZEN in
+  // the intent arguments. Pins the snapshot built for exactly those devices
+  // (the run_script material: content, run context, parameter definitions,
+  // device orgs, variable references) plus the canonical parameters, the
+  // EFFECTIVE run context, the offline policy and the sorted device ids
+  // (fleetEffectDigest.ts). MANDATORY (pinnedEffectPolicy.ts): creation
+  // refuses an unresolved digest and release refuses a missing one. The
+  // snapshot rides along as `verified`, which the release worker hands to the
+  // built-in so dispatch runs from the observation the digest compared.
+  run_script_on_targets: async (args, database) => {
+    const deviceIds = Array.isArray(args.deviceIds) ? args.deviceIds.filter((d): d is string => typeof d === 'string') : [];
+    if (deviceIds.length === 0) return MISSING_ARG;
+    const built = await buildRunScriptSnapshot({ scriptId: args.scriptId, deviceIds }, database);
+    if (built.kind === 'missing_arg') return MISSING_ARG;
+    if (built.kind === 'target_absent') return TARGET_ABSENT;
+    const runAs = typeof args.runAs === 'string' ? args.runAs : built.snapshot.script.runAs;
+    return {
+      kind: 'material',
+      material: fleetEffectMaterial({
+        snapshot: built.snapshot,
+        parameters: args.parameters ?? {},
+        runAs,
+        offlinePolicy: args.whenOffline === 'skip' ? 'skip' : 'queue',
+        deviceIds,
+      }),
+      verified: { snapshot: built.snapshot, scriptRow: built.scriptRow, scope: built.scope },
+    };
+  },
+
   // diagnose_connectivity (Tier 3, SUPERVISED) — topology M4 Task 4 / M4-D3
   // (#6000). Pins the deterministic executable effect of ONE fixed-recipe
   // diagnostic: the materialized proposal (explicit origin/context/family and
@@ -254,6 +295,136 @@ const EFFECT_DIGEST_RESOLVERS: Record<
     const resolved = await resolveTopologyDiagnosticEffect(args, database);
     if (resolved.kind !== 'material') return resolved.kind === 'missing_arg' ? MISSING_ARG : TARGET_ABSENT;
     return { kind: 'material', material: resolved.material, verifiedTopologyDiagnostic: resolved.verified };
+  },
+
+  // operator_plan (Tier 3, FOUR_EYES) — Recipe Library spec §6.4. Unlike the
+  // m365_/google_ surfaces (DELIBERATELY_UNPINNED: their target lives in
+  // someone else's system) everything this tool references is a LOCAL row, so
+  // the release path can prove the approved effect rows have not moved. The
+  // pin is mandatory (`requiresPinnedEffectDigest`). Material is the canonical
+  // effect set over the stored rows, the same canonicalizer
+  // `effect_set_digest` uses; a malformed set (no rows, bad ordinals) is
+  // `target_absent`, never a throw.
+  operator_plan: async (args, database) => {
+    const taskId = typeof args.taskId === 'string' ? args.taskId : null;
+    const planRevision = typeof args.planRevision === 'number' ? args.planRevision : null;
+    if (!taskId || planRevision === null) return MISSING_ARG;
+
+    const rows = await database
+      .select({
+        ordinal: aiOperatorPlanApprovalEffects.ordinal,
+        toolName: aiOperatorPlanApprovalEffects.toolName,
+        provider: aiOperatorPlanApprovalEffects.provider,
+        targetId: aiOperatorPlanApprovalEffects.targetId,
+        accountExternalId: aiOperatorPlanApprovalEffects.accountExternalId,
+        argumentDigest: aiOperatorPlanApprovalEffects.argumentDigest,
+      })
+      .from(aiOperatorPlanApprovalEffects)
+      .where(and(
+        eq(aiOperatorPlanApprovalEffects.taskId, taskId),
+        eq(aiOperatorPlanApprovalEffects.planRevision, planRevision),
+      ))
+      .orderBy(asc(aiOperatorPlanApprovalEffects.ordinal));
+    if (rows.length === 0) return TARGET_ABSENT;
+
+    // Loaded on demand: planApproval pulls the db + outbox graph.
+    const { rowsToDigestProjection } = await import('../aiOperator/planApproval');
+    try {
+      return material(canonicalizeEffectSet({ taskId, planRevision, effects: rowsToDigestProjection(rows) }));
+    } catch {
+      return TARGET_ABSENT;
+    }
+  },
+
+  // Full-control W12 (#6782, quorum QW3, W12-D12) — a supervised software deployment. The approver signs off on
+  // installing ONE package: a version (its URL / S3 object, checksum, install args, detection, scripts) or a catalog
+  // item's enabled winget / Homebrew methods. Pin the same dependency fingerprint the deployment stores and retry
+  // re-checks, so a version or method edited (or a method added / disabled) between approval and release changes the
+  // digest and the release fails closed instead of installing something the approver never saw.
+  'manage_software_deployments:create': async (args, database) => {
+    const versionId = typeof args.softwareVersionId === 'string' ? args.softwareVersionId : null;
+    const catalogId = typeof args.catalogId === 'string' ? args.catalogId : null;
+    if (versionId && !catalogId) {
+      const [row] = await database
+        .select({ version: softwareVersions, catalog: softwareCatalog })
+        .from(softwareVersions)
+        .innerJoin(softwareCatalog, eq(softwareVersions.catalogId, softwareCatalog.id))
+        .where(and(eq(softwareVersions.id, versionId), isNull(softwareCatalog.deletedAt)))
+        .limit(1);
+      if (!row) return TARGET_ABSENT;
+      return material(JSON.stringify({ kind: 'version', fingerprint: fingerprintSoftwareVersionDependency(row.version, row.catalog) }));
+    }
+    if (catalogId && !versionId) {
+      const [catalog] = await database
+        .select()
+        .from(softwareCatalog)
+        .where(and(eq(softwareCatalog.id, catalogId), isNull(softwareCatalog.deletedAt)))
+        .limit(1);
+      if (!catalog) return TARGET_ABSENT;
+      const methods = await database
+        .select()
+        .from(softwareInstallMethods)
+        .where(and(eq(softwareInstallMethods.catalogId, catalogId), eq(softwareInstallMethods.enabled, true)))
+        .orderBy(asc(softwareInstallMethods.id));
+      return material(JSON.stringify({
+        kind: 'catalog',
+        versionMode: args.versionMode === 'exact' ? 'exact' : 'latest',
+        requestedVersion: typeof args.requestedVersion === 'string' ? args.requestedVersion : null,
+        methods: methods.map((m) => fingerprintSoftwareInstallMethodDependency(m, catalog)),
+      }));
+    }
+    return MISSING_ARG;
+  },
+
+  // W06 (#6776) hard deletes. The approver signs off on deleting a specific
+  // row by its CONTENT, so pin the content fields (not just updated_at):
+  // an edit between approval and release changes the digest and the release
+  // fails closed instead of destroying a different template than was approved.
+  'manage_ticket_forms:delete': async (args, database) => {
+    const id = typeof args.id === 'string' ? args.id : null;
+    if (!id) return MISSING_ARG;
+    const [row] = await database.select().from(ticketForms).where(eq(ticketForms.id, id)).limit(1);
+    if (!row) return TARGET_ABSENT;
+    return material(JSON.stringify({
+      name: row.name, description: row.description, categoryId: row.categoryId,
+      fields: row.fields, titleTemplate: row.titleTemplate, descriptionIntro: row.descriptionIntro,
+      defaultPriority: row.defaultPriority, defaultTags: row.defaultTags, showInPortal: row.showInPortal,
+      isActive: row.isActive, version: row.version, updatedAt: row.updatedAt.toISOString(),
+    }));
+  },
+
+  'manage_ticket_response_templates:delete': async (args, database) => {
+    const id = typeof args.id === 'string' ? args.id : null;
+    if (!id) return MISSING_ARG;
+    const [row] = await database
+      .select().from(ticketResponseTemplates).where(eq(ticketResponseTemplates.id, id)).limit(1);
+    if (!row) return TARGET_ABSENT;
+    return material(JSON.stringify({
+      name: row.name, body: row.body, category: row.category, isActive: row.isActive,
+      updatedAt: row.updatedAt.toISOString(),
+    }));
+  },
+
+  // Items are separate rows (item edits do not always bump the template's
+  // updated_at), so they are hashed explicitly, ordered for stability.
+  'manage_ticket_checklist_templates:delete': async (args, database) => {
+    const id = typeof args.id === 'string' ? args.id : null;
+    if (!id) return MISSING_ARG;
+    const [row] = await database
+      .select().from(ticketChecklistTemplates).where(eq(ticketChecklistTemplates.id, id)).limit(1);
+    if (!row) return TARGET_ABSENT;
+    const items = await database
+      .select({
+        id: ticketChecklistTemplateItems.id, label: ticketChecklistTemplateItems.label,
+        detail: ticketChecklistTemplateItems.detail, sortOrder: ticketChecklistTemplateItems.sortOrder,
+      })
+      .from(ticketChecklistTemplateItems)
+      .where(eq(ticketChecklistTemplateItems.templateId, id))
+      .orderBy(ticketChecklistTemplateItems.sortOrder, ticketChecklistTemplateItems.id);
+    return material(JSON.stringify({
+      name: row.name, description: row.description, instructions: row.instructions,
+      isActive: row.isActive, updatedAt: row.updatedAt.toISOString(), items,
+    }));
   },
 
   // manage_quotes:send: pin the quote's revision (updated_at) plus a
@@ -313,6 +484,58 @@ const EFFECT_DIGEST_RESOLVERS: Record<
   // manage_contracts activate/cancel: pin the contract's revision.
   'manage_contracts:activate': async (args, database) => resolveContractUpdatedAt(args.contractId, database),
   'manage_contracts:cancel': async (args, database) => resolveContractUpdatedAt(args.contractId, database),
+
+  // manage_contracts:generate_invoice (full-control W14 PR B, #6784; four-eyes, quorum QW1/QW9, PR B quorum
+  // QB1-QB3). Pins the WHOLE computed invoice the next billing run would create: the period, the currency, every
+  // line's quantity / unit price / tax flag / total and its overage leg, subtotal / tax / total, auto-issue and the
+  // recipients the auto-issue email goes to (contractInvoicePreview.ts mirrors generateDueInvoice without writing).
+  // A device added, a catalog price or tax rate edited, the billing contact changed, auto-issue switched or the
+  // period billed in the meantime all change it, and the release refuses (content_changed). Mandatory per action
+  // (pinnedEffectPolicy.ts). Loaded on demand: the preview pulls the contract and catalog service graph, which this
+  // module (imported by the release worker) must not load eagerly. The preview reads through the ambient context,
+  // which every call site of this module runs system-scoped (the manage_patches:install caller obligation).
+  'manage_contracts:generate_invoice': async (args) => {
+    const contractId = typeof args.contractId === 'string' ? args.contractId : null;
+    if (!contractId) return MISSING_ARG;
+    if (!UUID_RE.test(contractId)) return TARGET_ABSENT;
+    const { previewDueInvoice, previewDigestMaterial, ContractInvoicePreviewNotFound } = await import('../contractInvoicePreview');
+    try {
+      return material(previewDigestMaterial(await previewDueInvoice(contractId)));
+    } catch (err) {
+      if (err instanceof ContractInvoicePreviewNotFound) return TARGET_ABSENT;
+      throw err;
+    }
+  },
+
+  // manage_accounting_sync push / push_bulk (full-control W14 PR B, #6784; four-eyes, QW1, PR B quorum QB4/QB5):
+  // every input of what lands in the books — the invoice and its lines, the destination connection and payload
+  // settings, the invoice / customer / item mapping rows, and the customer's and items' payload inputs
+  // (accountingPushDigest.ts). push_bulk pins each invoice in sorted id order; an unknown id pins as null. The
+  // handler pushes synchronously at release (never queued), so the pin binds the push that runs. Mandatory.
+  'manage_accounting_sync:push': async (args, database) => {
+    const invoiceId = typeof args.invoiceId === 'string' ? args.invoiceId : null;
+    const provider = typeof args.provider === 'string' ? args.provider : null;
+    if (!invoiceId || !provider) return MISSING_ARG;
+    if (!UUID_RE.test(invoiceId)) return TARGET_ABSENT;
+    const { accountingPushMaterial } = await import('./accountingPushDigest');
+    const pinned = await accountingPushMaterial(database, invoiceId, provider);
+    if (!pinned) return TARGET_ABSENT;
+    return material(canonicalJson({ v: 1, provider, push: pinned }));
+  },
+  'manage_accounting_sync:push_bulk': async (args, database) => {
+    const provider = typeof args.provider === 'string' ? args.provider : null;
+    const ids = Array.isArray(args.invoiceIds)
+      ? [...new Set(args.invoiceIds.filter((id): id is string => typeof id === 'string'))].sort()
+      : [];
+    if (!provider || ids.length === 0) return MISSING_ARG;
+    const { accountingPushMaterial } = await import('./accountingPushDigest');
+    const pushes: Array<[string, Record<string, unknown> | null]> = [];
+    for (const id of ids) {
+      pushes.push([id, UUID_RE.test(id) ? await accountingPushMaterial(database, id, provider) : null]);
+    }
+    if (pushes.every(([, m]) => m === null)) return TARGET_ABSENT;
+    return material(canonicalJson({ v: 1, provider, pushes }));
+  },
 
   // manage_ai_agents (P2-5, #4192) — registered under the WHOLE-TOOL key, not
   // `manage_ai_agents:authorize_supervised_key`. The tool is a member of BOTH
@@ -516,6 +739,31 @@ const EFFECT_DIGEST_RESOLVERS: Record<
     return material(JSON.stringify({ orgId: ticket.orgId, status: ticket.status }));
   },
 
+  // manage_notification_channels:delete (full-control W02, #6756; four_eyes
+  // per QV3) — pins the channel's IDENTITY (name, type, org/partner scope),
+  // deliberately NOT updated_at: a `test` run or a delivery-status write
+  // touches the row without changing which channel the approvers agreed to
+  // destroy. The destination lives in notification_channel_configs and is
+  // destroyed with the channel, so a repointed destination does not change
+  // what the delete does. A rename or re-scope does: the approvers signed
+  // off on "delete <name>", and that name now identifies something else.
+  'manage_notification_channels:delete': async (args, database) => {
+    const channelId = typeof args.channelId === 'string' ? args.channelId : null;
+    if (!channelId) return MISSING_ARG;
+    const [channel] = await database
+      .select({
+        name: notificationChannels.name,
+        type: notificationChannels.type,
+        orgId: notificationChannels.orgId,
+        partnerId: notificationChannels.partnerId,
+      })
+      .from(notificationChannels)
+      .where(eq(notificationChannels.id, channelId))
+      .limit(1);
+    if (!channel) return TARGET_ABSENT;
+    return material(JSON.stringify(channel));
+  },
+
   // execute_dr_plan — structurally the same TOCTOU shape as run_script: the
   // approver approves "execute plan <id>", and the PLAN DEFINITION can be
   // edited inside the approval window while the intent's arguments stay
@@ -556,7 +804,129 @@ const EFFECT_DIGEST_RESOLVERS: Record<
     if (!partner) return TARGET_ABSENT;
     return material(JSON.stringify({ name: partner.name, status: partner.status }));
   },
+
+  // confirm_memory / retract_memory (Wisp W03; registry tier 3, FOUR_EYES like
+  // operator_plan). The approver signs off on a block REFERENCE (`blockId`);
+  // pin the block itself so one edited, superseded, retracted or re-owned
+  // between approval and release fails closed. Both tools touch the same row,
+  // so they share one resolver.
+  confirm_memory: (args, database) => resolveMemoryBlockMaterial(args.blockId, database),
+  retract_memory: (args, database) => resolveMemoryBlockMaterial(args.blockId, database),
+
+  // ioc_hunt:sweep (#6268, W05-7). The approver approves a PREVIEW: its
+  // previewDigest (computed under the requester's own context over the
+  // eligible targets and the set shas) plus the sets' published bytes. Pins
+  // both, so a set republished between approval and release is
+  // content_changed here, and a target change is refused by createSweep
+  // itself (SWEEP_SCOPE_CHANGED: previewDigest re-proved under the rebuilt
+  // auth, or more targets than expectedDeviceCount). Resolvers get no auth,
+  // so caller-scoped eligibility is carried only by previewDigest.
+  'ioc_hunt:sweep': async (args, database) => {
+    const orgId = typeof args.orgId === 'string' && UUID_RE.test(args.orgId) ? args.orgId.toLowerCase() : null;
+    const previewDigest = typeof args.previewDigest === 'string' && /^[0-9a-f]{64}$/.test(args.previewDigest)
+      ? args.previewDigest
+      : null;
+    const ids = Array.isArray(args.ruleSetIds) ? args.ruleSetIds : [];
+    if (!orgId || !previewDigest || ids.length === 0 || !ids.every((id) => typeof id === 'string' && UUID_RE.test(id))) {
+      return MISSING_ARG;
+    }
+    const setIds = [...new Set((ids as string[]).map((id) => id.toLowerCase()))].sort();
+    const rows = await database
+      .select({
+        id: yaraRuleSets.id,
+        enabled: yaraRuleSets.enabled,
+        publishedVersion: yaraRuleSets.publishedVersion,
+        publishedSha256: yaraRuleSets.publishedSha256,
+      })
+      .from(yaraRuleSets)
+      // Only sets usable in the sweep's org (its own, partner-wide, built-in):
+      // a foreign org's set pins as absent, never as material.
+      .where(and(inArray(yaraRuleSets.id, setIds), or(eq(yaraRuleSets.orgId, orgId), isNull(yaraRuleSets.orgId))));
+    const byId = new Map(rows.map((r) => [r.id.toLowerCase(), r]));
+    const pins: Array<{ id: string; version: number; sha256: string }> = [];
+    for (const id of setIds) {
+      const row = byId.get(id);
+      if (!row || !row.enabled || row.publishedVersion === null || !row.publishedSha256) return TARGET_ABSENT;
+      pins.push({ id, version: row.publishedVersion, sha256: row.publishedSha256 });
+    }
+    return material(canonicalizeArguments({ v: 1, orgId, previewDigest, pins }));
+  },
+
+  // ioc_hunt:import_iocs (#6268). Pins the set's draft and published
+  // versions, so a set edited or republished between approval and release is
+  // content_changed, and a digest of the IOC list (also immutable in the
+  // intent's arguments; pinned here so the effect names exactly what is added).
+  'ioc_hunt:import_iocs': async (args, database) => {
+    const ruleSetId = typeof args.ruleSetId === 'string' && UUID_RE.test(args.ruleSetId) ? args.ruleSetId.toLowerCase() : null;
+    const iocs = Array.isArray(args.iocs) ? args.iocs : [];
+    const wellFormed = iocs.every((ioc) => {
+      const o = (ioc && typeof ioc === 'object' ? ioc : null) as Record<string, unknown> | null;
+      return !!o && typeof o.kind === 'string' && typeof o.value === 'string';
+    });
+    if (!ruleSetId || iocs.length === 0 || !wellFormed) return MISSING_ARG;
+    const [set] = await database
+      .select({ currentVersion: yaraRuleSets.currentVersion, publishedVersion: yaraRuleSets.publishedVersion })
+      .from(yaraRuleSets)
+      .where(eq(yaraRuleSets.id, ruleSetId))
+      .limit(1);
+    if (!set) return TARGET_ABSENT;
+    const sorted = iocs
+      .map((ioc) => ({ kind: (ioc as { kind: string }).kind, value: (ioc as { value: string }).value }))
+      // Code-point order, not localeCompare: the digest is recomputed at release,
+      // possibly on another host, and must not depend on its ICU locale.
+      .sort((a, b) => cmp(a.kind, b.kind) || cmp(a.value, b.value));
+    const iocDigest = createHash('sha256').update(canonicalizeArguments({ iocs: sorted })).digest('hex');
+    return material(canonicalizeArguments({
+      v: 1,
+      ruleSetId,
+      currentVersion: set.currentVersion,
+      publishedVersion: set.publishedVersion ?? 0,
+      iocDigest,
+    }));
+  },
 };
+
+const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** JSON with object keys sorted at every depth, so a jsonb round trip never changes the pin. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.keys(value as Record<string, unknown>).sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+async function resolveMemoryBlockMaterial(blockIdArg: unknown, database: Database): Promise<ResolverResult> {
+  const blockId = typeof blockIdArg === 'string' ? blockIdArg : null;
+  if (!blockId) return MISSING_ARG;
+  // A non-uuid would make Postgres throw (22P02); no such block can exist.
+  if (!UUID_RE.test(blockId)) return TARGET_ABSENT;
+  // Loaded on demand: memoryService pulls the db + audit graph. The read lives
+  // there (the single-caller contract), through the caller's database handle.
+  const { readMemoryBlockForEffectDigest } = await import('../wisp/memoryService');
+  const block = await readMemoryBlockForEffectDigest(database, blockId);
+  if (!block) return TARGET_ABSENT;
+  return material(JSON.stringify({
+    v: 1,
+    id: block.id,
+    tenantPartnerId: block.tenantPartnerId,
+    ownerKind: block.ownerKind,
+    ownerUserId: block.ownerUserId,
+    ownerOrgId: block.ownerOrgId,
+    blockType: block.blockType,
+    subjectKey: block.subjectKey,
+    confidence: block.confidence,
+    status: block.status,
+    supersededById: block.supersededById,
+    updatedAt: block.updatedAt.toISOString(),
+    contentSha256: createHash('sha256').update(canonicalJson(block.content)).digest('hex'),
+  }));
+}
 
 async function resolveInvoiceUpdatedAt(
   invoiceIdArg: unknown,

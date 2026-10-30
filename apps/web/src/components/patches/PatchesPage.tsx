@@ -6,6 +6,7 @@ import PatchList, {
   type Patch,
   type PatchApprovalStatus,
 } from './PatchList';
+import PatchDetailsDrawer from './PatchDetailsDrawer';
 import PatchApprovalModal, { type PatchApprovalAction } from './PatchApprovalModal';
 import PatchComplianceView from './PatchComplianceView';
 import PatchJobsList from './PatchJobsList';
@@ -14,6 +15,7 @@ import UpdateRingList, { type UpdateRingItem } from './UpdateRingList';
 import UpdateRingForm, { type UpdateRingFormValues } from './UpdateRingForm';
 import RingSelector, { type UpdateRing } from './RingSelector';
 import SourceFilterChips from './SourceFilterChips';
+import type { LoadPatchDevices } from './PatchDevicesPopover';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { useOrgStore } from '../../stores/orgStore';
@@ -25,14 +27,17 @@ import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { Dialog } from '../shared/Dialog';
 import { runAction, ActionError } from '@/lib/runAction';
 import { asList } from '@/lib/asList';
+import { useHashState } from '@/lib/useHashState';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
+import { keepHashAcrossOrgSwitch } from '../../lib/orgSwitch';
+import { orgAgnosticPatchesHash, parsePatchesHash, type PatchesTab } from './patchesHash';
 
-type TabKey = 'rings' | 'patches' | 'compliance' | 'jobs';
-const validTabs: TabKey[] = ['rings', 'patches', 'compliance', 'jobs'];
+type TabKey = PatchesTab;
 
 // Tab state lives in window.location.hash (`#patches`) per the project
 // convention for transient UI state (CLAUDE.md); DiscoveryPage and DeviceDetails
@@ -40,17 +45,34 @@ const validTabs: TabKey[] = ['rings', 'patches', 'compliance', 'jobs'];
 // on a permission — this page is the only one that does, which is what made the
 // #4010 ordering bug possible here and nowhere else. The default `compliance`
 // tab keeps the hash empty so the URL stays clean.
+//
+// `#patches/<patchId>` deep-links the read-only patch details drawer (#9544): the
+// tab is the segment before the first `/`, the drawer's patch id the rest.
+//
+// Tabs are read through the shared hash grammar (#9791 C, patchesHash.ts), so
+// `#compliance&status=failed` and a bare `#status=failed` (no tab token) both
+// select the default compliance tab and leave the filter to the compliance view.
 function getTabFromHash(): TabKey {
   if (typeof window === 'undefined') return 'compliance';
-  const hash = window.location.hash.replace(/^#/, '');
-  return validTabs.includes(hash as TabKey) ? (hash as TabKey) : 'compliance';
+  return parsePatchesHash(window.location.hash).tab ?? 'compliance';
+}
+
+function parsePatchIdFromHash(hash: string): string | null {
+  const [tab, ...rest] = hash.split('/');
+  const id = rest.join('/');
+  if (tab !== 'patches' || !id) return null;
+  try {
+    return decodeURIComponent(id);
+  } catch {
+    return null; // malformed percent-escape in a hand-edited URL — no drawer
+  }
 }
 
 function setTabInHash(tab: TabKey) {
   if (typeof window === 'undefined') return;
   const url = new URL(window.location.href);
   url.hash = tab === 'compliance' ? '' : tab;
-  window.history.replaceState({}, '', url.toString());
+  replaceUrl(url.toString());
 }
 
 // Resolve a hash-derived tab against the user's access. Rings are partner-scoped:
@@ -86,13 +108,14 @@ const PATCH_FETCH_MAX_PAGES = 25;
 // timeout, and gives each batch its own audit entry.
 const BULK_APPROVE_BATCH_SIZE = 200;
 
+interface LinkedPolicy { id: string; name: string; orgId: string | null }
+
 export default function PatchesPage() {
   const { t } = useTranslation('patches');
   const { can } = usePermissions();
   const canScan = can('devices', 'execute'); // UX gate; POST /patches/scan requires devices.execute
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
-  const { organizations, currentOrgId } = useOrgStore();
-  const currentOrg = organizations.find(o => o.id === currentOrgId) ?? null;
+  const { organizations } = useOrgStore();
   // Reactive claims, not the one-shot getJwtClaims(): access tokens are never
   // persisted, so on a cold load the store is empty at first paint and only
   // fills once the refresh cookie has been exchanged (#4010).
@@ -179,6 +202,31 @@ export default function PatchesPage() {
   }, [ringAccess, setActiveTab]);
   const [selectedRingId, setSelectedRingId] = useState<string | null>(null);
   const [selectedPatch, setSelectedPatch] = useState<Patch | null>(null);
+  // Read-only details drawer (#9544): the patch id lives in the hash.
+  const [detailsPatchId, setDetailsPatchId] = useHashState<string | null>(null, parsePatchIdFromHash);
+  const openPatchDetails = useCallback((patch: Patch) => {
+    setDetailsPatchId(patch.id);
+    window.location.hash = `patches/${encodeURIComponent(patch.id)}`;
+  }, [setDetailsPatchId]);
+  // The drawer is gated on the patches tab; drop the id when leaving it so a
+  // return to the tab (tab switches replaceUrl without a hashchange) doesn't
+  // resurrect a drawer the URL no longer names.
+  // Only a patches -> other transition clears: the cold-load default tab is
+  // 'compliance' until the hash syncs, and must not wipe a deep-linked id.
+  const prevTabRef = useRef(activeTab);
+  useEffect(() => {
+    if (prevTabRef.current === 'patches' && activeTab !== 'patches') setDetailsPatchId(null);
+    prevTabRef.current = activeTab;
+  }, [activeTab, setDetailsPatchId]);
+  const closePatchDetails = useCallback(() => {
+    setDetailsPatchId(null);
+    window.location.hash = 'patches';
+  }, [setDetailsPatchId]);
+  // #10083: a header org switch re-renders this page in place. Keep the tab and
+  // the compliance status filter (same meaning in every org); never the patch id
+  // the drawer selected, which belongs to the org being left. Read at switch
+  // time, so it follows tab changes that replaceUrl made without a hashchange.
+  useEffect(() => keepHashAcrossOrgSwitch(() => orgAgnosticPatchesHash(window.location.hash)), []);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   // Which tab the approval modal opens on: 'approve' from Review (the default,
@@ -187,6 +235,8 @@ export default function PatchesPage() {
   const [modalInitialAction, setModalInitialAction] = useState<PatchApprovalAction>('approve');
   const [ringModalOpen, setRingModalOpen] = useState(false);
   const [ringSubmitting, setRingSubmitting] = useState(false);
+  const [pendingRingDelete, setPendingRingDelete] = useState<{ ring: UpdateRingItem; linked: LinkedPolicy[] } | null>(null);
+  const [ringDeleting, setRingDeleting] = useState(false);
   const [editingRing, setEditingRing] = useState<UpdateRingItem | null>(null);
 
   // Data
@@ -494,6 +544,22 @@ export default function PatchesPage() {
     }
   };
 
+  // #8728: hostnames behind a row's outstanding device count, one page at a
+  // time. fetchWithAuth adds the selected org as ?orgId=, so the names are
+  // scoped exactly like the count on the list.
+  const loadPatchDevices = useCallback<LoadPatchDevices>(async (patchId, page) => {
+    const response = await fetchWithAuth(`/patches/${patchId}/devices?limit=50&page=${page}`);
+    if (!response.ok) {
+      if (response.status === 401) void navigateTo('/login', { replace: true });
+      throw new Error(`Failed to load devices (${response.status})`);
+    }
+    const body = await response.json();
+    return {
+      devices: Array.isArray(body?.data) ? body.data : [],
+      total: Number(body?.pagination?.total) || 0
+    };
+  }, []);
+
   const handleBulkDecline = async (patchIds: string[]) => {
     // Same partner-level scope requirement as approve (see handleBulkApprove).
     if (!canManageRings) {
@@ -715,6 +781,8 @@ export default function PatchesPage() {
               gracePeriodHours: values.gracePeriodHours,
               autoApprove: values.autoApprove,
               categoryRules: values.categoryRules,
+              appRules: values.appRules,
+              featureUpdates: values.featureUpdates,
             }),
           }),
         errorFallback: isEditing ? t('patchesPage.errors.updateRing') : t('patchesPage.errors.createRing'),
@@ -740,7 +808,7 @@ export default function PatchesPage() {
     }
   };
 
-  const handleRingDelete = async (ring: UpdateRingItem) => {
+  const executeRingDelete = async (ring: UpdateRingItem) => {
     try {
       await runAction({
         request: () => fetchWithAuth(`/update-rings/${ring.id}`, { method: 'DELETE' }),
@@ -752,6 +820,39 @@ export default function PatchesPage() {
     } catch (err) {
       if (err instanceof ActionError && err.status === 401) return;
       setRingsError(err instanceof ActionError ? err.message : t('patchesPage.errors.deleteRing'));
+    }
+  };
+
+  // #8909: a deleted ring strands every config policy linked to it (patching is
+  // held until another ring is chosen). Ask the API who is affected BEFORE the
+  // destructive call, then always confirm by name: even an unlinked ring carries
+  // its whole approval rule set and a delete has no undo.
+  const handleRingDelete = async (ring: UpdateRingItem) => {
+    let linked: LinkedPolicy[];
+    try {
+      const response = await fetchWithAuth(`/update-rings/${ring.id}/linked-policies`);
+      if (response.status === 401) { void navigateTo('/login', { replace: true }); return; }
+      if (!response.ok) throw new Error(`linked-policies ${response.status}`);
+      const body = await response.json();
+      if (!Array.isArray(body?.linkedPolicies)) throw new Error('linked-policies: malformed response');
+      linked = body.linkedPolicies;
+    } catch {
+      // Fail closed: without the linked-policy list we cannot warn, so do not delete.
+      showToast({ message: t('patchesPage.errors.checkRingLinks'), type: 'error' });
+      return;
+    }
+    setPendingRingDelete({ ring, linked });
+  };
+
+  const confirmRingDelete = async () => {
+    if (!pendingRingDelete) return;
+    const { ring } = pendingRingDelete;
+    setRingDeleting(true);
+    try {
+      await executeRingDelete(ring);
+    } finally {
+      setRingDeleting(false);
+      setPendingRingDelete(null);
     }
   };
 
@@ -919,16 +1020,29 @@ export default function PatchesPage() {
               )}
             </div>
           )}
+          {/* An empty ring has no device reports of its own, so device-derived
+              severity reads Unrated until devices are assigned (#9930). */}
+          {selectedRingId && rings.find((r) => r.id === selectedRingId)?.deviceCount === 0 && (
+            <div
+              data-testid="patches-empty-ring-notice"
+              className="mt-4 rounded-md border border-border bg-muted/40 px-4 py-2 text-sm text-muted-foreground"
+            >
+              {t('patchesPage.emptyRingSeverityNotice')}
+            </div>
+          )}
           <PatchList
             patches={sourceFilter === 'all' ? patches : patches.filter((p) => p.source === sourceFilter)}
             loading={patchesLoading}
             error={patchesError}
             onRetry={fetchPatches}
             onReview={handleReview}
+            onView={openPatchDetails}
             onDeploy={handleDeploy}
             onUnapprove={handleUnapprove}
             onBulkApprove={handleBulkApprove}
             onBulkDecline={handleBulkDecline}
+            // The ring list (/update-rings/:id/patches) carries no device count.
+            loadPatchDevices={selectedRingId ? undefined : loadPatchDevices}
           />
         </>
       )}
@@ -940,12 +1054,21 @@ export default function PatchesPage() {
       {activeTab === 'jobs' && <PatchJobsList onSelectJob={setSelectedJobId} />}
       {selectedJobId && <PatchJobDetail jobId={selectedJobId} onClose={() => setSelectedJobId(null)} />}
 
+      {/* Read-only patch details (#9544) */}
+      {activeTab === 'patches' && (
+        <PatchDetailsDrawer
+          patch={detailsPatchId ? patches.find((p) => p.id === detailsPatchId) ?? null : null}
+          rings={rings}
+          onClose={closePatchDetails}
+        />
+      )}
+
       {/* Approval modal — passes ringId and org context for confirmation */}
       <PatchApprovalModal
         open={modalOpen}
         patch={selectedPatch}
         ringId={selectedRingId}
-        orgName={currentOrg?.name ?? null}
+        ringName={selectedRingId ? (rings.find(r => r.id === selectedRingId)?.name ?? null) : null}
         ringDeviceCount={selectedRingId ? (rings.find(r => r.id === selectedRingId)?.deviceCount ?? null) : null}
         initialAction={modalInitialAction}
         onClose={() => {
@@ -954,6 +1077,38 @@ export default function PatchesPage() {
         }}
         onSubmit={handleApprovalSubmit}
       />
+
+      {/* Ring delete confirmation — names the ring and lists any linked config policies (#8909) */}
+      <ConfirmDialog
+        open={pendingRingDelete !== null}
+        onClose={() => { if (!ringDeleting) setPendingRingDelete(null); }}
+        onConfirm={() => void confirmRingDelete()}
+        title={t('patchesPage.ringDelete.title', { name: pendingRingDelete?.ring.name ?? '' })}
+        message={
+          pendingRingDelete
+            ? t(
+                /* i18n-dynamic */ pendingRingDelete.linked.length === 0
+                  ? 'patchesPage.ringDelete.messageNone'
+                  : pendingRingDelete.linked.length === 1
+                    ? 'patchesPage.ringDelete.messageOne'
+                    : 'patchesPage.ringDelete.messageMany',
+                { count: pendingRingDelete.linked.length }
+              )
+            : ''
+        }
+        confirmLabel={t('patchesPage.ringDelete.confirm')}
+        variant="destructive"
+        isLoading={ringDeleting}
+        confirmTestId="confirm-delete-ring"
+      >
+        {pendingRingDelete && pendingRingDelete.linked.length > 0 && (
+          <ul className="mt-3 max-h-48 list-disc space-y-1 overflow-y-auto pl-5 text-sm">
+            {pendingRingDelete.linked.map((p) => (
+              <li key={p.id}>{p.name}</li>
+            ))}
+          </ul>
+        )}
+      </ConfirmDialog>
 
       {/* Scan confirmation — names the scope before POSTing /patches/scan */}
       <ConfirmDialog
@@ -1012,6 +1167,7 @@ export default function PatchesPage() {
           <UpdateRingForm
             key={editingRing?.id ?? 'new'}
             onSubmit={handleRingSubmit}
+            existingRingOrders={rings.map((ring) => ring.ringOrder)}
             onCancel={() => { setRingModalOpen(false); setEditingRing(null); }}
             submitLabel={
               ringSubmitting
@@ -1029,6 +1185,8 @@ export default function PatchesPage() {
               gracePeriodHours: editingRing.gracePeriodHours,
               autoApprove: editingRing.autoApprove ?? { enabled: false, severities: [], deferralDays: 0 },
               categoryRules: editingRing.categoryRules,
+              appRules: editingRing.appRules ?? [],
+              featureUpdates: editingRing.featureUpdates,
             } : undefined}
           />
         </div>

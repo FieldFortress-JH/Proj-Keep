@@ -123,6 +123,10 @@ vi.mock('../../../db', () => {
   };
 });
 
+// The value writer requests a dynamic-group re-evaluation after commit (#8832);
+// the db mock has no runAfterDbContextCommit, so stub the producer.
+vi.mock('../../../jobs/deviceGroupJobs', () => ({ requestDeviceGroupReevaluationAfterCommit: vi.fn() }));
+
 vi.mock('./warrantyTarget', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./warrantyTarget')>();
   return { ...actual, applyWarrantyImport: applyWarrantyImportMock };
@@ -133,6 +137,7 @@ import {
   previewDeviceCustomFieldImport,
   type ValueImportContext,
 } from './valueImport';
+import { requestDeviceGroupReevaluationAfterCommit } from '../../../jobs/deviceGroupJobs';
 import type { CommitValueRowInput, DeviceCustomFieldImportRow, MappingTarget } from './types';
 
 const ctx: ValueImportContext = { partnerId: PARTNER, accessibleOrgIds: [ORG], allowedSiteIds: null };
@@ -376,6 +381,18 @@ describe('previewDeviceCustomFieldImport', () => {
     expect(opted!.values[0]!.outcome).toBe('applied');
   });
 
+  it('previews an agent-owned warranty as refused, even with overrideProviderWarranty (#5511 W01)', async () => {
+    for (const dataSource of ['agent_cmsl', 'agent_plist']) {
+      seed({ warranty: [{ deviceId: D1, dataSource }] });
+      const [row] = await preview(
+        [{ deviceId: D1, values: [w('warrantyEndDate', '2027-03-04')] }],
+        { ...ctx, overrideProviderWarranty: true },
+      );
+      expect(row!.values[0]!.outcome).toBe('skipped-provider-owned');
+      expect(row!.values[0]!.warning).toMatch(/agent/i);
+    }
+  });
+
   it('previews an unchanged warranty cell as skipped-already-set, the way commit will treat it', async () => {
     // Preview's whole job is to predict commit. Before this, a re-import of an
     // unchanged file previewed every warranty cell as `applied` and then
@@ -436,6 +453,7 @@ describe('previewDeviceCustomFieldImport', () => {
 describe('commitDeviceCustomFieldImport', () => {
   it('applies the good values on a mixed row and reports the rest, in ONE transaction', async () => {
     seed();
+    vi.mocked(requestDeviceGroupReevaluationAfterCommit).mockClear();
 
     const summary = await commit([{
       deviceId: D1,
@@ -447,6 +465,13 @@ describe('commitDeviceCustomFieldImport', () => {
     expect(summary.failedValues).toBe(2);
     expect(txCount.current).toBe(1);
     expect(txInserts.filter((i) => i.table === 'device_custom_field_values')).toHaveLength(1);
+    // #8832: only the applied key is requested, tagged with the import source.
+    expect(requestDeviceGroupReevaluationAfterCommit).toHaveBeenCalledTimes(1);
+    expect(requestDeviceGroupReevaluationAfterCommit).toHaveBeenCalledWith(expect.objectContaining({
+      deviceId: D1,
+      changedFields: ['custom.asset_tag'],
+      reason: 'custom_field_write:import',
+    }));
   });
 
   it('a row that fails to write does not poison its neighbours', async () => {

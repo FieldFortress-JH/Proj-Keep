@@ -8,6 +8,9 @@ import {
   isValidMaintenanceWindow,
 } from '@breeze/shared';
 import AgentVersionPinSelectors, { type PinnableVersions } from './AgentVersionPinSelectors';
+import FieldLabel from './partnerSettings/FieldLabel';
+import SettingBadge from './partnerSettings/SettingBadge';
+import InheritanceLine from './partnerSettings/InheritanceLine';
 import { Trans, useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 
@@ -22,7 +25,7 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
   const set = (patch: Partial<InheritableDefaultSettings>) =>
     onChange({ ...data, ...patch });
 
-  const autoEnrollment = data.autoEnrollment ?? { enabled: false, requireApproval: true, sendWelcome: true };
+  const autoEnrollment = data.autoEnrollment ?? { enabled: false, requireApproval: true };
 
   const maintenanceWindow = data.maintenanceWindow ?? '';
   const maintenanceWindowInvalid = maintenanceWindow.trim() !== '' && !isValidMaintenanceWindow(maintenanceWindow);
@@ -59,8 +62,9 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
     <div className="space-y-6">
       <div className="grid gap-6 sm:grid-cols-2">
         <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerDefaults.updatePolicy')}</label>
+          <FieldLabel htmlFor="partner-defaults-update-policy" fieldId="defaults.agentUpdatePolicy">{t('partnerDefaults.updatePolicy')}</FieldLabel>
           <select
+            id="partner-defaults-update-policy"
             // Fold the legacy 'staged' value into 'auto' for display — they are
             // behaviourally identical (both maintenance-window gated; no real
             // staged rollout exists, see #1962). The backend still accepts
@@ -73,11 +77,14 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
             <option value="auto">{t('partnerDefaults.automatic')}</option>
             <option value="manual">{t('partnerDefaults.manual')}</option>
           </select>
+          <InheritanceLine fieldId="defaults.agentUpdatePolicy" />
         </div>
 
         <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerDefaults.maintenanceWindow')}</label>
+          <FieldLabel htmlFor="partner-defaults-maintenance-window" fieldId="defaults.maintenanceWindow">{t('partnerDefaults.maintenanceWindow')}</FieldLabel>
           <input
+            id="partner-defaults-maintenance-window"
+            aria-describedby="partner-defaults-maintenance-window-hint"
             type="text"
             value={maintenanceWindow}
             onChange={e => set({ maintenanceWindow: e.target.value || undefined })}
@@ -87,12 +94,13 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
               maintenanceWindowInvalid ? 'border-destructive' : ''
             }`}
           />
+          <InheritanceLine fieldId="defaults.maintenanceWindow" />
           {maintenanceWindowInvalid ? (
-            <p className="text-xs text-destructive">
+            <p id="partner-defaults-maintenance-window-hint" className="text-xs text-destructive">
               <Trans i18nKey="partnerDefaults.maintenanceInvalid" t={t} components={{ first: <code />, second: <code />, always: <code /> }} />
             </p>
           ) : (
-            <p className="text-xs text-muted-foreground">
+            <p id="partner-defaults-maintenance-window-hint" className="text-xs text-muted-foreground">
               <Trans i18nKey="partnerDefaults.maintenanceHelp" t={t} components={{ always: <code /> }} />
             </p>
           )}
@@ -104,37 +112,18 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
             value={data.agentVersionPins ?? {}}
             onChange={(agentVersionPins) => set({ agentVersionPins })}
             pinnable={pinnableVersions ?? null}
+            labelAddon={key => <SettingBadge fieldId={`defaults.agentVersionPins.${key}`} />}
+            footer={key => <InheritanceLine fieldId={`defaults.agentVersionPins.${key}`} />}
           />
         </div>
 
-        <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerDefaults.deviceGroup')}</label>
-          <input
-            type="text"
-            value={data.deviceGroup ?? ''}
-            onChange={e => set({ deviceGroup: e.target.value || undefined })}
-            placeholder={t('partnerDefaults.notSet')}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-          />
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerDefaults.alertThreshold')}</label>
-          <input
-            type="text"
-            value={data.alertThreshold ?? ''}
-            onChange={e => set({ alertThreshold: e.target.value || undefined })}
-            placeholder={t('partnerDefaults.notSet')}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-          />
-        </div>
       </div>
 
       {/* Auto-enrollment */}
-      <div className="space-y-4 rounded-lg border bg-muted/40 p-4">
-        <p className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.title')}</p>
+      <div className="space-y-4 border-t pt-6">
+        <h3 className="text-sm font-semibold">{t('partnerDefaults.autoEnrollment.title')}</h3>
         <div className="space-y-3">
-          <div className="flex items-center gap-3">
+          <label className="flex items-center gap-3">
             <input
               type="checkbox"
               checked={autoEnrollment.enabled}
@@ -143,9 +132,9 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
               }
               className="h-4 w-4 rounded border"
             />
-            <label className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.enable')}</label>
-          </div>
-          <div className="flex items-center gap-3">
+            <span className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.enable')}</span>
+          </label>
+          <label className="flex items-center gap-3">
             <input
               type="checkbox"
               checked={autoEnrollment.requireApproval}
@@ -154,30 +143,19 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
               }
               className="h-4 w-4 rounded border"
             />
-            <label className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.requireApproval')}</label>
-          </div>
-          <div className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              checked={autoEnrollment.sendWelcome}
-              onChange={e =>
-                set({ autoEnrollment: { ...autoEnrollment, sendWelcome: e.target.checked } })
-              }
-              className="h-4 w-4 rounded border"
-            />
-            <label className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.sendWelcome')}</label>
-          </div>
+            <span className="text-sm font-medium">{t('partnerDefaults.autoEnrollment.requireApproval')}</span>
+          </label>
         </div>
       </div>
 
       {/* Enrollment link defaults + the partner-only lifetime cap (#2776) */}
-      <div className="space-y-4 rounded-lg border bg-muted/40 p-4">
-        <p className="text-sm font-medium">{t('partnerDefaults.enrollment.title')}</p>
+      <div className="space-y-4 border-t pt-6">
+        <h3 className="text-sm font-semibold">{t('partnerDefaults.enrollment.title')}</h3>
         <div className="grid gap-6 sm:grid-cols-2">
           <div className="space-y-2">
-            <label htmlFor="partner-enrollment-ttl" className="text-sm font-medium">
+            <FieldLabel htmlFor="partner-enrollment-ttl" fieldId="defaults.defaultEnrollmentTtlMinutes">
               {t('partnerDefaults.enrollment.ttl')}
-            </label>
+            </FieldLabel>
             <select
               id="partner-enrollment-ttl"
               data-testid="partner-enrollment-ttl"
@@ -192,15 +170,16 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
                 enrollmentTtlOptionsIncluding(partnerCap, data.defaultEnrollmentTtlMinutes),
               )}
             </select>
+            <InheritanceLine fieldId="defaults.defaultEnrollmentTtlMinutes" />
             <p className="text-xs text-muted-foreground">
               {t('partnerDefaults.enrollment.ttlHint')}
             </p>
           </div>
 
           <div className="space-y-2">
-            <label htmlFor="partner-enrollment-device-count" className="text-sm font-medium">
+            <FieldLabel htmlFor="partner-enrollment-device-count" fieldId="defaults.defaultEnrollmentDeviceCount">
               {t('partnerDefaults.enrollment.deviceCount')}
-            </label>
+            </FieldLabel>
             <input
               id="partner-enrollment-device-count"
               data-testid="partner-enrollment-device-count"
@@ -214,15 +193,16 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
               placeholder={t('partnerDefaults.notSet')}
               className="h-10 w-full rounded-md border bg-background px-3 text-sm"
             />
+            <InheritanceLine fieldId="defaults.defaultEnrollmentDeviceCount" />
             <p className="text-xs text-muted-foreground">
               {t('partnerDefaults.enrollment.deviceCountHint')}
             </p>
           </div>
 
           <div className="space-y-2 sm:col-span-2">
-            <label htmlFor="partner-max-enrollment-ttl" className="text-sm font-medium">
+            <FieldLabel htmlFor="partner-max-enrollment-ttl" fieldId="defaults.maxEnrollmentLinkTtlMinutes">
               {t('partnerDefaults.enrollment.maxTtl')}
-            </label>
+            </FieldLabel>
             <select
               id="partner-max-enrollment-ttl"
               data-testid="partner-max-enrollment-ttl"
@@ -235,6 +215,7 @@ export default function PartnerDefaultsTab({ data, onChange, pinnableVersions }:
               <option value="">{t('partnerDefaults.notSet')}</option>
               {renderTtlOptions(ENROLLMENT_TTL_OPTIONS)}
             </select>
+            <InheritanceLine fieldId="defaults.maxEnrollmentLinkTtlMinutes" />
             <p className="text-xs text-muted-foreground">
               {t('partnerDefaults.enrollment.maxTtlHint')}
             </p>

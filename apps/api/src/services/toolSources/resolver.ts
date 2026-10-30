@@ -22,7 +22,7 @@ import { and, eq, isNull, or, sql, type SQL } from 'drizzle-orm';
 import Ajv, { type ValidateFunction } from 'ajv';
 import addFormats from 'ajv-formats';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
-import { organizations, toolSources, toolSourceTools, type ToolSourceRow } from '../../db/schema';
+import { organizations, toolSources, toolSourceTools, type ToolSourceRow, type ToolSourceToolRow } from '../../db/schema';
 import { toolSourcesEnabled } from '../../config/env';
 import type { AuthContext } from '../../middleware/auth';
 
@@ -30,7 +30,8 @@ export interface TenantToolDescriptor {
   id: string;
   sourceId: string;
   sourceName: string;
-  sourceKind: 'mcp';
+  /** Which transport dispatches this tool (W2): read from the joined source row. */
+  sourceKind: 'mcp' | 'openapi';
   ownerRef: { orgId: string | null; partnerId: string | null };
   qualifiedName: string;
   name: string;
@@ -58,6 +59,7 @@ export interface ResolvedToolRow {
   orgId: string | null;
   partnerId: string | null;
   sourceName: string;
+  sourceKind: 'mcp' | 'openapi';
   rateLimitPerMinute: number;
 }
 
@@ -73,6 +75,7 @@ const RESOLVE_TOOL_ROW_SELECTION = {
   orgId: toolSourceTools.orgId,
   partnerId: toolSourceTools.partnerId,
   sourceName: toolSources.name,
+  sourceKind: toolSources.kind,
   rateLimitPerMinute: toolSources.rateLimitPerMinute,
 };
 
@@ -200,7 +203,7 @@ export function compileToolDescriptor(row: ResolvedToolRow, ajv: Ajv): TenantToo
     id: row.id,
     sourceId: row.sourceId,
     sourceName: row.sourceName,
-    sourceKind: 'mcp',
+    sourceKind: row.sourceKind,
     ownerRef: { orgId: row.orgId, partnerId: row.partnerId },
     qualifiedName: row.qualifiedName,
     name: row.name,
@@ -285,6 +288,87 @@ export async function resolveTenantTools(
     if (descriptor) descriptors.push(descriptor);
   }
   return dedupeByQualifiedName(descriptors);
+}
+
+// ---------------------------------------------------------------------------
+// Tool Catalog W03 (#5218) — resolve against a flow OWNER, not a session.
+//
+// A flow validates against the catalog of the org or partner that owns it
+// (spec §6.3 rule 1), which is not the same thing as "what this request's
+// token can see" (a partner tech drafting an org flow, or a stored row
+// re-validated on read). The owner is produced only by
+// `services/flows/owner.ts` (after the real caller is authorized) or read from
+// a stored `flows` row, never from tool input.
+// ---------------------------------------------------------------------------
+
+export interface ToolOwnerRef {
+  orgId: string | null;
+  partnerId: string;
+}
+
+/**
+ * The owner predicate: an org owner gets its own tools plus the partner-wide
+ * tools of the org's partner RE-DERIVED from `organizations` (the passed
+ * `partnerId` is never trusted for the widening); a partner owner gets its
+ * partner-wide tools only.
+ */
+export function buildResolveTenantToolsForOwnerQuery(owner: ToolOwnerRef) {
+  let predicate: SQL | undefined;
+  if (owner.orgId) {
+    const orgsPartnerId = sql<string>`(select ${organizations.partnerId} from ${organizations} where ${organizations.id} = ${owner.orgId})`;
+    predicate = or(
+      eq(toolSourceTools.orgId, owner.orgId),
+      and(isNull(toolSourceTools.orgId), eq(toolSourceTools.partnerId, orgsPartnerId)),
+    );
+  } else {
+    predicate = and(isNull(toolSourceTools.orgId), eq(toolSourceTools.partnerId, owner.partnerId));
+  }
+
+  return db
+    .select(RESOLVE_TOOL_ROW_SELECTION)
+    .from(toolSourceTools)
+    .innerJoin(toolSources, eq(toolSourceTools.sourceId, toolSources.id))
+    .where(
+      and(
+        eq(toolSourceTools.enabled, true),
+        isNull(toolSourceTools.removedAt),
+        eq(toolSources.status, 'active'),
+        predicate,
+      ),
+    )
+    .orderBy(toolSourceTools.qualifiedName);
+}
+
+/** Every enabled tenant tool the owner's catalog contains. `[]` when the tool-sources kill switch is off. */
+export async function resolveTenantToolsForOwner(owner: ToolOwnerRef): Promise<TenantToolDescriptor[]> {
+  if (!toolSourcesEnabled()) return [];
+  // Built inside the system context for the same proxy-binding reason as
+  // resolveTenantTools above.
+  const rows = await runOutsideDbContext(() =>
+    withSystemDbAccessContext(async () => buildResolveTenantToolsForOwnerQuery(owner), 'resolveTenantToolsForOwner'),
+  );
+  const ajv = newAjv();
+  const descriptors: TenantToolDescriptor[] = [];
+  for (const row of rows) {
+    const descriptor = compileToolDescriptor(row, ajv);
+    if (descriptor) descriptors.push(descriptor);
+  }
+  return dedupeByQualifiedName(descriptors);
+}
+
+/**
+ * Compiles a tenant tool input schema with the resolver's Ajv options
+ * (`allErrors`, non-strict, formats), so callers that need structured errors
+ * (`instancePath` + `keyword`) — the flow validator's template-aware partial
+ * validation — get the same acceptance as dispatch. `null` when uncompilable.
+ */
+export function compileTenantInputSchema(schema: Record<string, unknown>): ValidateFunction | null {
+  try {
+    return newAjv().compile(schema);
+  } catch (err) {
+    console.warn(`[toolSources.resolver] compileTenantInputSchema: uncompilable schema skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 export async function resolveTenantToolByName(
@@ -472,7 +556,7 @@ export async function loadTenantToolForExecution(
   toolId: string,
   auth?: AuthContext,
   targetOrgId?: string | null,
-): Promise<{ descriptor: TenantToolDescriptor; source: ToolSourceRow } | null> {
+): Promise<{ descriptor: TenantToolDescriptor; source: ToolSourceRow; tool: ToolSourceToolRow } | null> {
   // The kill switch is re-checked HERE, not only at session-start resolution
   // (`resolveTenantTools`, routes, and the discovery worker): a chat
   // session's SDK tool descriptors / `extraTools` map are built once when the
@@ -508,11 +592,15 @@ export async function loadTenantToolForExecution(
       orgId: row.tool.orgId,
       partnerId: row.tool.partnerId,
       sourceName: row.source.name,
+      sourceKind: row.source.kind,
       rateLimitPerMinute: row.source.rateLimitPerMinute,
     },
     ajv,
   );
   if (!descriptor) return null;
 
-  return { descriptor, source: row.source };
+  // `tool` is the fresh row: the OpenAPI executor reads its routing binding
+  // (`annotations.operation`) from here, never from a descriptor captured at
+  // session start.
+  return { descriptor, source: row.source, tool: row.tool };
 }

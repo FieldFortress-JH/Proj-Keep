@@ -1,18 +1,21 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { MlFeatureSettings } from '@breeze/shared';
-import { ActionError, runAction } from '@/lib/runAction';
+import { handleActionError, runAction } from '@/lib/runAction';
 import { fetchWithAuth, handleSessionExpired } from '@/stores/auth';
+import AutosaveSwitch from './partnerSettings/AutosaveSwitch';
+import { usePartnerSettingsSaveApi } from './partnerSettings/partnerSettingsSaveContext';
 
 /**
  * Partner-wide defaults for the ML feature switches (`settings.ml`, read by
  * the API's mlFeatureFlags resolver). Every child org inherits these unless it
  * sets its own override on the org AI tab (OrgMlFeaturesCard).
  *
- * Self-saving: each switch PATCHes /orgs/partners/me immediately with the
- * COMPLETE block of the section it belongs to (`ml.anomalies` or
+ * Autosave switches (spec §3.1): each PATCHes /orgs/partners/me immediately
+ * with the COMPLETE block of the section it belongs to (`ml.anomalies` or
  * `ml.remediation_suggestions`) and nothing else — the API deep-merges `ml` one
- * level, so sibling blocks are preserved — and reverts on failure.
+ * level, so sibling blocks are preserved — and reverts on failure. It never
+ * touches the page's unsaved drafts; its outcome goes to the header status line.
  */
 type MlState = {
   anomalies: { enabled: boolean; create_alerts: boolean };
@@ -37,11 +40,13 @@ export default function PartnerMlFeaturesCard({
   onSaved,
 }: {
   value: MlFeatureSettings | undefined;
-  onSaved: () => void;
+  /** Receives the saved ml state so the parent can update its copy without a refetch. */
+  onSaved: (ml: MlFeatureSettings) => void;
 }) {
   const { t } = useTranslation('settings');
   const [ml, setMl] = useState<MlState>(() => initialState(value));
   const [busy, setBusy] = useState(false);
+  const { reportAutosave } = usePartnerSettingsSaveApi();
 
   const toggle = async <S extends Section>(section: S, key: keyof MlState[S], next: boolean) => {
     if (busy) return;
@@ -60,10 +65,13 @@ export default function PartnerMlFeaturesCard({
         errorFallback: t('partnerSettingsPage.aiFeatures.saveFailed'),
         onUnauthorized: handleSessionExpired,
       });
-      onSaved();
+      onSaved({ ...ml, [section]: block });
+      reportAutosave('aiFeatures', { status: 'saved', savedAt: Date.now() });
     } catch (err) {
       setMl(previous);
-      if (!(err instanceof ActionError)) throw err;
+      reportAutosave('aiFeatures', { status: 'failed' });
+      // Runs under a fire-and-forget `void toggle(...)`: never rethrow.
+      handleActionError(err, t('partnerSettingsPage.aiFeatures.saveFailed'));
     } finally {
       setBusy(false);
     }
@@ -76,20 +84,20 @@ export default function PartnerMlFeaturesCard({
     label: string,
     description: string,
   ) => (
-    <label className="flex items-start gap-3 rounded-md border bg-muted/30 p-3">
-      <input
-        type="checkbox"
-        data-testid={testId}
+    <div className="flex items-start justify-between gap-3 rounded-md border bg-muted/30 p-3">
+      <span>
+        <span id={`${testId}-label`} className="block text-sm font-medium">{label}</span>
+        <span id={`${testId}-description`} className="block text-xs text-muted-foreground">{description}</span>
+      </span>
+      <AutosaveSwitch
         checked={ml[section][key] as boolean}
         disabled={busy}
-        onChange={(e) => void toggle(section, key, e.target.checked)}
-        className="mt-0.5"
+        onChange={(next) => void toggle(section, key, next)}
+        labelledBy={`${testId}-label`}
+        describedBy={`${testId}-description`}
+        testId={testId}
       />
-      <span>
-        <span className="block text-sm font-medium">{label}</span>
-        <span className="block text-xs text-muted-foreground">{description}</span>
-      </span>
-    </label>
+    </div>
   );
 
   return (

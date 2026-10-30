@@ -121,7 +121,7 @@
     "orgConnectedAppsPage": {
       "title": "Applications connectées (à l’échelle de l’organisation)",
       "description": {
-        "prefix": "Assistants IA et autres clients MCP que les utilisateurs utilisent",
+        "prefix": "Clients IA que les utilisateurs utilisent",
         "yourOrganization": "Votre organisation",
         "suffix": "Autorisé. Bloquez un client pour révoquer immédiatement toutes ses autorisations actives."
       },
@@ -561,6 +561,61 @@
         "mfaRequired": "Le basculement du coupe-circuit IA nécessite l'authentification multifacteur. Activez la MFA dans les paramètres de sécurité de votre profil, puis réessayez."
       }
     },
+    "wisp": {
+      "title": "Wisp",
+      "description": "Vue d'ensemble par partenaire des autorisations Wisp et de l'activité du jour. Lecture seule.",
+      "refresh": "Actualiser",
+      "retry": "Réessayer",
+      "loading": "Chargement...",
+      "empty": "Aucun partenaire n'a encore d'autorisation Wisp",
+      "disabled": "Wisp n'est pas activé sur ce déploiement (BREEZE_WISP_ENABLED).",
+      "errors": {
+        "load": "Impossible de charger la vue d'ensemble de Wisp"
+      },
+      "platformAdmin": {
+        "title": "Réservé aux administrateurs de la plateforme",
+        "description": "La vue d'ensemble de Wisp est réservée aux administrateurs de la plateforme."
+      },
+      "table": {
+        "partner": "Partenaire",
+        "plan": "Offre",
+        "activeGrants": "Autorisations actives",
+        "pausedGrants": "Autorisations en pause",
+        "assessmentsToday": "Vérifications du jour",
+        "specialistRequestsToday": "Demandes de spécialistes aujourd'hui",
+        "openConcerns": "Préoccupations ouvertes",
+        "budgetExhaustedToday": "Autorisations sans budget aujourd'hui"
+      },
+      "grants": {
+        "loading": "Chargement des autorisations...",
+        "error": "Impossible de charger les autorisations",
+        "empty": "Ce partenaire n'a aucune autorisation",
+        "grantor": "Autorisant",
+        "scope": "Portée",
+        "status": "Statut",
+        "pausedReason": "Motif de la pause",
+        "expires": "Expire",
+        "budget": "Budget (cents/jour)",
+        "tickMinutes": "Intervalle (min)",
+        "assessmentsToday": "Vérifications du jour",
+        "partnerWide": "Tout le partenaire"
+      },
+      "status": {
+        "active": "Active",
+        "paused": "En pause",
+        "revoked": "Révoquée",
+        "expired": "Expirée"
+      },
+      "pausedReason": {
+        "budget_exhausted": "Budget épuisé",
+        "grantor_suspended": "Autorisant suspendu",
+        "grantor_access_lost": "L'autorisant a perdu l'accès",
+        "factor_expired": "Facteur expiré",
+        "entitlement_lost": "Droit perdu",
+        "user_paused": "Mise en pause par l'utilisateur",
+        "partner_disabled": "Partenaire désactivé"
+      }
+    },
     "systemPage": {
       "title": "Système",
       "description": "État de l'ensemble du déploiement pour les administrateurs de plateforme. Cette page est en lecture seule.",
@@ -616,7 +671,55 @@
           "observability": "Observabilité",
           "security-abuse": "Sécurité et abus",
           "integrations": "Intégrations"
+        },
+        "probe": {
+          "checkNow": "Vérifier maintenant",
+          "checking": "Vérification…",
+          "failed": "Impossible d'exécuter la vérification de l'exécuteur.",
+          "notConfigured": "L'URL de l'exécuteur n'est pas définie.",
+          "reachable": "Joignable · {{ms}} ms",
+          "unreachable": "Injoignable",
+          "route": "Route /v1/{{route}} : {{state}}",
+          "version": "Version {{version}} (commit {{sha}})",
+          "versionMismatch": "La version {{version}} ({{sha}}) diffère de cette API",
+          "versionUnavailable": "Version non communiquée (build plus ancien)",
+          "state": {
+            "present": "Présente",
+            "missing": "Absente",
+            "unknown": "Inconnue"
+          }
         }
+      },
+      "connectionHealthJobs": {
+        "title": "Tâches de fond de l’état des connexions",
+        "description": "Indique si les tâches qui surveillent l’état des connexions sont en cours d’exécution. Vérifié via les signaux de vie dans Redis.",
+        "jobs": {
+          "reconcile": {
+            "label": "Réconciliateur d’incidents",
+            "description": "Ouvre et résout les incidents de connexion toutes les 15 minutes."
+          },
+          "digest": {
+            "label": "E-mail de synthèse quotidien",
+            "description": "Envoie la synthèse de l’état des connexions ; s’exécute toutes les heures."
+          }
+        },
+        "state": {
+          "ok": "Normal",
+          "stale": "Obsolète",
+          "missing": "Aucun signal de vie",
+          "failing": "En échec"
+        },
+        "lastRun": "Dernière exécution {{relative}}",
+        "neverRun": "Aucun signal de vie enregistré",
+        "kindsHeading": "Sources surveillées",
+        "lastOk": "Dernier succès {{relative}}",
+        "neverOk": "Jamais réussi",
+        "failureStreak": "Échecs consécutifs : {{count}}",
+        "redisUnavailable": "L’état des tâches est illisible, car Redis est indisponible. Cela ne signifie pas que les tâches sont arrêtées.",
+        "errors": {
+          "load": "Impossible de charger l’état des tâches."
+        },
+        "retry": "Réessayer"
       }
     },
     "aiModels": {
@@ -743,6 +846,7 @@
       "agent.eventlogs.submit": "Journaux d’événements signalés",
       "agent.reliability.submit": "Fiabilité signalée",
       "agent.command.result.submit": "Résultat de commande soumis",
+      "agent.command.*": "Commande mise en file : {command}",
       "agent.filesystem.threshold_scan.queued": "Analyse du système de fichiers mise en file",
       "agent.enroll": "Agent inscrit",
       "api.fallback.post": "Soumis : {target}",
@@ -755,11 +859,14 @@
       "session_offer_submitted": "Offre de session soumise",
       "session_consent_granted": "Consentement à la session à distance accordé",
       "session_consent_denied": "Session à distance refusée par l'utilisateur",
+      "remote.session.ended_by_user": "Session à distance terminée par l'utilisateur",
       "session_consent_blocked_unanswered": "Session à distance bloquée : demande de consentement sans réponse",
       "session_consent_blocked_unavailable": "Session à distance bloquée : demande de consentement indisponible",
       "session_consent_bypassed": "Session à distance démarrée sans réponse à la demande de consentement",
       "screen_access_consent_blocked": "Accès à l'écran bloqué : l'appareil exige le consentement de l'utilisateur",
       "device.wake_on_lan": "Wake-on-LAN envoyé",
+      "device.recovery_key.reveal": "Clé de récupération révélée",
+      "device.recovery_key.rotate": "Clé de récupération renouvelée",
       "device.create": "Appareil ajouté",
       "device.update": "Appareil mis à jour",
       "device.delete": "Appareil supprimé",
@@ -778,7 +885,23 @@
       "enrollment_key.revoke": "Clé d’inscription révoquée",
       "partner.settings.update": "Paramètres du partenaire mis à jour",
       "ai.message.send": "Message d’IA envoyé",
+      "backup.restore.create": "Restauration démarrée",
+      "backup.restore.cancel": "Restauration annulée",
+      "backup.restore.unattested_override": "Restauration d’un instantané non vérifié confirmée",
       "ai.tool_approval.update": "Approbation d’outil d’IA mise à jour",
+      "ai.tool.*": "Outil d’IA : {tool}",
+      "ai.session.create": "Conversation Breeze AI démarrée",
+      "ai.session.close": "Conversation Breeze AI fermée",
+      "ai.session.flag": "Conversation Breeze AI signalée",
+      "ai.session.unflag": "Signalement de la conversation Breeze AI retiré",
+      "ai.message.interrupt": "Réponse de l’IA arrêtée",
+      "ai.command.executed": "L’IA a exécuté une commande",
+      "ai.script.executed": "L’IA a exécuté un script",
+      "ai.external_tool.call": "L’IA a appelé un outil externe",
+      "ai.plan_approval.update": "Approbation du plan IA mise à jour",
+      "ai.plan.abort": "Plan IA abandonné",
+      "ai.security.prompt_injection_detected": "IA : injection de prompt détectée",
+      "ai.budget.update": "Budget IA mis à jour",
       "mcp.initialize": "MCP : initialiser",
       "mcp.notifications.initialized": "MCP : notifications initialisées",
       "mcp.tools.list": "MCP : lister les outils",
@@ -786,6 +909,7 @@
       "mcp.resources.list": "MCP : lister les ressources",
       "terminal.session.summary": "Résumé de session de terminal",
       "script.run": "Script exécuté",
+      "script.execute": "Script exécuté sur l’appareil",
       "script.create": "Script créé",
       "script.update": "Script mis à jour",
       "script.delete": "Script supprimé",
@@ -869,6 +993,7 @@
       "changesSnapshot": "Instantané des changements",
       "before": "Avant",
       "after": "Après",
+      "noFieldChanges": "Aucune modification de champ n’a été enregistrée pour cette action.",
       "userInfo": "Informations utilisateur",
       "requestMetadata": "Métadonnées de demande",
       "fields": {

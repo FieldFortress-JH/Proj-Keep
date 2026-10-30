@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { McpGrantableDomain } from '@breeze/shared';
 import { fetchWithAuth } from '../../stores/auth';
+import McpDomainPicker, { isMcpDomainSelectionValid } from '../shared/McpDomainPicker';
 // Initializes the shared i18next singleton. This page's layout has no Sidebar
 // (which is what pulls i18n in elsewhere), so without this every t() call here
 // renders its raw key.
@@ -30,6 +32,14 @@ interface InteractionDetails {
     // origin. Empty strings signal missing metadata → fail-closed render.
     redirect_uri: string;
     redirect_origin: string;
+    // B-W03 (#6157): 'metadata_document' = the client_id is an https URL whose
+    // host publishes the app's details (CIMD). That host is NOT a verified
+    // identity — the integration stays labelled unverified. Optional so an
+    // older API that omits them renders as before.
+    registration?: 'metadata_document' | 'dynamic';
+    client_id_host?: string | null;
+    redirect_host?: string;
+    localhost_redirect?: boolean;
   };
   scopes: string[];
   resource: string | null;
@@ -101,6 +111,8 @@ export default function ConsentForm({ uid }: ConsentFormProps) {
   const { t } = useTranslation('common');
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
   const [partnerId, setPartnerId] = useState<string>('');
+  // null = every tool; a restricted list is posted as `mcp_domains` (#6156).
+  const [mcpDomains, setMcpDomains] = useState<McpGrantableDomain[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -156,7 +168,7 @@ export default function ConsentForm({ uid }: ConsentFormProps) {
     try {
       const res = await fetchWithAuth(`/oauth/interaction/${encodeURIComponent(uid)}/consent`, {
         method: 'POST',
-        body: JSON.stringify({ partner_id: partnerId, approve }),
+        body: JSON.stringify({ partner_id: partnerId, approve, mcp_domains: approve ? mcpDomains : null }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -250,6 +262,7 @@ export default function ConsentForm({ uid }: ConsentFormProps) {
   const selectedPartnerScopes = selectedPartner?.effectiveScopes ?? details.scopes;
 
   const displayName = details.client.display_name?.trim() || details.client.client_id;
+  const isMetadataDocument = details.client.registration === 'metadata_document';
   const showClientIdSubtitle = displayName !== details.client.client_id;
 
   // MCP-OAUTH-08: fail closed if we can't show the user where the
@@ -275,9 +288,33 @@ export default function ConsentForm({ uid }: ConsentFormProps) {
     >
       <UnverifiedNotice />
 
+      {isMetadataDocument && details.client.client_id_host && (
+        <p data-testid="oauth-metadata-host" className="text-xs text-muted-foreground break-all">
+          {t('longTail.oauth.ConsentForm.metadataHostedAt', { host: details.client.client_id_host })}
+        </p>
+      )}
+
       <CallbackDestination origin={redirectOrigin} />
 
+      {isMetadataDocument && details.client.localhost_redirect === true && (
+        <div
+          data-testid="oauth-localhost-warning"
+          role="alert"
+          className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-300"
+        >
+          {t('longTail.oauth.ConsentForm.localhostRedirectWarning')}
+        </div>
+      )}
+
       <ScopeList scopes={selectedPartnerScopes} />
+
+      <McpDomainPicker
+        idPrefix="consent"
+        variant="consent"
+        value={mcpDomains}
+        onChange={setMcpDomains}
+        disabled={submitting}
+      />
 
       {details.partners.length > 1 && (
         <TenantPicker
@@ -292,7 +329,7 @@ export default function ConsentForm({ uid }: ConsentFormProps) {
         <button
           type="button"
           onClick={() => submit(true)}
-          disabled={submitting || !partnerId}
+          disabled={submitting || !partnerId || !isMcpDomainSelectionValid(mcpDomains)}
           className="inline-flex h-10 flex-1 items-center justify-center rounded-md bg-emerald-600 px-4 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {submitting ? t('longTail.oauth.ConsentForm.approving') : t('longTail.oauth.ConsentForm.approve')}

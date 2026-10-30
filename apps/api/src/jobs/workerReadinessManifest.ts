@@ -32,6 +32,7 @@ export type WorkerInitializerClassification =
         | 'topologyDiagnosticSweeper'
         | 'topologyMonitoringWorker'
         | 'topologyTelemetryMaintenance'
+        | 'topologyPresenceWorker'
         | 'incidentCorrelationWorker'
         | 'incidentTimelineEnricher'
         | 'incidentSlaMonitor';
@@ -58,6 +59,8 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('fleetFindingsWorker'),
   consumers('fleetRemediationDispatchWorker'),
   consumers('mlOutputRetention'),
+  consumers('aiToolOutputRetention'),
+  consumers('aiTranscriptSweeper'),
   consumers('offlineDetector'),
   consumers('notificationDispatcher'),
   // #5306 — daily MFA enrolment grace notices. Plain Redis-required consumer:
@@ -76,6 +79,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('cisJobs'),
   consumers('automationWorker'),
   consumers('securityPostureWorker'),
+  consumers('trustPageSnapshotWorker'),
   consumers('reliabilityWorker'),
   consumers('userRiskWorker'),
   consumers('abuseSignalsWorker', ['abuseSignalsWorker'], 'abuse_or_partner_trust_enabled'),
@@ -89,6 +93,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // One Worker, no flag gate; attaches under 'helperScreenshotRetention',
   // which differs from its registry key.
   consumers('helperScreenshotRetentionWorker', ['helperScreenshotRetention']),
+  consumers('endpointMessageRetention'),
   consumers('ipHistoryRetention'),
   consumers('reliabilityRetention'),
   consumers('processSampleRetention'),
@@ -99,6 +104,12 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // Disk Cleanup v2 W03. Plain Redis-required consumer: it constructs and
   // attaches unconditionally wherever it is placed, with no feature flag.
   consumers('filesystemCleanupRunRetention'),
+  // #8581. Plain Redis-required consumer, no feature flag.
+  consumers('restorePointAttemptRetention'),
+  // #9128. Plain Redis-required consumer, no feature flag.
+  consumers('webhookDeliveryRetention'),
+  // #10019/#10020. Plain Redis-required consumer, no feature flag.
+  consumers('dnsSecurityRetention'),
   consumers('oauthCleanup'),
   consumers('stripeAccountCacheRefresh'),
   consumers('exchangeRateSync'),
@@ -107,11 +118,14 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('authEmailWorker'),
   consumers('quoteSendWorker'),
   consumers('enrollmentKeyCleanup'),
+  consumers('migrationWindowSweep'),
   consumers('partnerApiIdempotencyRetention'),
   consumers('quickSupportReaper'),
+  consumers('wispGrantReconciler'),
   consumers('softwareUploadSessionCleanup'),
   consumers('softwareRemediationRequestCleanup'),
   consumers('auditRetention'),
+  consumers('pamEvidenceRetention'),
   consumers('auditChainVerify', ['auditChainVerify'], 'audit_chain_verify_enabled'),
   consumers('auditChainAnchor'),
   consumers('tenantErasure'),
@@ -128,6 +142,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   { kind: 'non_consumer', initializer: 'topologyDiagnosticSweeper' },
   { kind: 'non_consumer', initializer: 'topologyMonitoringWorker' },
   { kind: 'non_consumer', initializer: 'topologyTelemetryMaintenance' },
+  { kind: 'non_consumer', initializer: 'topologyPresenceWorker' },
   consumers('networkBaselineWorker'),
   consumers('snmpWorker'),
   consumers('monitorWorker'),
@@ -146,6 +161,8 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('huntressSyncWorker'),
   consumers('backupProviderSyncWorker'),
   consumers('edrProviderSyncWorker'),
+  // #6960 W03 — security agent coverage reconciliation; one Worker, no flag gate.
+  consumers('securityAgentCoverageWorker'),
   // The Worker is constructed unconditionally and attached unconditionally;
   // M365_TENANT_SYNC_ENABLED gates the TICK registration and the processor
   // body, not the construction. A flag-gated construction would need its own
@@ -154,6 +171,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('m365SyncWorker'),
   consumers('pax8SyncWorker'),
   consumers('aiModelDiscoveryWorker'),
+  consumers('imageCurrencyWorker'),
   consumers('tdSynnexSftpSyncWorker'),
   consumers('logForwardingWorker'),
   consumers('patchJobWorker', ['patchJobWorker', 'patchJobDeviceWorker']),
@@ -194,12 +212,19 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('stripeReconcileSweep'),
   consumers('stripeSessionRevocationSweep'),
   consumers('quoteExpiryReaper'),
+  consumers('agreementRequestExpiryReaper'),
+  // #9075 W4a: automatic agreement-request reminders.
+  consumers('agreementRequestAutoReminder'),
   consumers('suppressionExpiryReaper'),
   consumers('ticketNotifyWorker'),
   // Caller verification (#6354 W01) — post-commit effects publisher; one
   // consumer named for its initializer, Redis-required like its neighbours.
   consumers('callerVerificationPublisher'),
+  // W02: workstation decision repair (terminal results + late rejections).
+  consumers('callerVerificationReconciliation'),
   consumers('ticketSlaWorker'),
+  // #8973 W4: business-calendar holiday recompute (one-shot jobs).
+  consumers('businessCalendarRecomputeWorker'),
   consumers('inboundEmailWorker'),
   consumers('gmailMarkHandledWorker'),
   consumers('ticketMailboxPollWorker'),
@@ -227,9 +252,14 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('metricAnomalyIncidentPublisher'),
   consumers('aiUnattendedExposureRetention'),
   consumers('aiInvocationRetention'),
+  consumers('llmEgressRetention'),
   consumers('aiChargebackWorker'),
   consumers('alertVerdictScheduler'),
   consumers('aiAgentSweepScheduler'),
+  // Wisp W05b (#9917): one Worker constructed and attached unconditionally
+  // under its registry-key name; the Wisp flag is read inside the tick and
+  // the assess job, not before construction — plain-required (`redis`).
+  consumers('wispWakeScheduler'),
   // Task 8 merge-forward (origin/main fcd5b498a): three more `global` registry
   // entries, each constructing one Worker and attaching unconditionally (no
   // flag gate before the attach — aiAgentImpactRollup reads
@@ -264,14 +294,27 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // accountingReconcileWorker likewise reads no integrations flag — its
   // per-connection gating happens inside the sweep job, at job time.
   consumers('aiBudgetAlertDeliveryWorker', ['ai-budget-alert-delivery']),
+  // Connection health W1 (#8845) — one Worker, no flag gate, constructed and
+  // attached unconditionally under CONNECTION_HEALTH_QUEUE, which differs from
+  // the registry key.
+  consumers('connectionHealthReconcileWorker', ['connection-health-reconcile']),
+  consumers('connectionHealthDigestWorker', ['connection-health-digest']),
   consumers('ticketOutboxRetention'),
   consumers('intentOutboxRetention'),
   consumers('metricAnomalyIncidentRetention'),
+  // Wisp W05b (#9917): daily concern retention — same shape (one Worker, no
+  // flag gate before construction, attached under its registry-key name).
+  consumers('wispConcernRetention'),
+  // Wisp W06a (#9912): 15-minute nudge digest + morning brief — same shape
+  // (one Worker constructed and attached unconditionally; flag read per run).
+  consumers('wispNudgeDigest'),
   // #5290 (W03) — daily monitor breach-episode retention prune, same shape as
   // mlOutputRetention/metricAnomalyIncidentRetention/agentLogRetention: one
   // Worker, no flag gate, constructs and attaches unconditionally under its
   // own registry-key name.
   consumers('monitorEpisodeRetention'),
+  // #8164 W02 — one Worker, unconditional, attached under its registry name.
+  consumers('edrDetectionRetentionWorker'),
   // #4248 W03 — one Worker, unconditional, attached under its registry name.
   consumers('reportRunDeliveryReconciler'),
   consumers('accountingReconcileWorker'),
@@ -288,7 +331,11 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // under its registry name.
   consumers('parkedDeviceExpiry'),
   consumers('parkedDevicePurge'),
+  // #8318 wave 1b — reinstall reattach: the per-minute intent expiry sweep.
+  // One Worker, unconditional, attached under its registry name.
+  consumers('deviceReattachIntentSweep'),
   consumers('deviceGroupJobs', ['deviceGroupReevaluationWorker']),
+  consumers('partnerGroupEvaluationJobs', ['partnerGroupEvaluationWorker', 'partnerGroupSweepWorker']),
   // Started outside WORKER_REGISTRY, role-gated in index.ts / worker.ts.
   // D3a: the dispatch consumer is constructed only when EVENT_DISPATCH_MODE is
   // on (or an off-mode backlog remains — that drain then attaches as
@@ -309,6 +356,14 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // TOOL_SOURCES_ENABLED gates the job PROCESSOR body (discoverSource is
   // skipped), not whether the Worker itself constructs and attaches.
   consumers('toolSourceDiscoveryWorker'),
+  // Tool catalog W04 (#5219), Task A8 — each constructs and attaches one
+  // Worker unconditionally under its registry name (FLOWS_ENABLED gates
+  // what a slice does, not whether the Worker exists).
+  consumers('flowRunner'),
+  consumers('flowRunReconciler'),
+  consumers('flowRunRetention'),
+  // Task A9 — the schedule trigger tick (FLOWS_ENABLED gates the tick body).
+  consumers('flowScheduleTick'),
   // Partner sending domains W03. initializeSendingDomainsWorker returns before
   // constructing a Worker when EMAIL_DOMAINS_PROVIDER is unset — the default on
   // every self-hosted install and on hosted until W05 — so a plain-required row

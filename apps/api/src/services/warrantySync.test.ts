@@ -16,7 +16,11 @@ vi.mock('../db', () => ({
 }));
 
 vi.mock('../db/schema', () => ({
-  deviceWarranty: { deviceId: 'deviceWarranty.deviceId' },
+  deviceWarranty: {
+    deviceId: 'deviceWarranty.deviceId',
+    dataSource: 'deviceWarranty.dataSource',
+    warrantyEndDate: 'deviceWarranty.warrantyEndDate',
+  },
   deviceHardware: {
     deviceId: 'deviceHardware.deviceId',
     serialNumber: 'deviceHardware.serialNumber',
@@ -283,5 +287,380 @@ describe('vendor ship date → purchase date (Hardware Lifecycle)', () => {
     expect(compiled.sql).toContain("IS DISTINCT FROM 'manual'");
     expect(compiled.params).toContain('manualAssets.purchaseDateSource');
     expect(compiled.params).toContain('ma-1');
+  });
+});
+
+describe('upsertAgentWarranty entitlement provider (#5511 W01, defect 1)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("labels an HP CMSL entitlement 'hp', not 'apple'", async () => {
+    const { values, onConflictDoUpdate } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_cmsl',
+      manufacturer: 'HP',
+      serialNumber: 'HP-SERIAL-1',
+      coverageEndDate: inDays(400),
+      coverageStartDate: inDays(-100),
+      coverageType: 'HP 3y Next Business Day Onsite',
+    });
+
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entitlements: [expect.objectContaining({ provider: 'hp' })],
+      }),
+    );
+    // The UPDATE arm carries the same value — a fix applied to only one of the
+    // two would mislabel every row after the first report.
+    expect(onConflictDoUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        set: expect.objectContaining({
+          entitlements: [expect.objectContaining({ provider: 'hp' })],
+        }),
+      }),
+    );
+  });
+
+  it("still labels a macOS plist entitlement 'apple'", async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_plist',
+      manufacturer: 'Apple',
+      serialNumber: 'APPLE-SERIAL-1',
+      coverageEndDate: inDays(400),
+      coverageStartDate: inDays(-100),
+      coverageType: 'AppleCare+',
+    });
+
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entitlements: [expect.objectContaining({ provider: 'apple' })],
+      }),
+    );
+  });
+
+  it('synthesises no entitlement at all when the vendor cannot be attributed', async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_future',
+      manufacturer: 'Acme Whitebox',
+      serialNumber: 'ACME-1',
+      coverageEndDate: inDays(400),
+      coverageStartDate: inDays(-100),
+      coverageType: 'Some coverage',
+    });
+
+    // A mislabelled entitlement is worse than a missing one: everything
+    // downstream reads entitlements[].provider as ground truth.
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ entitlements: [] }));
+  });
+});
+
+describe('upsertAgentWarranty entitlements array (#5511 W01, D10)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("stores every reported entitlement, each stamped with the derived provider", async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_cmsl',
+      manufacturer: 'HP',
+      serialNumber: 'HP-SERIAL-1',
+      coverageStartDate: '2024-03-01',
+      coverageEndDate: '2027-02-28',
+      coverageType: 'HP 3y Next Business Day Onsite',
+      entitlements: [
+        { serviceLevelDescription: 'HP 3y NBD Onsite', entitlementType: 'Hardware Support', startDate: '2024-03-01', endDate: '2027-02-28' },
+        { serviceLevelDescription: 'HP Pickup and Return', entitlementType: 'Hardware Support', startDate: '2024-03-01', endDate: '2026-02-28' },
+      ],
+    });
+
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entitlements: [
+          { provider: 'hp', serviceLevelDescription: 'HP 3y NBD Onsite', entitlementType: 'Hardware Support', startDate: '2024-03-01', endDate: '2027-02-28' },
+          { provider: 'hp', serviceLevelDescription: 'HP Pickup and Return', entitlementType: 'Hardware Support', startDate: '2024-03-01', endDate: '2026-02-28' },
+        ],
+      }),
+    );
+  });
+
+  it('preserves HP dates rather than re-deriving them from the coverage window', async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_cmsl',
+      manufacturer: 'HP',
+      serialNumber: 'HP-SERIAL-2',
+      coverageStartDate: '2024-03-01',
+      coverageEndDate: '2027-02-28',
+      coverageType: 'HP 3y Next Business Day Onsite',
+      entitlements: [{ entitlementType: 'Battery', startDate: '2024-03-01', endDate: '2025-03-01' }],
+    });
+
+    const written = values.mock.calls[0]![0] as { entitlements: Array<{ endDate: string }> };
+    expect(written.entitlements[0]!.endDate).toBe('2025-03-01');
+  });
+
+  it('re-slices to the bound so a non-HTTP caller cannot bypass the schema', async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_cmsl',
+      manufacturer: 'HP',
+      serialNumber: 'HP-SERIAL-3',
+      coverageStartDate: '2024-03-01',
+      coverageEndDate: '2027-02-28',
+      coverageType: 'x',
+      entitlements: Array.from({ length: 40 }, (_, i) => ({ entitlementType: `e${i}` })),
+    });
+
+    const written = values.mock.calls[0]![0] as { entitlements: unknown[] };
+    expect(written.entitlements).toHaveLength(25);
+  });
+
+  it('falls back to the single synthesised window when the collector reports none', async () => {
+    const { values } = captureUpsert();
+
+    await upsertAgentWarranty(DEVICE_ID, ORG_ID, {
+      source: 'agent_plist',
+      manufacturer: 'Apple',
+      serialNumber: 'APPLE-1',
+      coverageStartDate: '2024-01-01',
+      coverageEndDate: '2027-01-01',
+      coverageType: 'AppleCare+',
+      entitlements: null,
+    });
+
+    expect(values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entitlements: [expect.objectContaining({ provider: 'apple', entitlementType: 'AppleCare+' })],
+      }),
+    );
+  });
+});
+
+describe('server upsert never overwrites an agent-owned row (#5511 W01 review: TOCTOU)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('guards the device-subject write in SQL, NULL-safe, with both agent sources', async () => {
+    const { onConflictDoUpdate } = captureUpsert();
+    providerMock.mockReturnValue({
+      lookup: vi.fn().mockResolvedValue(new Map([['SN1', {
+        found: true, entitlements: [], warrantyStartDate: '2024-01-10', warrantyEndDate: inDays(400),
+      }]])),
+    });
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: { kind: 'device', deviceId: DEVICE_ID } });
+
+    const setWhere = onConflictDoUpdate.mock.calls[0]![0].setWhere;
+    expect(setWhere).toBeDefined();
+    const compiled = compileWhere(setWhere);
+    expect(compiled.sql).toContain('is null');
+    expect(compiled.sql).toContain('not in');
+    expect(compiled.params).toEqual(expect.arrayContaining(['agent_plist', 'agent_cmsl']));
+  });
+});
+
+describe('a sync with nothing better never erases imported or agent data (#9862)', () => {
+  /** Queue the advisory `device_warranty` read(s) syncWarrantyForSubject issues. */
+  function queueReads(...results: unknown[][]) {
+    const queue = [...results];
+    selectMock.mockImplementation(() => ({
+      from: () => ({ where: () => ({ limit: () => Promise.resolve(queue.shift() ?? []) }) }),
+    }));
+  }
+
+  const DEVICE = { kind: 'device' as const, deviceId: DEVICE_ID };
+  const IMPORTED = [{ dataSource: 'import' }];
+
+  function vendorAnswers(result: Record<string, unknown>) {
+    providerMock.mockReturnValue({ lookup: vi.fn().mockResolvedValue(new Map([['SN1', result]])) });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    selectMock.mockReset();
+    providerMock.mockReset();
+  });
+
+  it('no provider: keeps an imported row — no upsert, dates untouched, lastSyncAt not stamped', async () => {
+    providerMock.mockReturnValue(null);
+    queueReads(IMPORTED);
+    captureUpsert();
+    const { set, where } = captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Acme', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(set).toHaveBeenCalledTimes(1);
+    // The bookkeeping UPDATE is scoped to this one device's row.
+    expect(where).toHaveBeenCalledTimes(1);
+    const target = compileWhere(where.mock.calls[0]![0]);
+    expect(target.params).toEqual(['deviceWarranty.deviceId', DEVICE_ID]);
+    const patch = set.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch).toMatchObject({ lastSyncError: null });
+    expect(patch.nextSyncAt).toBeInstanceOf(Date);
+    // Nothing was fetched: the card polls lastSyncAt to detect a completed lookup.
+    expect(patch).not.toHaveProperty('lastSyncAt');
+    for (const key of ['warrantyStartDate', 'warrantyEndDate', 'status', 'dataSource', 'entitlements']) {
+      expect(patch).not.toHaveProperty(key);
+    }
+  });
+
+  it('no provider and no row: still records an unknown provider row (unchanged)', async () => {
+    providerMock.mockReturnValue(null);
+    queueReads([]);
+    const { values } = captureUpsert();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Acme', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ status: 'unknown', dataSource: 'provider' }));
+  });
+
+  it('vendor miss: keeps an imported row and stamps the check', async () => {
+    vendorAnswers({ found: false, entitlements: [], warrantyStartDate: null, warrantyEndDate: null });
+    queueReads(IMPORTED);
+    captureUpsert();
+    const { set } = captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(insertMock).not.toHaveBeenCalled();
+    const patch = set.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch).toMatchObject({ lastSyncError: null });
+    expect(patch.lastSyncAt).toBeInstanceOf(Date);
+    expect(patch).not.toHaveProperty('warrantyEndDate');
+    expect(patch).not.toHaveProperty('dataSource');
+  });
+
+  it('vendor miss on an agent-owned row: keeps it and stamps the check (was a silent no-op before)', async () => {
+    vendorAnswers({ found: false, entitlements: [], warrantyStartDate: null, warrantyEndDate: null });
+    queueReads([{ dataSource: 'agent_plist' }]);
+    captureUpsert();
+    const { set } = captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(insertMock).not.toHaveBeenCalled();
+    const patch = set.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch.lastSyncAt).toBeInstanceOf(Date);
+    for (const key of ['warrantyStartDate', 'warrantyEndDate', 'status', 'dataSource', 'entitlements']) {
+      expect(patch).not.toHaveProperty(key);
+    }
+  });
+
+  it('vendor lookup error: keeps an imported row and records the error', async () => {
+    providerMock.mockReturnValue({ lookup: vi.fn().mockRejectedValue(new Error('vendor 503')) });
+    queueReads(IMPORTED);
+    captureUpsert();
+    const { set } = captureUpdate();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+    errSpy.mockRestore();
+
+    expect(insertMock).not.toHaveBeenCalled();
+    const patch = set.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch).toMatchObject({ lastSyncError: 'vendor 503' });
+    expect(patch.lastSyncAt).toBeInstanceOf(Date);
+    expect(patch).not.toHaveProperty('warrantyEndDate');
+  });
+
+  const VENDOR_BASE = {
+    provider: 'dell', serviceLevelDescription: 'Basic Hardware Service', entitlementType: 'INITIAL',
+    startDate: '2023-03-31', endDate: '2026-03-31',
+  };
+
+  it('vendor hit ending EARLIER than an import: keeps the import, records the vendor answer', async () => {
+    // An MSP imported an extended Care Pack to 2028; the OEM API only knows
+    // the base warranty to 2026. The vendor answer must not shorten coverage.
+    vendorAnswers({ found: true, entitlements: [VENDOR_BASE], warrantyStartDate: '2023-03-31', warrantyEndDate: '2026-03-31' });
+    queueReads([{ dataSource: 'import', warrantyEndDate: '2028-06-30' }]);
+    captureUpsert();
+    const { set, where } = captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(set).toHaveBeenCalledTimes(1);
+    const patch = set.mock.calls[0]![0] as Record<string, unknown>;
+    // The vendor's own entitlements are recorded beside the imported dates,
+    // so the card can say the vendor reports an earlier end.
+    expect(patch).toMatchObject({ entitlements: [VENDOR_BASE], lastSyncError: null });
+    expect(patch.lastSyncAt).toBeInstanceOf(Date);
+    for (const key of ['warrantyStartDate', 'warrantyEndDate', 'status', 'dataSource']) {
+      expect(patch).not.toHaveProperty(key);
+    }
+    // Scoped to this device, and only while the row is still the import it read.
+    const target = compileWhere(where.mock.calls[0]![0]);
+    expect(target.params).toEqual(expect.arrayContaining(['deviceWarranty.deviceId', DEVICE_ID, 'deviceWarranty.dataSource', 'import']));
+    // Alerts run against the row, which still holds the imported (effective) end date.
+    expect(evaluateWarrantyAlertsMock).toHaveBeenCalledWith(DEVICE_ID);
+  });
+
+  it('vendor hit with NO end date over an import: keeps the import', async () => {
+    vendorAnswers({ found: true, entitlements: [], warrantyStartDate: null, warrantyEndDate: null });
+    queueReads([{ dataSource: 'import', warrantyEndDate: '2028-06-30' }]);
+    captureUpsert();
+    captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('vendor hit ending LATER than an import: the vendor wins', async () => {
+    vendorAnswers({ found: true, entitlements: [], warrantyStartDate: '2024-01-10', warrantyEndDate: '2030-01-31' });
+    queueReads([{ dataSource: 'import', warrantyEndDate: '2028-06-30' }]);
+    const { values, onConflictDoUpdate } = captureUpsert();
+    const { set } = captureUpdate();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(set).not.toHaveBeenCalled();
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'active', dataSource: 'provider', warrantyEndDate: '2030-01-31',
+    }));
+    // The SQL guard repeats the rule: a non-vendor row is only replaced while
+    // its end date is NULL or not after the vendor's.
+    const compiled = compileWhere(onConflictDoUpdate.mock.calls[0]![0].setWhere);
+    expect(compiled.params).toEqual(expect.arrayContaining(['deviceWarranty.warrantyEndDate', '2030-01-31']));
+    expect(compiled.sql).toContain('<=');
+  });
+
+  it('vendor hit ending on the SAME day as an import: the vendor wins (nothing is lost)', async () => {
+    vendorAnswers({ found: true, entitlements: [], warrantyStartDate: '2024-01-10', warrantyEndDate: '2028-06-30' });
+    queueReads([{ dataSource: 'import', warrantyEndDate: '2028-06-30' }]);
+    const { values } = captureUpsert();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ dataSource: 'provider', warrantyEndDate: '2028-06-30' }));
+  });
+
+  it('vendor hit ending earlier than a PROVIDER row: the vendor still wins (it is correcting itself)', async () => {
+    vendorAnswers({ found: true, entitlements: [], warrantyStartDate: '2023-03-31', warrantyEndDate: '2026-03-31' });
+    queueReads([{ dataSource: 'provider', warrantyEndDate: '2028-06-30' }]);
+    const { values } = captureUpsert();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ dataSource: 'provider', warrantyEndDate: '2026-03-31' }));
+  });
+
+  it('vendor miss with no stored row: the unknown upsert is guarded in SQL against a non-vendor row landing first', async () => {
+    vendorAnswers({ found: false, entitlements: [], warrantyStartDate: null, warrantyEndDate: null });
+    queueReads([]);
+    const { onConflictDoUpdate } = captureUpsert();
+
+    await syncWarrantyForSubject({ orgId: ORG_ID, manufacturer: 'Dell', serialNumber: 'SN1', subject: DEVICE });
+
+    const compiled = compileWhere(onConflictDoUpdate.mock.calls[0]![0].setWhere);
+    expect(compiled.sql).toContain('is null');
+    expect(compiled.params).toEqual(expect.arrayContaining(['deviceWarranty.dataSource', 'provider']));
+    expect(compiled.params).not.toContain('agent_plist');
   });
 });

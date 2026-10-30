@@ -6,6 +6,7 @@
 
 import { z } from 'zod';
 import { pageZodShape } from './aiToolPagination';
+import { GENERATE_REPORT_TYPES } from './aiReportTypes';
 
 const uuid = z.string().guid();
 
@@ -52,8 +53,6 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
     deferUntil: z.string().datetime({ offset: true }).optional(),
     notes: z.string().max(1000).optional(),
     configPolicyId: uuid.optional(),
-    autoApprove: z.boolean().optional(),
-    autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).optional(),
     scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).optional(),
     scheduleTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
     rebootPolicy: z.enum(['if_required', 'always', 'never']).optional(),
@@ -186,7 +185,7 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
     action: z.enum(['list', 'generate', 'data', 'create', 'update', 'delete', 'history', 'download']),
     reportId: uuid.optional(),
     reportRunId: uuid.optional(),
-    reportType: z.enum(['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary']).optional(),
+    reportType: z.enum(GENERATE_REPORT_TYPES).optional(),
     name: z.string().min(1).max(255).optional(),
     config: z.record(z.string(), z.unknown()).optional(),
     schedule: z.enum(['one_time', 'daily', 'weekly', 'monthly']).optional(),

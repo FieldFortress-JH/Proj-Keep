@@ -13,7 +13,7 @@ The **Devices** page is the home view for every managed endpoint — servers, wo
 
 ### Columns
 
-The list shows a compact set of columns by default — hostname, class, organization, site, OS, role, status, CPU, RAM, and last seen. Many more columns are available but hidden until you enable them through the **column-visibility picker** in the list toolbar, including:
+The list shows a compact set of columns by default — hostname, class, organization, site, OS, role, status, **Attention** (v0.124.0: the device's open alerts by severity and open tickets, or **Nothing open**), CPU, RAM, and last seen. Many more columns are available but hidden until you enable them through the **Columns** chooser in the list toolbar (v0.124.0: type to filter the column list by name), including:
 
 - **OS version / OS build / architecture**
 - **Pending reboot** and **headless** indicators
@@ -44,10 +44,27 @@ Since v0.117.0 an **Updates withheld** badge appears next to the version when th
 
 Above the list you can:
 
-- **Search** by display name or hostname.
+- **Search** by display name, hostname, IP address, serial number, asset tag, or last logged-in user. Typing a user's name (for example `harry`) finds the PC they last signed in to.
 - Build **structured filters** with the filter toolbar — status, OS, role, organization, site, group, hardware attributes, and more, combinable into saved filter conditions.
 - Switch the **class facet** between All, Agent (endpoints running the Breeze agent), Network (devices found by network discovery), and Manual (hand-entered assets — see [Manual Assets](#manual-assets)). The list opens on **Agent** by default and remembers the last facet you chose.
 - Filter by **VPN** when the VPN column is enabled (see below).
+
+### Bulk power and lock actions
+
+Selecting several devices and choosing **Reboot**, **Reboot into safe mode**, **Shut down**, **Lock**, **Wake** or **End maintenance** from the bulk actions bar asks for confirmation first (v0.124.0). The dialog names the action and the device count, the organization (or how many organizations) the devices belong to, and splits the count into devices that are **online now** and devices that will be **queued for next check-in** — see [Queued Actions](#queued-actions).
+
+### Moving devices to another site
+
+To move devices between sites of the same organization, use **Move to site** (v0.125.0+):
+
+- **One device:** choose **Move to site** from the row's actions in the device list, or change the site on the device page.
+- **Several devices:** select them and choose **Move to site** from the bulk actions bar. You can move up to 100 devices at once, and they must all belong to one organization; the action is disabled, with the reason shown, when the selection spans organizations or is too large.
+
+Pick the target site and confirm with MFA. Each device is moved on its own, so one failure does not stop the others: the result says how many moved and names any that did not (a device already at that site is skipped, and one that was moved by someone else in the meantime is reported as a conflict). Each move is audited. Moving a device needs `devices:write` and access to both its current site and the target site. To move devices to a different organization, see [Moving a Device to Another Organization](#moving-a-device-to-another-organization).
+
+### Force reboot now
+
+**Force reboot now**, in the device page's **Power** menu, restarts the device immediately and closes running applications instead of waiting for them, so unsaved work is lost. Use it when an unattended device is stuck behind "this app is preventing shutdown". You type the hostname to confirm and pass an MFA check. It needs `devices:execute`, an online device and agent 0.125.0 or later, and it is not available as a bulk action or to API keys, MCP clients or the AI assistant. See [`force_reboot`](/agents/commands/#force_reboot).
 
 ---
 
@@ -122,7 +139,9 @@ A removed device's **Actions** menu offers two choices in place of Remove:
 - **Restore** -- returns the device to the active fleet and cancels any still-pending agent uninstall. A restored device counts toward the partner's device limit again, so Restore is refused with **Device limit reached** when the partner is already at its limit, the same as enrolling a new device. Quick Support devices and devices waiting in the holding area never count, so restoring one of those is not limited.
 - **Delete permanently** -- deletes the device record and every record that references it (open tickets are kept but detached from the device). This cannot be undone.
 
-From v0.118.0, **Delete permanently** (and the automatic purge below) is refused while the device has a backup snapshot under legal hold or inside its immutability window. Release the hold, or wait for the window to end, then try again.
+From v0.118.0, **Delete permanently** (and the automatic purge below) is refused while the device has a backup snapshot under legal hold or inside its immutability window. From v0.122.1, a legal hold set on the device's backup policy or on a configuration policy's backup settings blocks it too. Release the hold, or wait for the window to end, then try again.
+
+From v0.122.1, deleting a device permanently no longer removes its backup files from storage, even those past retention, so purging a device does not reclaim backup storage.
 
 Selecting several removed devices at once in the device list adds bulk equivalents: **Restore Selected** applies immediately, while **Delete Permanently…** asks you to type the device count to confirm, then runs as a background job (up to 500 devices per run) with a progress indicator -- deleting a large batch touches too many records to finish inside a single request.
 
@@ -154,6 +173,11 @@ If the device's tickets carry unbilled time or parts in a currency other than th
 
 The agent is disconnected and reconnects under the new organization within its normal heartbeat interval. The device page refreshes to the new organization and site. Two audit events are written, one in each organization's trail (`device.move_org.source` and `device.move_org.target`).
 
+From v0.122.1 the agent also picks up its new organization and site itself, through a signed identity update. When it applies the update, the agent restarts after a random delay of 0–60 seconds, first letting commands that are already running finish (it waits at most 5 minutes). Two cases keep the agent on the organization and site it enrolled with (the device record still moves):
+
+- **No deployment signing key.** The identity update is signed with the server's agent deployment signing key. The server creates one the first time it signs anything: registering its own agent binaries (`BINARY_SOURCE=local`), issuing an agent rollback directive, or approving a diagnostic file access grant. Until then (the usual state on the default `BINARY_SOURCE=github`) no identity update is sent, as before this release, and the API logs a one-time warning.
+- **Environment overrides.** An agent with `BREEZE_ORG_ID` or `BREEZE_SITE_ID` set in its environment cannot take the new identity.
+
 <Aside type="note">
 Moving is refused while durable PAM lifecycle evidence exists for the device, and while any of its tickets is pinned to a service deliverable. Both refusals leave the device untouched.
 </Aside>
@@ -183,6 +207,11 @@ Agents on Windows, macOS, and Linux detect active VPN and overlay-network client
 - **ZeroTier**
 - **OpenVPN**
 - **Cloudflare WARP**
+- **Zscaler** (Zscaler Client Connector)
+- **GlobalProtect**
+- **Cisco Secure Client** (including AnyConnect)
+- **FortiClient**
+- **Netskope**
 - A generic **VPN** fallback for active tunnel interfaces that don't match a known provider
 
 Detection works purely from **local signals on the device** — tunnel interface names and addresses, corroborated by the provider's running service or process. It is read-only telemetry: Breeze does not read keys, peer lists, or any VPN configuration, and cannot manage the VPN. For Tailscale, the device's own DNS name is also reported.
@@ -199,6 +228,14 @@ A provider is only ever reported when the device gives a concrete signal for it 
 <Aside type="note">
   A VPN whose client is not running at all is not reported. "Disconnected" means the client is running with no tunnel up, which is the state operators usually care about; a stopped client is indistinguishable from an uninstalled one without scanning the filesystem, which the agent deliberately does not do.
 </Aside>
+
+### Clients without a tunnel adapter
+
+Some security-service clients do not create a network adapter of their own. **Zscaler Client Connector on Windows** steers traffic through a filter driver bound to the existing Ethernet and Wi-Fi adapters, so there is normally no tunnel interface for the agent to see. Breeze can confirm the client is running, but not whether its tunnel is up, so on Windows Zscaler is usually shown as **Disconnected** (client running). Treat that state as "installed and running", not as proof the tunnel is down. Netskope may behave the same way.
+
+For Cisco Secure Client and FortiClient, only the VPN component counts: the Cisco VPN agent and the FortiClient SSL-VPN daemon. Their other modules (Cisco Umbrella, FortiClient antivirus and web filtering) are not reported as a VPN. Cisco's VPN agent is part of the core install, so a device running Cisco Secure Client only for Umbrella can still show **Cisco Secure Client — Disconnected**.
+
+On macOS, Zscaler's tunnel is a plain `utun` with no network-extension owner, so it is named by the single-running-client rule described below.
 
 ### Naming tunnels on macOS
 
@@ -285,6 +322,8 @@ The same data is available outside the UI:
 
 ## The Device Info Tab
 
+The device page header (v0.124.0) shows the display name once, with the hostname in the sub-line, and an **Offline · last seen …** pill when the device is not checking in; CPU and RAM read **—** while the device is offline or its last sample is stale. When the device belongs to an organization other than your working organization, the header says **Viewing a *Org* device** with a **Switch to *Org*** action that changes your working organization and keeps you on the record.
+
 Opening a device and selecting **Info** shows the device's identity and inventory at a glance:
 
 | Section | Contents |
@@ -296,9 +335,17 @@ Opening a device and selecting **Info** shows the device's identity and inventor
 | **Hardware Summary** | CPU model, cores/threads, RAM, disk, GPU, motherboard, BIOS version. |
 | **Power** | Battery and power status (portable devices only — see above). |
 | **VPN** | Active VPN/overlay clients (only when at least one is active — see above). |
-| **Agent** | Agent, watchdog and helper (Breeze Assist) versions, status, last seen, enrollment date, system uptime, logged-in user. A warning appears here when agent updates are withheld from the device. |
+| **Agent** | Agent, watchdog and helper (Breeze Assist) versions, status, last seen, enrollment date, system uptime, logged-in user. A warning appears here when agent updates are withheld from the device. A **Breeze Assist** row (v0.125.0+) reads **Installed**, **Not deployed**, or **Unavailable** with the reason; see [Breeze Assist availability](/agents/helper/#enabling--disabling-helper-chat). |
 | **Desktop Access** | macOS remote-desktop readiness (macOS devices only). |
 | **Tags** and **Custom Fields** | Organizational metadata, when present. |
+
+The device's **Overview** tab also has a **Responsible contacts** card: who to contact about this device for each role (billing, technical, escalation and so on), resolved from its device group, site or organization. See [Responsible contacts](/reference/organizations-and-sites/#responsible-contacts).
+
+The device **Overview** tab also has a **Physical placement** card (v0.125.0+) for the room, rack, rack unit and height (rack unit and height are whole numbers from 1 to 100). **Add** or **Edit** needs `devices:write` and an MFA check; clearing every field removes the placement. Discovered network assets have the same card on their detail page; an asset that is linked to a managed device shows the device's placement read-only, with a link to the device. The API is `GET`/`PUT`/`DELETE /devices/:id/placement` and `/discovery/assets/:id/placement`.
+
+### System Restore tab
+
+Separately from the Info tab, Windows devices have a **System Restore** tab (`#system-restore`) that lists each time Breeze asked for a System Restore checkpoint: when it was requested, what triggered it (patch install, script run or software install) and the outcome. From **agent 0.124.0** the device takes one restore point per command, just before its first change, and reports the outcome here; a device on an older agent keeps reading **Awaiting the device**. The list records requests and what the device reported; it does not mean a restore point still exists. See [System Protection](/features/configuration-policies/#system-protection). Entries are kept for 90 days from the request (set `RESTORE_POINT_ATTEMPT_RETENTION_DAYS`, up to 365). An entry still awaiting the device is removed only once it is past that window and its command can no longer report back.
 
 ### Device function
 
@@ -324,7 +371,10 @@ there if you no longer want it to run.
 
 Elsewhere in the product a waiting step reads **"Queued — device offline"**
 rather than Failed, so a nightly automation over a fleet of sleeping laptops no
-longer shows a wall of red. The trade-off is worth knowing: **work that used to
+longer shows a wall of red. A script run reads **"Queued — waiting for the
+device to pick it up"** instead when the device itself still reports online but
+no agent session has taken the command yet; it is delivered on the agent's next
+check-in. The trade-off is worth knowing: **work that used to
 fail fast now sits pending for up to a week.** If a step is only meaningful
 against a live device, set it to skip instead — see the offline behaviour control
 in [Automations](/features/automations/) and the patch-policy equivalent in
@@ -387,4 +437,4 @@ Two filters narrow the list: a **Type** filter (including dedicated **Hardware**
 
 ---
 
-Related pages: [Device Groups](/features/device-groups/) for organizing devices into collections, [Tags](/features/tags/) and [Custom Fields](/features/custom-fields/) for metadata, [Change Tracking](/features/change-tracking/) for software and configuration change auditing, and [IP History](/features/ip-history/) for the timeline of a device's network addresses.
+Related pages: [Device Groups](/features/device-groups/) for organizing devices into collections, [Tags](/features/tags/) and [Custom Fields](/features/custom-fields/) for metadata, [Change Tracking](/features/change-tracking/) for software and configuration change auditing, [IP History](/features/ip-history/) for the timeline of a device's network addresses, and [Workload Inventory](/features/workload-inventory/) for the containers and VMs on a host (the **Workloads** tab).

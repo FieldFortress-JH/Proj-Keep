@@ -29,7 +29,7 @@ function unavailable<T>(): DashboardQueryState<T> {
 }
 
 function stats(total: number): DeviceStats {
-  return { total, online: total, offline: 0, byStatus: { online: total }, migrationRequiredCount: 0 };
+  return { total, online: total, offline: 0, byStatus: { online: total }, migrationRequiredCount: 0, logShippingFailingCount: 0 };
 }
 
 const alertsSummary: AlertsSummary = {
@@ -39,6 +39,7 @@ const alertsSummary: AlertsSummary = {
 };
 
 const noVulns: VulnerabilityStats = {
+  openFindings: 0,
   criticalOpen: 0,
   kevCveCount: 0,
   kevDeviceCount: 0,

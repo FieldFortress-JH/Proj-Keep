@@ -17,7 +17,9 @@ import {
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { formatNumber } from '@/lib/i18n/format';
-import { fetchWithAuth } from '../../stores/auth';
+import { formatBytes } from './backupDashboardHelpers';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import AlphaBadge from '../shared/AlphaBadge';
 import RestoreResultNotices from './RestoreResultNotices';
 import { showToast } from '../shared/Toast';
@@ -30,33 +32,24 @@ import {
   useUnattestedRestoreStepUp,
   type UnattestedRestoreExtras,
 } from './useUnattestedRestoreStepUp';
-import SnapshotIntegrityBadge from './SnapshotIntegrityBadge';
+import SnapshotIntegrityBadge, { isUnverifiedSnapshotStatus } from './SnapshotIntegrityBadge';
+import {
+  LARGE_FOLDER_SELECTION_THRESHOLD,
+  folderCheckState,
+  selectedFolderFileTotal,
+} from './folderSelection';
+import RestoreSnapshotStep, {
+  groupSnapshotsByDevice,
+  snapshotDeviceKey,
+  type RestoreSnapshot,
+} from './RestoreSnapshotStep';
 import '../../lib/i18n';
 
 type RestoreType = 'full' | 'selective';
 
 type DestinationType = 'original' | 'alternate';
 
-type SnapshotFile = {
-  id: string;
-  name: string;
-  size?: string;
-  path: string;
-};
-
-type Snapshot = {
-  id: string;
-  label: string;
-  deviceName?: string | null;
-  size?: string;
-  sizeBytes?: number | null;
-  // /backup/snapshots carries no status (a snapshot row only exists once its
-  // backup completed), so the card shows when it was captured instead (#6496).
-  createdAt?: string | null;
-  files?: SnapshotFile[];
-  /** Integrity status from GET /backup/snapshots (absent on an older API). */
-  integrityStatus?: string | null;
-};
+type Snapshot = RestoreSnapshot;
 
 type RestoreResultDetails = {
   status?: string;
@@ -96,43 +89,22 @@ type SnapshotTreeItem = {
   type: 'file' | 'directory';
   sizeBytes?: number;
   modifiedAt?: string;
-  children?: SnapshotTreeItem[];
+  /** Directories: indexed files beneath it (#9628). */
+  fileCount?: number;
 };
 
-function flattenSnapshotTree(nodes: SnapshotTreeItem[]): SnapshotFile[] {
-  const files: SnapshotFile[] = [];
+const ROOT_DIR = '/';
 
-  const visit = (entries: SnapshotTreeItem[]) => {
-    for (const entry of entries) {
-      if (entry.type === 'file') {
-        files.push({
-          id: entry.path,
-          path: entry.path,
-          name: entry.name,
-          size: typeof entry.sizeBytes === 'number' ? formatBytes(entry.sizeBytes) : undefined,
-        });
-        continue;
-      }
-      if (entry.children) visit(entry.children);
-    }
-  };
-
-  visit(nodes);
-  return files;
+// #8230: browse returns one directory level per request, paged by cursor.
+function browseUrl(snapshotId: string, dir: string, cursor?: string | null): string {
+  const params: string[] = [];
+  if (dir !== ROOT_DIR) params.push(`dir=${encodeURIComponent(dir)}`);
+  if (cursor) params.push(`cursor=${encodeURIComponent(cursor)}`);
+  return `/backup/snapshots/${snapshotId}/browse${params.length ? `?${params.join('&')}` : ''}`;
 }
 
-function formatBytes(bytes?: number | null): string {
-  if (!Number.isFinite(bytes) || !bytes || bytes <= 0) return '--';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
-  return `${formatNumber(value, { minimumFractionDigits: precision, maximumFractionDigits: precision })} ${units[unitIndex]}`;
-}
+type DirPage = { items: SnapshotTreeItem[]; nextCursor: string | null };
+
 
 function isActiveRestoreStatus(status: string | null | undefined): boolean {
   return ['pending', 'running'].includes(`${status ?? ''}`.toLowerCase());
@@ -174,19 +146,24 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
   const { t } = useTranslation('backup');
   const [step, setStep] = useState(0);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
-  const [snapshotId, setSnapshotId] = useState(initialSnapshotId ?? '');
+  // The operator's pick. The EFFECTIVE selection (`snapshotId` below) is
+  // derived: only a snapshot of the chosen device counts (#9627).
+  const [pickedSnapshotId, setPickedSnapshotId] = useState(initialSnapshotId ?? '');
+  // Source device the operator chose in step 1; null until they pick one.
+  const [chosenDeviceKey, setChosenDeviceKey] = useState<string | null>(null);
   const [restoreType, setRestoreType] = useState<RestoreType>(
     initialSelectedPaths && initialSelectedPaths.length > 0 ? 'selective' : 'full'
   );
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(
     () => new Set(initialSelectedPaths ?? [])
   );
-  // The snapshot-change effect below clears the selection on every
-  // `snapshotId` change so a user picking a *different* snapshot in step 0
-  // doesn't drag a stale selection along. That would also fire on mount and
-  // wipe out the selection carried in via `initialSelectedPaths` the instant
-  // the wizard renders — skip its first run.
-  const isFirstSnapshotChange = useRef(true);
+  // The snapshot-change effect below clears the file selection when the
+  // operator moves from one snapshot to a *different* one, so a stale
+  // selection is not dragged along. It must not fire for the carried
+  // snapshot settling in once the list loads, or it would wipe the selection
+  // carried in via `initialSelectedPaths` — hence the last-seen id, seeded
+  // with the carried one.
+  const lastSnapshotId = useRef(initialSnapshotId ?? '');
   const [destination, setDestination] = useState<DestinationType>('original');
   // #6349: this defaulted to the demo path '/restore/nyc-db-14'. The wizard
   // was unreachable, so nobody saw it; now that it is mounted, a pre-filled
@@ -198,6 +175,10 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
   const [restoreSuccess, setRestoreSuccess] = useState<string>();
   const [restoring, setRestoring] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [dirs, setDirs] = useState<Record<string, DirPage>>({});
+  const [browseDir, setBrowseDir] = useState(ROOT_DIR);
+  // Bumped per snapshot so a slow page for the previous snapshot is dropped.
+  const browseEpoch = useRef(0);
   const [restoreJob, setRestoreJob] = useState<RestoreJob | null>(null);
   const [restoreHistory, setRestoreHistory] = useState<RestoreJob[]>([]);
   const [restoreHistoryLoading, setRestoreHistoryLoading] = useState(false);
@@ -261,54 +242,86 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
     void fetchRestoreHistory();
   }, [fetchRestoreHistory, fetchSnapshots]);
 
-  useEffect(() => {
-    if (!snapshotId && snapshots.length > 0) {
-      setSnapshotId(snapshots[0].id);
-    }
-  }, [snapshotId, snapshots]);
+  const deviceGroups = useMemo(() => groupSnapshotsByDevice(snapshots), [snapshots]);
 
-  useEffect(() => {
-    if (isFirstSnapshotChange.current) {
-      isFirstSnapshotChange.current = false;
-      return;
+  // #9627: never preselect across devices. The org-wide list is newest-first,
+  // so its first row is whichever server backed up last, not the device the
+  // operator came to restore. Without an explicit choice, a device is only
+  // implied by the carried snapshot (its own device) or by an org that has
+  // exactly one device with snapshots. Derived, not set from an effect, so
+  // the first render after the list loads is already scoped.
+  // A carried id that is no longer listed (expired, deleted) implies no
+  // device at all — not even a single-device org's — or that device's newest
+  // snapshot would be silently substituted for the one the link named.
+  const carriedSnapshotMissing = Boolean(initialSnapshotId)
+    && !loading
+    && !snapshots.some((snap) => snap.id === initialSnapshotId);
+  const impliedDeviceKey = useMemo(() => {
+    if (initialSnapshotId) {
+      const carried = snapshots.find((snap) => snap.id === initialSnapshotId);
+      return carried ? snapshotDeviceKey(carried) : null;
     }
-    setSelectedFiles(new Set());
-  }, [snapshotId]);
+    return deviceGroups.length === 1 ? deviceGroups[0].key : null;
+  }, [deviceGroups, initialSnapshotId, snapshots]);
+  const deviceKey = chosenDeviceKey ?? impliedDeviceKey;
+
+  // Within the chosen device: the operator's pick, else that device's newest.
+  // A pick from another device (or a carried id no longer listed) never
+  // survives a device switch.
+  const selectedSnapshot = useMemo(() => {
+    const group = deviceGroups.find((candidate) => candidate.key === deviceKey);
+    if (!group) return undefined;
+    return group.snapshots.find((snap) => snap.id === pickedSnapshotId) ?? group.snapshots[0];
+  }, [deviceGroups, deviceKey, pickedSnapshotId]);
+  const snapshotId = selectedSnapshot?.id ?? '';
 
   useEffect(() => {
     if (!snapshotId) return;
-
-    let cancelled = false;
-    const loadSnapshotFiles = async () => {
-      try {
-        setFilesLoading(true);
-        const response = await fetchWithAuth(`/backup/snapshots/${snapshotId}/browse`);
-        if (!response.ok) {
-          throw new Error('Failed to browse snapshot contents');
-        }
-        const payload = await response.json();
-        const items = Array.isArray(payload?.data) ? payload.data as SnapshotTreeItem[] : [];
-        const files = flattenSnapshotTree(items);
-        if (cancelled) return;
-        setSnapshots((prev) => prev.map((snapshot) => (
-          snapshot.id === snapshotId
-            ? { ...snapshot, files }
-            : snapshot
-        )));
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load snapshot contents');
-        }
-      } finally {
-        if (!cancelled) setFilesLoading(false);
-      }
-    };
-
-    void loadSnapshotFiles();
-    return () => {
-      cancelled = true;
-    };
+    if (lastSnapshotId.current && lastSnapshotId.current !== snapshotId) {
+      setSelectedFiles(new Set());
+    }
+    lastSnapshotId.current = snapshotId;
   }, [snapshotId]);
+
+  const loadDir = useCallback(async (dir: string, cursor?: string | null) => {
+    if (!snapshotId) return;
+    const epoch = browseEpoch.current;
+    try {
+      setFilesLoading(true);
+      const response = await fetchWithAuth(browseUrl(snapshotId, dir, cursor));
+      if (!response.ok) {
+        throw new Error('Failed to browse snapshot contents');
+      }
+      const payload = await response.json();
+      if (epoch !== browseEpoch.current) return;
+      const items = Array.isArray(payload?.data) ? payload.data as SnapshotTreeItem[] : [];
+      setDirs((prev) => ({
+        ...prev,
+        [dir]: {
+          items: cursor ? [...(prev[dir]?.items ?? []), ...items] : items,
+          nextCursor: typeof payload?.nextCursor === 'string' ? payload.nextCursor : null,
+        },
+      }));
+    } catch (err) {
+      if (epoch === browseEpoch.current) {
+        setError(err instanceof Error ? err.message : 'Failed to load snapshot contents');
+      }
+    } finally {
+      if (epoch === browseEpoch.current) setFilesLoading(false);
+    }
+  }, [snapshotId]);
+
+  useEffect(() => {
+    browseEpoch.current += 1;
+    setDirs({});
+    setBrowseDir(ROOT_DIR);
+    void loadDir(ROOT_DIR);
+  }, [loadDir]);
+
+  const openDir = (dir: string) => {
+    setBrowseDir(dir);
+    if (!dirs[dir]) void loadDir(dir);
+  };
 
   const toggleFile = (id: string) => {
     setSelectedFiles((prev) => {
@@ -322,6 +335,48 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
     });
   };
 
+  // Selecting a folder stores its tree path; the API expands it to the indexed
+  // files beneath it (#9628). Counts are remembered to gate very large picks.
+  const folderCounts = useRef(new Map<string, number>());
+  const [pendingFolder, setPendingFolder] = useState<{ item: SnapshotTreeItem; total: number } | null>(null);
+  const applyFolderToggle = (item: SnapshotTreeItem) => {
+    setSelectedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(item.path)) next.delete(item.path);
+      else next.add(item.path);
+      return next;
+    });
+  };
+  const toggleFolder = (item: SnapshotTreeItem) => {
+    const count = item.fileCount ?? 0;
+    folderCounts.current.set(item.path, count);
+    const state = folderCheckState(item.path, selectedFiles);
+    // Covered by a selected ancestor folder: uncheck that one instead.
+    if (state === 'checked' && !selectedFiles.has(item.path)) return;
+    if (state !== 'checked' && count > 0) {
+      const total = selectedFolderFileTotal(selectedFiles, folderCounts.current, count);
+      if (total > LARGE_FOLDER_SELECTION_THRESHOLD) {
+        setPendingFolder({ item, total });
+        return;
+      }
+    }
+    applyFolderToggle(item);
+  };
+
+  // Folder paths are remembered in folderCounts when toggled; everything else
+  // in the selection is a file. Count them separately so a folder isn't "1 file".
+  const selectedFolderCount = Array.from(selectedFiles).filter((path) => folderCounts.current.has(path)).length;
+  const selectedFileCount = selectedFiles.size - selectedFolderCount;
+  const selectionSummary =
+    selectedFolderCount === 0
+      ? t('restoreWizard.filesSelected', { count: selectedFileCount, formatted: formatNumber(selectedFileCount) })
+      : [
+          selectedFileCount > 0
+            ? t('restoreWizard.selectionFiles', { count: selectedFileCount, formatted: formatNumber(selectedFileCount) })
+            : null,
+          t('restoreWizard.selectionFolders', { count: selectedFolderCount, formatted: formatNumber(selectedFolderCount) }),
+        ].filter(Boolean).join(', ');
+
   const restoreKindLabel = (job: RestoreJob): string => {
     if (job.restoreMode === 'vm') return t('restoreWizard.kindVm');
     if (job.restoreMode === 'instant_boot') return t('restoreWizard.kindInstantBoot');
@@ -329,11 +384,20 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
     return job.restoreType === 'selective' ? t('restoreWizard.kindSelective') : t('restoreWizard.kindFull');
   };
 
-  const selectedSnapshot = useMemo(
-    () => snapshots.find((snap) => snap.id === snapshotId),
-    [snapshotId, snapshots]
-  );
-  const selectableFiles = selectedSnapshot?.files ?? [];
+  const copyCommandId = async (commandId: string) => {
+    try {
+      await navigator.clipboard.writeText(commandId);
+      showToast({ type: 'success', message: t('restoreWizard.commandIdCopied') });
+    } catch {
+      showToast({ type: 'error', message: t('restoreWizard.commandIdCopyFailed') });
+    }
+  };
+
+  const currentPage = dirs[browseDir];
+  const currentItems = currentPage?.items ?? [];
+  const parentDir = browseDir === ROOT_DIR
+    ? null
+    : `/${browseDir.split('/').filter(Boolean).slice(0, -1).join('/')}`.replace(/^\/$/, ROOT_DIR);
   const latestKnownRestore = useMemo(() => {
     if (restoreJob) return restoreJob;
     return restoreHistory[0] ?? null;
@@ -365,6 +429,9 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
   // A backup without an integrity attestation is restored only after the
   // operator confirms it (two-factor when enabled); the server asks for it.
   const unattestedStepUp = useUnattestedRestoreStepUp();
+  // Presentational hint only (#9629): the server gate stays the one authority.
+  const secondFactorMissing = useAuthStore((state) => state.user?.mfaEnabled === false);
+  const selectedNeedsConfirmation = isUnverifiedSnapshotStatus(selectedSnapshot?.integrityStatus);
 
   const submitRestore = useCallback(async (extras: UnattestedRestoreExtras): Promise<boolean> => {
     try {
@@ -536,48 +603,16 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
 
         <div className="mt-6 space-y-6">
           {step === 0 && (
-            <div className="space-y-4">
-              <div>
-                <h3 className="text-lg font-semibold text-foreground">{t('restoreWizard.selectASnapshot')}</h3>
-                <p className="text-sm text-muted-foreground">
-                  {t('restoreWizard.chooseTheRecoveryPointYouWantToRestore')} </p>
-              </div>
-              {snapshots.length === 0 ? (
-                <div className="rounded-md border border-dashed bg-muted/30 p-4 text-sm text-muted-foreground">
-                  {t('restoreWizard.noSnapshotsAvailable')} </div>
-              ) : (
-                <div className="grid gap-4 md:grid-cols-3">
-                  {snapshots.map((snapshot) => (
-                    <button
-                      key={snapshot.id}
-                      onClick={() => setSnapshotId(snapshot.id)}
-                      className={cn(
-                        'rounded-lg border p-4 text-left',
-                        snapshotId === snapshot.id
-                          ? 'border-primary bg-primary/5'
-                          : 'border-muted bg-muted/20'
-                      )}
-                    >
-                      <div className="flex items-center justify-between text-xs text-muted-foreground">
-                        <span>
-                          {typeof snapshot.sizeBytes === 'number'
-                            ? formatBytes(snapshot.sizeBytes)
-                            : snapshot.size ?? '--'}
-                        </span>
-                        {snapshot.createdAt ? <span>{formatDateTime(snapshot.createdAt)}</span> : null}
-                      </div>
-                      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm font-semibold text-foreground">
-                        {snapshot.label}
-                        <SnapshotIntegrityBadge status={snapshot.integrityStatus} />
-                      </div>
-                      {snapshot.deviceName ? (
-                        <div className="mt-1 text-xs text-muted-foreground">{snapshot.deviceName}</div>
-                      ) : null}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <RestoreSnapshotStep
+              groups={deviceGroups}
+              deviceKey={deviceKey}
+              onDeviceChange={setChosenDeviceKey}
+              snapshotId={snapshotId}
+              onSnapshotChange={setPickedSnapshotId}
+              formatBytes={formatBytes}
+              carriedSnapshotMissing={carriedSnapshotMissing && chosenDeviceKey === null}
+              secondFactorMissing={secondFactorMissing}
+            />
           )}
 
           {step === 1 && (
@@ -631,28 +666,84 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
               </div>
               {restoreType === 'selective' ? (
                 <div className="space-y-3">
-                  {selectableFiles.length === 0 ? (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {parentDir !== null && (
+                      <button
+                        type="button"
+                        onClick={() => openDir(parentDir)}
+                        className="rounded-md border px-2 py-1 font-medium text-foreground hover:bg-muted"
+                      >
+                        Up
+                      </button>
+                    )}
+                    <span data-testid="restore-wizard-current-dir">{browseDir}</span>
+                  </div>
+                  {currentItems.length === 0 ? (
                     <div className="rounded-md border border-dashed bg-muted/30 p-4 text-sm text-muted-foreground">
                       {filesLoading ? 'Loading snapshot contents...' : 'No files available for this snapshot.'}
                     </div>
                   ) : (
-                    selectableFiles.map((file) => (
-                      <label
-                        key={file.id}
-                        className="flex items-center justify-between rounded-md border bg-muted/20 px-4 py-3 text-sm"
-                      >
-                        <div className="flex items-center gap-2">
+                    currentItems.map((item) => (
+                      item.type === 'directory' ? (
+                        <div
+                          key={`d:${item.path}`}
+                          className="flex w-full items-center gap-2 rounded-md border bg-muted/20 px-4 py-3 text-sm hover:bg-muted/40"
+                        >
                           <input
                             type="checkbox"
-                            checked={selectedFiles.has(file.id)}
-                            onChange={() => toggleFile(file.id)}
+                            aria-label={t('restoreWizard.selectFolder', { name: item.name })}
+                            checked={folderCheckState(item.path, selectedFiles) === 'checked'}
+                            ref={(el) => {
+                              if (el) el.indeterminate = folderCheckState(item.path, selectedFiles) === 'partial';
+                            }}
+                            // Covered by a selected parent folder: uncheck that one instead.
+                            disabled={folderCheckState(item.path, selectedFiles) === 'checked' && !selectedFiles.has(item.path)}
+                            onChange={() => toggleFolder(item)}
                             className="h-4 w-4"
                           />
-                          <span className="font-medium text-foreground">{file.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => openDir(item.path)}
+                            className="flex-1 text-left font-medium text-foreground"
+                          >
+                            {item.name}/
+                          </button>
+                          {typeof item.fileCount === 'number' && (
+                            <span className="text-xs text-muted-foreground">
+                              {t('restoreWizard.folderFileCount', { count: item.fileCount, formatted: formatNumber(item.fileCount) })}
+                            </span>
+                          )}
                         </div>
-                        <span className="text-xs text-muted-foreground">{file.size ?? '--'}</span>
-                      </label>
+                      ) : (
+                        <label
+                          key={`f:${item.path}`}
+                          className="flex items-center justify-between rounded-md border bg-muted/20 px-4 py-3 text-sm"
+                        >
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={selectedFiles.has(item.path)}
+                              onChange={() => toggleFile(item.path)}
+                              className="h-4 w-4"
+                            />
+                            <span className="font-medium text-foreground">{item.name}</span>
+                          </div>
+                          <span className="text-xs text-muted-foreground">
+                            {typeof item.sizeBytes === 'number' ? formatBytes(item.sizeBytes) : '--'}
+                          </span>
+                        </label>
+                      )
                     ))
+                  )}
+                  {currentPage?.nextCursor && (
+                    <button
+                      type="button"
+                      onClick={() => void loadDir(browseDir, currentPage.nextCursor)}
+                      disabled={filesLoading}
+                      className="text-xs font-medium text-primary hover:underline disabled:opacity-60"
+                    >
+                      Load more
+                    </button>
                   )}
                 </div>
               ) : (
@@ -728,17 +819,46 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
                     <CheckCircle2 className="h-4 w-4 text-success" />
                     {t('restoreWizard.snapshot')} </div>
+                  {selectedSnapshot ? (
+                    <p data-testid="restore-review-device" className="mt-2 text-xs font-medium text-foreground">
+                      {t('restoreWizard.reviewDevice', {
+                        device: selectedSnapshot.deviceName || t('restoreWizard.unknownDevice'),
+                      })}
+                    </p>
+                  ) : null}
                   <p data-testid="restore-review-snapshot" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     {selectedSnapshot?.label ?? 'No snapshot selected'}
                     <SnapshotIntegrityBadge status={selectedSnapshot?.integrityStatus} />
                   </p>
+                  {selectedNeedsConfirmation ? (
+                    <p
+                      data-testid="restore-review-second-factor-note"
+                      data-tone={secondFactorMissing ? 'warning' : 'info'}
+                      className={cn(
+                        'mt-2 rounded-md border px-2 py-1.5 text-xs',
+                        secondFactorMissing
+                          ? 'border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300'
+                          : 'border-muted bg-muted/40 text-muted-foreground'
+                      )}
+                    >
+                      {secondFactorMissing
+                        ? t('restoreWizard.secondFactorNoteNotEnrolled')
+                        : t('restoreWizard.secondFactorNote')}
+                      {secondFactorMissing ? (
+                        <>
+                          {' '}
+                          <a href="/settings/profile" className="font-medium underline">{t('restoreWizard.secondFactorSetUp')}</a>
+                        </>
+                      ) : null}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="rounded-md border border-dashed bg-muted/30 p-4">
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
                     <Server className="h-4 w-4 text-primary" />
                     {t('restoreWizard.restoreType')} </div>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {restoreType === 'full' ? 'Full restore' : 'Selective restore'}
+                    {restoreType === 'full' ? t('restoreWizard.kindFull') : t('restoreWizard.kindSelective')}
                   </p>
                 </div>
                 <div className="rounded-md border border-dashed bg-muted/30 p-4">
@@ -757,8 +877,8 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                     {t('restoreWizard.files')} </div>
                   <p className="mt-2 text-xs text-muted-foreground">
                     {restoreType === 'full'
-                      ? 'All files from snapshot'
-                      : t('restoreWizard.filesSelected', { count: selectedFiles.size })}
+                      ? t('restoreWizard.allFilesFromSnapshot')
+                      : selectionSummary}
                   </p>
                 </div>
               </div>
@@ -778,7 +898,8 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
             {step < 4 ? (
               <button
                 onClick={nextStep}
-                className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                disabled={step === 0 && !selectedSnapshot}
+                className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {t('restoreWizard.continue')} <ArrowRight className="h-4 w-4" />
               </button>
@@ -787,7 +908,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                 onClick={handleRestore}
                 disabled={
                   restoring ||
-                  !snapshotId ||
+                  !selectedSnapshot ||
                   (restoreType === 'selective' && selectedFiles.size === 0) ||
                   (destination === 'alternate' && !alternatePath.trim())
                 }
@@ -853,7 +974,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                   </div>
                   <div className="rounded-md border bg-muted/20 p-4">
                     <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('restoreWizard.restoredSize')}</p>
-                    <p className="mt-2 text-sm font-semibold text-foreground">{formatBytes(latestKnownRestore.restoredSize)}</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{formatBytes(latestKnownRestore.restoredSize, '--')}</p>
                   </div>
                 </div>
 
@@ -887,9 +1008,26 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                 <div className="grid gap-3">
                   <div className="rounded-md border border-dashed bg-muted/20 p-4">
                     <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('restoreWizard.commandTarget')}</p>
-                    <p className="mt-2 text-xs text-foreground">{t('restoreWizard.command')} {latestKnownRestore.commandId ?? '--'}</p>
+                    <p data-testid="restore-job-summary" className="mt-2 text-sm font-semibold text-foreground">
+                      {latestKnownRestore.deviceName ?? t('restoreWizard.unknownDevice')} · {restoreKindLabel(latestKnownRestore)}
+                    </p>
                     <p className="mt-1 text-xs text-foreground">{t('restoreWizard.targetPath')} {latestKnownRestore.targetPath ?? t('restoreWizard.stagingFolder')}</p>
                     <p className="mt-1 text-xs text-foreground">{t('restoreWizard.completed')} {formatTimestamp(latestKnownRestore.completedAt)}</p>
+                    {latestKnownRestore.commandId ? (
+                      <details className="mt-2 text-xs text-muted-foreground">
+                        <summary className="cursor-pointer">{t('restoreWizard.commandDetails')}</summary>
+                        <div className="mt-1 flex items-center gap-2">
+                          <code className="break-all">{latestKnownRestore.commandId}</code>
+                          <button
+                            type="button"
+                            onClick={() => void copyCommandId(latestKnownRestore.commandId as string)}
+                            className="rounded border px-2 py-0.5 text-xs font-medium text-foreground hover:bg-muted"
+                          >
+                            {t('restoreWizard.copyCommandId')}
+                          </button>
+                        </div>
+                      </details>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -940,7 +1078,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                         <span>{t('restoreWizard.files2')} {job.restoredFiles ?? '--'}</span>
-                        <span>{t('restoreWizard.size')} {formatBytes(job.restoredSize)}</span>
+                        <span>{t('restoreWizard.size')} {formatBytes(job.restoredSize, '--')}</span>
                       </div>
                       {job.errorSummary ? (
                         <p className="mt-2 line-clamp-2 text-xs text-destructive">{job.errorSummary}</p>
@@ -953,6 +1091,24 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
           </div>
         </div>
       ) : null}
+      <ConfirmDialog
+        open={pendingFolder !== null}
+        onClose={() => setPendingFolder(null)}
+        onConfirm={() => {
+          if (!pendingFolder) return;
+          const { item } = pendingFolder;
+          setPendingFolder(null);
+          applyFolderToggle(item);
+        }}
+        title={t('restoreWizard.largeFolderSelectionTitle')}
+        message={t('restoreWizard.confirmLargeFolderSelection', {
+          count: pendingFolder?.total ?? 0,
+          formatted: formatNumber(pendingFolder?.total ?? 0),
+        })}
+        variant="warning"
+        dialogTestId="restore-large-folder-dialog"
+        confirmTestId="restore-large-folder-confirm"
+      />
     </div>
   );
 }

@@ -57,13 +57,16 @@ function grantScriptsExecute() {
 
 describe('DeviceScriptHistory status labels (#5318)', () => {
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
     grantScriptsExecute();
   });
 
   it.each([
     ['pending', 'Pending'],
-    ['queued', 'Queued — device offline'],
+    // #9563 — no deviceStatus prop here, so the neutral copy, not "offline".
+    ['queued', 'Queued — awaiting pickup'],
     ['cancelling', 'Stopping…'],
     ['cancelled', 'Cancelled'],
     ['timeout', 'Timeout'],
@@ -87,6 +90,8 @@ describe('DeviceScriptHistory status labels (#5318)', () => {
 
 describe('DeviceScriptHistory Stop action (#5318)', () => {
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
     grantScriptsExecute();
   });

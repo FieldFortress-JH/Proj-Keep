@@ -1,214 +1,106 @@
-import { and, eq, inArray, or, type SQL } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db';
 import {
-  devices,
-  organizations,
   configPolicyFeatureLinks,
   configPolicyAssignments,
   configurationPolicies,
-  deviceGroupMemberships,
   patchPolicies
 } from '../db/schema';
 import {
-  resolveExecutionSafeGroupIds,
-  auditRefusedExecutionGroups,
   warningsForRefusedExecutionGroups,
   type RefusedExecutionGroup,
 } from '../services/executionTargetGating';
-import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import {
+  resolveAssignmentDevices,
+  type AssignmentToExpand,
+} from '../services/configPolicyAssignmentDevices';
+import { resolvePatchPolicyWinnersForDevices, type PatchPolicyWinner } from '../services/featureConfigResolver';
+import { captureException } from '../services/sentry';
 
 /**
  * One config-policy assignment as this module needs it: the assignment's own
- * level/target plus the OWNING policy's org id.
+ * level/target/role-OS filter plus the OWNING policy's org id.
  *
  * `policyOrgId` is null for a partner-owned ("all organizations") library
- * policy (#1724/#2280) and set for a classic org-owned policy. It exists only
- * to reproduce the scheduler's legacy backstop — see resolveRingAssignedDeviceIds.
+ * policy (#1724/#2280) and set for a classic org-owned policy.
  */
-export interface RingAssignment {
-  level: string;
-  targetId: string;
+export interface RingAssignment extends AssignmentToExpand {
   policyOrgId: string | null;
 }
 
 /**
- * Build the WHERE condition that expands partner-level assignments to devices.
+ * Resolve the device IDs assigned to a single ring via its config-policy
+ * assignments. Returns a de-duplicated Set.
  *
- * Exported ONLY so a unit test can pin the compiled SQL (see
- * updateRingsHelpers.partnerFanout.test.ts). The predicate must reference
- * `organizations.partner_id` — NOT `devices.org_id` — because a partner-level
- * assignment's targetId is a partner id (#3954). A Drizzle-mock test that
- * ignores `.where()` cannot catch that regression; a compiled-SQL assertion can.
+ * Every assignment goes through `resolveAssignmentDevices`
+ * (services/configPolicyAssignmentDevices.ts), the same resolver the patch
+ * scheduler uses. The ring count therefore matches what the scheduler actually
+ * patches, role / OS filter included (#8442: a workstation-only ring counted
+ * the org's servers). The ring adds two things on top:
  *
- * Returns undefined when there are no partner-level assignments.
- */
-export function buildPartnerAssignmentCondition(
-  partnerAssignments: RingAssignment[]
-): SQL | undefined {
-  const seen = new Set<string>();
-  const conditions: SQL[] = [];
-  for (const a of partnerAssignments) {
-    const key = `${a.targetId}|${a.policyOrgId ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    conditions.push(
-      a.policyOrgId
-        ? and(eq(organizations.partnerId, a.targetId), eq(devices.orgId, a.policyOrgId))!
-        : eq(organizations.partnerId, a.targetId)
-    );
-  }
-  if (conditions.length === 0) return undefined;
-  return and(or(...conditions), eq(devices.isEphemeral, false), notHoldingOrgCondition());
-}
-
-/**
- * Shared inner logic: resolve device IDs assigned to a single ring via config policy assignments.
- * Returns a deduplicated Set of device IDs.
- *
- * IMPORTANT — `targetId` is polymorphic: its referent depends on `level`
- * ('device' → devices.id, 'device_group' → device_groups.id, 'site' → sites.id,
- * 'organization' → organizations.id, 'partner' → **partners.id**). Reading a
- * partner-level targetId as an org id matches zero rows and renders DEVICES 0
- * for a ring that is genuinely applied — that was issue #3954.
- *
- * This must stay behaviourally aligned with the scheduler's
- * `resolveDeviceIdsForAssignment` (apps/api/src/jobs/patchSchedulerWorker.ts),
- * which is the source of truth for which devices a ring acts on. Two
- * deliberate differences:
- *
- *  1. The scheduler resolves ONE assignment per call; this batches every
- *     assignment of a level into a single query, because the rings LIST
- *     endpoint resolves counts for every ring at once.
- *  2. The scheduler re-clamps every assignment to the POLICY's partner to close
- *     a TOCTOU hole (an org reparented to another partner after the assignment
- *     row was written, #2280), threading both policyOrgId and policyPartnerId.
- *     This module clamps to the RING's partner instead — one value, applied
- *     uniformly to all five levels. That is equivalent, not weaker: migration
+ *  1. A ring-partner clamp (`requirePartnerId`). Every subset-level device
+ *     must sit under the ring's partner and outside its holding org. Migration
  *     2026-07-27-a-feature-policy-reference-ownership.sql constrains a
- *     `feature_type='patch'` link so the referenced patch_policies row's
- *     partner_id EQUALS `COALESCE(policy.partner_id, policy_org.partner_id)` —
- *     the policy's effective partner. So "org is under the ring's partner" and
- *     "org is under the policy's partner" are the same predicate here.
+ *     `feature_type='patch'` link so the ring's partner EQUALS the policy's
+ *     effective partner, so this agrees with the scheduler's policy-partner
+ *     clamp. It is applied unconditionally because `accessible_org_ids` is
+ *     unrestricted under SYSTEM scope. Clamping in SQL keeps the result
+ *     independent of the caller's scope.
+ *  2. Refused dynamic groups (rules on execution-refused agent-reported
+ *     fields) are EXCLUDED and reported as warnings, rather than resolved
+ *     the way the protective scheduler resolves them.
  *
- *     The clamp is deliberately unconditional rather than leaning on the
- *     caller's RLS context: `accessible_org_ids` is unrestricted under SYSTEM
- *     scope, so an RLS-only argument would not hold for a system-scope caller
- *     of these endpoints. Clamping in SQL keeps the result scope-independent.
+ * Closest level wins (#9632), as in the scheduler: a device stays in this
+ * ring only when its winning patch policy links to this ring, or when no
+ * policy wins it (see keepDevicesThisPolicyWins in the scheduler). A pilot
+ * device that a device-group override moves to another ring is no longer
+ * counted under the broad ring as well.
+ *
+ * Each assignment is resolved with its own query. Batching by level is not
+ * possible once each assignment can carry a different filter, and a ring has a
+ * handful of assignments.
  */
 async function resolveRingAssignedDeviceIds(
+  ringId: string,
   assignments: RingAssignment[],
   /** The ring's own partner. Every resolved device must sit under it. */
-  ringPartnerId: string
+  ringPartnerId: string,
+  /** Winning patch policy per device, shared across the rings of one request. */
+  winners: Map<string, PatchPolicyWinner | null> = new Map(),
 ): Promise<{ deviceIds: Set<string>; refusedGroups: RefusedExecutionGroup[] }> {
   const deviceIds = new Set<string>();
-  const directDeviceIds: string[] = [];
-  const groupIds: string[] = [];
-  const siteIds: string[] = [];
-  const orgIds: string[] = [];
-  const partnerAssignments: RingAssignment[] = [];
-  let refusedGroups: RefusedExecutionGroup[] = [];
+  const refusedGroups = new Map<string, RefusedExecutionGroup>();
+  const seen = new Set<string>();
 
   for (const a of assignments) {
-    if (a.level === 'device') directDeviceIds.push(a.targetId);
-    else if (a.level === 'device_group') groupIds.push(a.targetId);
-    else if (a.level === 'site') siteIds.push(a.targetId);
-    else if (a.level === 'organization') orgIds.push(a.targetId);
-    else if (a.level === 'partner') partnerAssignments.push(a);
+    const key = JSON.stringify([a.level, a.targetId, a.policyOrgId, a.roleFilter ?? null, a.osFilter ?? null]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const expanded = await resolveAssignmentDevices(
+      a,
+      { policyOrgId: a.policyOrgId, policyPartnerId: ringPartnerId, requirePartnerId: ringPartnerId },
+      { refusedGroups: 'exclude', auditAction: 'update_ring.execution_target_refused_agent_reported_fields' }
+    );
+    for (const id of expanded.deviceIds) deviceIds.add(id);
+    for (const group of expanded.refusedGroups) refusedGroups.set(group.id, group);
   }
 
-  // The ring-partner clamp (see doc comment) — every branch below joins
-  // organizations and applies it, so a target that has since been reparented to
-  // another partner resolves to nothing regardless of the caller's scope.
-  // Also never a device parked in the partner's holding org.
-  const underRingPartner = and(eq(organizations.partnerId, ringPartnerId), notHoldingOrgCondition())!;
-
-  // Device-level targets are an operator-chosen machine, so they are NOT
-  // filtered on isEphemeral — matching the scheduler, which leaves its by-id
-  // branches alone. They are still verified to exist under the ring's partner.
-  if (directDeviceIds.length > 0) {
-    const directDevices = await db
-      .select({ id: devices.id })
-      .from(devices)
-      .innerJoin(organizations, eq(devices.orgId, organizations.id))
-      .where(and(inArray(devices.id, directDeviceIds), underRingPartner));
-    for (const row of directDevices) deviceIds.add(row.id);
+  const missing = [...deviceIds].filter((id) => !winners.has(id));
+  if (missing.length > 0) {
+    const resolved = await resolvePatchPolicyWinnersForDevices(missing);
+    for (const id of missing) winners.set(id, resolved.get(id) ?? null);
   }
-
-  // Group expansion joins devices (rather than reading memberships alone) so
-  // the ephemeral exclusion below applies here too, matching the scheduler.
-  //
-  // Field-provenance tiering: a device_group-level ring assignment can name a dynamic group
-  // whose rules key on an execution-refused agent-reported field (hostname,
-  // tags, deviceRole, custom.*, ...) — a device's own report could place it
-  // in that group and give it the ring's patch schedule. Gate through the shared
-  // helper before expanding membership, same as script/policy/automation
-  // targets.
-  if (groupIds.length > 0) {
-    const gated = await resolveExecutionSafeGroupIds(groupIds);
-    refusedGroups = gated.refusedGroups;
-    auditRefusedExecutionGroups(null, 'update_ring.execution_target_refused_agent_reported_fields', refusedGroups);
-
-    if (gated.allowedGroupIds.length > 0) {
-      const groupDevices = await db
-        .select({ deviceId: deviceGroupMemberships.deviceId })
-        .from(deviceGroupMemberships)
-        .innerJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
-        .innerJoin(organizations, eq(devices.orgId, organizations.id))
-        .where(and(
-          inArray(deviceGroupMemberships.groupId, gated.allowedGroupIds),
-          eq(devices.isEphemeral, false),
-          underRingPartner
-        ));
-      for (const row of groupDevices) deviceIds.add(row.deviceId);
+  if (deviceIds.size > 0) {
+    for (const id of [...deviceIds]) {
+      const winner = winners.get(id) ?? null;
+      // A winner with no ring (featurePolicyId null) patches the device
+      // outside every ring, so it leaves this ring's count too.
+      if (winner && winner.featurePolicyId !== ringId) deviceIds.delete(id);
     }
   }
 
-  // Site/org/partner expansion must never pull in ephemeral Quick Support
-  // devices: they live in the hidden 'quick_support' org that stays inside
-  // accessibleOrgIds for RLS, so nothing excludes them from a fan-out for us.
-  if (siteIds.length > 0) {
-    const siteDevices = await db
-      .select({ id: devices.id })
-      .from(devices)
-      .innerJoin(organizations, eq(devices.orgId, organizations.id))
-      .where(and(
-        inArray(devices.siteId, siteIds),
-        eq(devices.isEphemeral, false),
-        underRingPartner
-      ));
-    for (const row of siteDevices) deviceIds.add(row.id);
-  }
-
-  if (orgIds.length > 0) {
-    const orgDevices = await db
-      .select({ id: devices.id })
-      .from(devices)
-      .innerJoin(organizations, eq(devices.orgId, organizations.id))
-      .where(and(
-        inArray(devices.orgId, orgIds),
-        eq(devices.isEphemeral, false),
-        underRingPartner
-      ));
-    for (const row of orgDevices) deviceIds.add(row.id);
-  }
-
-  // Partner-level ("all organizations") assignments: targetId is a PARTNER id,
-  // so the devices are reached through their org's partner_id, mirroring the
-  // scheduler's partner branch. A legacy org-owned policy carrying a
-  // partner-level assignment (now rejected at assign time) still clamps to its
-  // own org, exactly as the scheduler does, so the count cannot overstate what
-  // will actually be patched.
-  const partnerCondition = buildPartnerAssignmentCondition(partnerAssignments);
-  if (partnerCondition) {
-    const partnerDevices = await db
-      .select({ id: devices.id })
-      .from(devices)
-      .innerJoin(organizations, eq(devices.orgId, organizations.id))
-      .where(partnerCondition);
-    for (const row of partnerDevices) deviceIds.add(row.id);
-  }
-
-  return { deviceIds, refusedGroups };
+  return { deviceIds, refusedGroups: [...refusedGroups.values()] };
 }
 
 /**
@@ -224,6 +116,8 @@ export async function resolveRingDeviceIdsWithWarnings(
     .select({
       level: configPolicyAssignments.level,
       targetId: configPolicyAssignments.targetId,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
       policyOrgId: configurationPolicies.orgId,
       ringPartnerId: patchPolicies.partnerId,
     })
@@ -244,7 +138,7 @@ export async function resolveRingDeviceIdsWithWarnings(
   const ringPartnerId = linkedAssignments[0]?.ringPartnerId;
   if (!ringPartnerId) return { deviceIds: [], warnings: [] };
 
-  const { deviceIds, refusedGroups } = await resolveRingAssignedDeviceIds(linkedAssignments, ringPartnerId);
+  const { deviceIds, refusedGroups } = await resolveRingAssignedDeviceIds(ringId, linkedAssignments, ringPartnerId);
   return { deviceIds: Array.from(deviceIds), warnings: warningsForRefusedExecutionGroups(refusedGroups) };
 }
 
@@ -265,6 +159,8 @@ export async function resolveRingDeviceCountsWithWarnings(
       ringId: configPolicyFeatureLinks.featurePolicyId,
       level: configPolicyAssignments.level,
       targetId: configPolicyAssignments.targetId,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
       policyOrgId: configurationPolicies.orgId,
       ringPartnerId: patchPolicies.partnerId,
     })
@@ -285,17 +181,28 @@ export async function resolveRingDeviceCountsWithWarnings(
   for (const row of linkedAssignments) {
     if (!row.ringId || !row.ringPartnerId) continue;
     const entry = ringAssignments.get(row.ringId) ?? { partnerId: row.ringPartnerId, assignments: [] };
-    entry.assignments.push({ level: row.level, targetId: row.targetId, policyOrgId: row.policyOrgId });
+    entry.assignments.push({
+      level: row.level,
+      targetId: row.targetId,
+      roleFilter: row.roleFilter,
+      osFilter: row.osFilter,
+      policyOrgId: row.policyOrgId,
+    });
     ringAssignments.set(row.ringId, entry);
   }
 
   // Resolve each ring's device count (isolated per ring — one failure doesn't block others)
+  const winners = new Map<string, PatchPolicyWinner | null>();
   for (const [ringId, { partnerId, assignments }] of ringAssignments) {
     try {
-      const { deviceIds, refusedGroups } = await resolveRingAssignedDeviceIds(assignments, partnerId);
+      const { deviceIds, refusedGroups } = await resolveRingAssignedDeviceIds(ringId, assignments, partnerId, winners);
       deviceCountMap.set(ringId, { count: deviceIds.size, warnings: warningsForRefusedExecutionGroups(refusedGroups) });
     } catch (err) {
+      // A 0 here reads as an empty ring, so the failure has to be visible.
       console.error(`Failed to resolve device count for ring ${ringId}:`, err instanceof Error ? err.message : err);
+      captureException(err instanceof Error ? err : new Error(`Failed to resolve device count for ring ${ringId}`), undefined, {
+        update_ring_stage: 'device_count_failed',
+      }, { fingerprint: ['update-ring', 'device-count-failed'] });
       deviceCountMap.set(ringId, { count: 0, warnings: [] });
     }
   }

@@ -4,7 +4,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
 import { db, runOutsideDbContext } from '../../db';
-import { backupProviderConnections, backupProviderDevices } from '../../db/schema';
+import { backupProviderConnections, backupProviderCustomers, backupProviderDevices } from '../../db/schema';
 import {
   requireMfa,
   requirePermission,
@@ -69,12 +69,101 @@ async function loadCredentials(id: string, partnerId: string) {
       provider: backupProviderConnections.provider,
       baseUrl: backupProviderConnections.baseUrl,
       credentialsEncrypted: backupProviderConnections.credentialsEncrypted,
+      vendorRootId: backupProviderConnections.vendorRootId,
       isActive: backupProviderConnections.isActive,
     })
     .from(backupProviderConnections)
     .where(and(eq(backupProviderConnections.id, id), eq(backupProviderConnections.partnerId, partnerId)))
     .limit(1);
   return row ?? null;
+}
+
+type DbExecutor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * A credential that resolves to a different vendor root than the one stored
+ * would make the next sync treat every customer of the old root as vanished
+ * and delete it — with its org mapping — and its devices
+ * (`persistVendorSnapshot`). Refuse it; the operator creates a new connection
+ * instead. A connection with no stored root yet may adopt its first one.
+ * Same rule as EDR connections (#8352).
+ */
+function vendorRootMismatch(stored: string | null, resolved: string, missingCustomerOverlap = false) {
+  if (!missingCustomerOverlap && (!stored || stored === resolved)) return null;
+  return {
+    error: 'These credentials belong to a different vendor account than this connection. '
+      + 'Create a new connection instead of changing the account on an existing one.',
+    code: 'VENDOR_ROOT_MISMATCH',
+    storedVendorRootId: stored,
+    newVendorRootId: resolved,
+  } as const;
+}
+
+/** Stored customers are scoped to both the connection and its owning partner. */
+async function customerOverlapMismatch(
+  executor: DbExecutor,
+  id: string,
+  partnerId: string,
+  stored: string | null,
+  resolved: string,
+  customerIds: ReadonlySet<string>,
+) {
+  const customers = await executor
+    .select({ vendorCustomerId: backupProviderCustomers.vendorCustomerId })
+    .from(backupProviderCustomers)
+    .where(and(eq(backupProviderCustomers.connectionId, id), eq(backupProviderCustomers.partnerId, partnerId)));
+  return customers.length && !customers.some(customer => customerIds.has(customer.vendorCustomerId))
+    ? vendorRootMismatch(stored, resolved, true)
+    : null;
+}
+
+/**
+ * The authoritative mismatch check, run inside the write transaction. The
+ * vendor round-trip happens outside any transaction (#1105), so a concurrent
+ * PATCH can commit a different root after this request's pre-check; the
+ * `FOR UPDATE` lock serialises the re-read with this request's write until
+ * commit. A missing row returns null and the caller's scoped write then
+ * matches nothing.
+ */
+async function lockedVendorRootMismatch(
+  executor: DbExecutor,
+  id: string,
+  partnerId: string,
+  resolved: string,
+  customerIds?: ReadonlySet<string>,
+) {
+  const [row] = await executor
+    .select({ vendorRootId: backupProviderConnections.vendorRootId })
+    .from(backupProviderConnections)
+    .where(and(eq(backupProviderConnections.id, id), eq(backupProviderConnections.partnerId, partnerId)))
+    .limit(1)
+    .for('update');
+  if (!row) return null;
+  return customerIds
+    ? customerOverlapMismatch(executor, id, partnerId, row.vendorRootId, resolved, customerIds)
+    : vendorRootMismatch(row.vendorRootId, resolved);
+}
+
+/** The audit row for a refused root change; ids only, never the credential. */
+function vendorRootMismatchAudit(
+  action: 'backup_provider.connection.update.rejected' | 'backup_provider.connection.test.rejected',
+  id: string,
+  partnerId: string,
+  mismatch: NonNullable<ReturnType<typeof vendorRootMismatch>>,
+) {
+  return {
+    orgId: null,
+    action,
+    resourceType: 'backup_provider_connection',
+    resourceId: id,
+    result: 'denied' as const,
+    details: {
+      partnerId,
+      reason: 'vendor_root_mismatch',
+      storedVendorRootId: mismatch.storedVendorRootId,
+      newVendorRootId: mismatch.newVendorRootId,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -130,8 +219,9 @@ connectionRoutes.post(
       return c.json({ error: `Invalid ${adapter.label} credentials` }, 400);
     }
 
-    const baseUrl = body.baseUrl ?? 'https://api.backup.management/jsonapi';
-    const urlError = assertHttpsBaseUrl(baseUrl);
+    const baseUrl = body.baseUrl ?? adapter.defaultBaseUrl;
+    if (!baseUrl) return c.json({ error: `Base URL is required for ${adapter.label}` }, 400);
+    const urlError = assertHttpsBaseUrl(baseUrl) ?? adapter.validateBaseUrl?.(baseUrl);
     if (urlError) return c.json({ error: urlError }, 400);
 
     // The row id is generated HERE, not defaulted by the database: the
@@ -163,7 +253,7 @@ connectionRoutes.post(
             vendorRootName: test.rootName,
             isActive: true,
             status: 'connected',
-            syncIntervalMinutes: body.syncIntervalMinutes ?? 30,
+            syncIntervalMinutes: body.syncIntervalMinutes ?? adapter.defaultSyncIntervalMinutes ?? 30,
             showProviderNameInPortal: body.showProviderNameInPortal ?? false,
             createdBy: auth.user?.id ?? null,
           })
@@ -242,6 +332,9 @@ connectionRoutes.patch(
     if (!existing) return c.json({ error: 'Backup provider connection not found' }, 404);
 
     const updates: Record<string, unknown> = { updatedAt: new Date() };
+    /** Set only when the credential changes: the root it resolved to. */
+    let resolvedRootId: string | null = null;
+    let resolvedCustomerIds: Set<string> | undefined;
     if (body.name !== undefined) updates.name = body.name;
     if (body.isActive !== undefined) updates.isActive = body.isActive;
     if (body.syncIntervalMinutes !== undefined) updates.syncIntervalMinutes = body.syncIntervalMinutes;
@@ -265,6 +358,24 @@ connectionRoutes.patch(
         // leave the connection with no working credential at all.
         return c.json({ success: false, error: test.error, reauth: test.reauth }, 422);
       }
+      // Cheap pre-check before sealing anything; re-checked under the row
+      // lock inside the write transaction below.
+      if (adapter.rootContinuity === 'customer_overlap') {
+        const customers = await adapter.listCustomers(creds.data, existing.baseUrl, test.rootId);
+        resolvedCustomerIds = new Set(customers.map(customer => customer.vendorCustomerId));
+      }
+      const mismatch = resolvedCustomerIds
+        ? await withAuthDbAccessContext(auth, () => customerOverlapMismatch(
+          db, id, gate.partnerId, existing.vendorRootId, test.rootId, resolvedCustomerIds!,
+        ))
+        : vendorRootMismatch(existing.vendorRootId, test.rootId);
+      if (mismatch) {
+        writeRouteAudit(c, vendorRootMismatchAudit(
+          'backup_provider.connection.update.rejected', id, gate.partnerId, mismatch,
+        ));
+        return c.json(mismatch, 409);
+      }
+      resolvedRootId = test.rootId;
       // Re-sealed under the EXISTING row id: the AAD is bound to it.
       updates.credentialsEncrypted = encryptProviderCredentials(existing.id, creds.data);
       updates.vendorRootId = test.rootId;
@@ -284,6 +395,10 @@ connectionRoutes.patch(
       // savepoint, leaving the ambient context usable so the mapped 409
       // actually reaches the client instead of poisoning the whole request.
       updated = await withAuthDbAccessContext(auth, () => db.transaction(async (tx) => {
+        if (resolvedRootId !== null) {
+          const mismatch = await lockedVendorRootMismatch(tx, id, gate.partnerId, resolvedRootId, resolvedCustomerIds);
+          if (mismatch) return { kind: 'mismatch' as const, mismatch };
+        }
         const [row] = await tx
           .update(backupProviderConnections)
           .set(updates)
@@ -306,7 +421,8 @@ connectionRoutes.patch(
             WHERE connection_id = ${id}::uuid
           `);
         }
-        return loadConnection(id, gate.partnerId);
+        const connection = await loadConnection(id, gate.partnerId);
+        return connection ? { kind: 'updated' as const, connection } : null;
       }));
     } catch (error) {
       if (pgErrorCode(error) === '23505') {
@@ -319,6 +435,12 @@ connectionRoutes.patch(
     }
 
     if (!updated) return c.json({ error: 'Backup provider connection not found' }, 404);
+    if (updated.kind === 'mismatch') {
+      writeRouteAudit(c, vendorRootMismatchAudit(
+        'backup_provider.connection.update.rejected', id, gate.partnerId, updated.mismatch,
+      ));
+      return c.json(updated.mismatch, 409);
+    }
 
     // A deactivated connection is skipped by processSyncAll, so nothing would
     // ever clear its alerts again — the inbox would keep showing failures for a
@@ -341,7 +463,7 @@ connectionRoutes.patch(
       },
     });
 
-    return c.json({ data: updated });
+    return c.json({ data: updated.connection });
   },
 );
 
@@ -424,6 +546,25 @@ connectionRoutes.post(
 
     const result = await adapter.testConnection(creds, existing.baseUrl);
 
+    let resolvedCustomerIds: Set<string> | undefined;
+    if (result.ok) {
+      if (adapter.rootContinuity === 'customer_overlap') {
+        const customers = await adapter.listCustomers(creds, existing.baseUrl, result.rootId);
+        resolvedCustomerIds = new Set(customers.map(customer => customer.vendorCustomerId));
+      }
+      const mismatch = resolvedCustomerIds
+        ? await withAuthDbAccessContext(auth, () => customerOverlapMismatch(
+          db, id, gate.partnerId, existing.vendorRootId, result.rootId, resolvedCustomerIds!,
+        ))
+        : vendorRootMismatch(existing.vendorRootId, result.rootId);
+      if (mismatch) {
+        writeRouteAudit(c, vendorRootMismatchAudit(
+          'backup_provider.connection.test.rejected', id, gate.partnerId, mismatch,
+        ));
+        return c.json(mismatch, 409);
+      }
+    }
+
     // Persist the outcome best-effort in a second short context. Only a REAUTH
     // failure changes `status`: a 503 must not disable a healthy connection.
     // `lastSyncError`/`lastSyncStatus` describe the most recent SYNC job, not a
@@ -432,7 +573,13 @@ connectionRoutes.post(
     // failed" line carrying the TEST error while `last_sync_status` stayed
     // `success`. A transient (non-reauth) failure persists nothing at all.
     if (result.ok || result.reauth) {
-      await withAuthDbAccessContext(auth, async () => {
+      const lateMismatch = await withAuthDbAccessContext(auth, async () => {
+        if (result.ok) {
+          // A concurrent credential PATCH may have committed a different root
+          // during the vendor call; re-read it under the row lock.
+          const mismatch = await lockedVendorRootMismatch(db, id, gate.partnerId, result.rootId, resolvedCustomerIds);
+          if (mismatch) return mismatch;
+        }
         await db
           .update(backupProviderConnections)
           .set(result.ok
@@ -442,9 +589,21 @@ connectionRoutes.post(
             eq(backupProviderConnections.id, id),
             eq(backupProviderConnections.partnerId, gate.partnerId),
           ));
+        return null;
       }).catch((error) => {
-        console.error('[backupProvider] failed to persist a connection test outcome:', error);
+        // Best-effort, as before: the transaction rolled back, so neither the
+        // status nor the root was written. The pre-check above already
+        // refused any mismatch visible at load time; only a root changed
+        // concurrently AND a failed re-read lands here, and that writes nothing.
+        console.error(`[backupProvider] failed to persist a connection test outcome for ${id}:`, error);
+        return null;
       });
+      if (lateMismatch) {
+        writeRouteAudit(c, vendorRootMismatchAudit(
+          'backup_provider.connection.test.rejected', id, gate.partnerId, lateMismatch,
+        ));
+        return c.json(lateMismatch, 409);
+      }
     }
 
     writeRouteAudit(c, {

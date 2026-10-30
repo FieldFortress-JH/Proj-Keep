@@ -10,8 +10,9 @@ import {
 import {
   createManualInvoice, getInvoice, listInvoices, addManualLine, addCatalogLine, addBundleLine,
   updateLine, removeLine, deleteDraftInvoice, updateInvoice, updateIssuedDueDate,
-  changeInvoiceCurrency
+  changeInvoiceCurrency, refreshDraftTimeLines, getOwnedInvoiceOr404, requireInvoiceAccess
 } from '../../services/invoiceService';
+import { assembleCustomerInvoiceDocument } from '../../services/customerDocument';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { auditBillingDocument } from '../../services/billingDocumentAudit';
 import { InvoiceServiceError, type InvoiceActor } from '../../services/invoiceTypes';
@@ -75,6 +76,19 @@ invoiceCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), as
     return c.json({ data: { ...detail, branding } });
   } catch (err) { return handleServiceError(c, err); }
 });
+// GET /:id/customer-view — the staff Preview's read of the CUSTOMER document
+// (#9402): exactly what the portal and the public link render, from the one
+// assembler. Same middleware and the same org + site ownership check as GET /:id,
+// so access is exactly "can read this invoice". Side-effect free: no markViewed,
+// no token minted or returned, no audit row (it reads what GET /:id already can).
+// Drafts are served (staff mode), previewing what issuing will freeze.
+invoiceCrudRoutes.get('/:id/customer-view', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  try {
+    const inv = await getOwnedInvoiceOr404(c.req.valid('param').id);
+    requireInvoiceAccess(invoiceActorFrom(c), inv);
+    return c.json({ data: await assembleCustomerInvoiceDocument(inv, 'staff') });
+  } catch (err) { return handleServiceError(c, err); }
+});
 invoiceCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam), zValidator('json', updateInvoiceSchema), async (c) => {
   try { return c.json({ data: await updateInvoice(c.req.valid('param').id, c.req.valid('json'), invoiceActorFrom(c)) }); }
   catch (err) { return handleServiceError(c, err); }
@@ -122,6 +136,22 @@ invoiceCrudRoutes.patch('/:id/due-date', scopes, writePerm, zValidator('param', 
 invoiceCrudRoutes.patch('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), zValidator('json', updateLineSchema), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await updateLine(p.id, p.lineId, c.req.valid('json'), invoiceActorFrom(c)) }); }
   catch (err) { return handleServiceError(c, err); }
+});
+// #8606: draft-only "Refresh from time entries". Re-reads each time-entry
+// line's source entry; never changes quantities, prices or totals. Returns the
+// per-line outcome (refreshed / unchanged / skipped + reason / quantityDrifted).
+invoiceCrudRoutes.post('/:id/refresh-time-lines', scopes, writePerm, zValidator('param', idParam), async (c) => {
+  try {
+    const result = await refreshDraftTimeLines(c.req.valid('param').id, invoiceActorFrom(c));
+    writeRouteAudit(c, {
+      orgId: result.orgId,
+      action: 'invoice.time_lines.refreshed',
+      resourceType: 'invoice',
+      resourceId: result.invoiceId,
+      details: { ...result.summary },
+    });
+    return c.json({ data: result });
+  } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.delete('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await removeLine(p.id, p.lineId, invoiceActorFrom(c)) }); }

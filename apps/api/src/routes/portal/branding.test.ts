@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Hono } from 'hono';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -37,6 +37,19 @@ vi.mock('../../db', () => {
   };
 });
 
+// Trust Center W3d: the per-user capability is decided by the editor gate (tested in featureFlags.test.ts and
+// against Postgres in portalTrustPageEditing.integration.test.ts); here only its plumbing onto /branding.
+const { capabilitiesMock } = vi.hoisted(() => ({ capabilitiesMock: vi.fn(async () => ({ canEditTrustPage: false })) }));
+vi.mock('./featureFlags', () => ({ resolvePortalCapabilities: capabilitiesMock }));
+
+// #9674: the partner's Custom CSS read is its own system-scope query (tested in
+// portalCustomCss.test.ts); here only how /branding layers it with the org's.
+const { partnerCssMock } = vi.hoisted(() => ({ partnerCssMock: vi.fn(async (): Promise<string | null> => null) }));
+vi.mock('./portalCustomCss', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./portalCustomCss')>()),
+  loadPartnerPortalCustomCss: partnerCssMock,
+}));
+
 import { brandingRoutes } from './branding';
 
 const ORG_ID = '22222222-2222-2222-2222-222222222222';
@@ -57,6 +70,12 @@ function buildAuthenticatedApp() {
 }
 
 const authenticatedApp = buildAuthenticatedApp();
+
+// A partner CSS value set by one test must never leak into the next.
+beforeEach(() => {
+  partnerCssMock.mockReset();
+  partnerCssMock.mockResolvedValue(null);
+});
 
 describe('GET /branding (authenticated)', () => {
   beforeEach(() => {
@@ -79,7 +98,13 @@ describe('GET /branding (authenticated)', () => {
       enableHardwareHealth: true,
       enableHardwareInventory: true,
       enablePerformanceMetrics: true,
+      enableSoftwareInventory: true,
       enableNetworkVisibility: true,
+      enableHourBlock: true,
+      enablePatchDetail: true,
+      enableVulnerabilityDetail: true,
+      enablePhysicalPlacement: true,
+      enableEdrVisibility: true,
     }];
 
     const response = await authenticatedApp.request('/branding');
@@ -98,6 +123,12 @@ describe('GET /branding (authenticated)', () => {
         enableHardwareHealth: true,
         enableHardwareInventory: true,
         enablePerformanceMetrics: true,
+        enableSoftwareInventory: true,
+        enableHourBlock: true,
+        enablePatchDetail: true,
+        enableVulnerabilityDetail: true,
+        enablePhysicalPlacement: true,
+        enableEdrVisibility: true,
       },
     });
 
@@ -123,7 +154,13 @@ describe('GET /branding (authenticated)', () => {
         'enableHardwareHealth',
         'enableHardwareInventory',
         'enablePerformanceMetrics',
+        'enableSoftwareInventory',
         'enableNetworkVisibility',
+        'enableHourBlock',
+        'enablePatchDetail',
+        'enableVulnerabilityDetail',
+        'enablePhysicalPlacement',
+        'enableEdrVisibility',
       ]),
     );
   });
@@ -157,7 +194,14 @@ describe('GET /branding (authenticated)', () => {
     expect(body).not.toHaveProperty('enableHardwareHealth');
     expect(body).not.toHaveProperty('enableHardwareInventory');
     expect(body).not.toHaveProperty('enablePerformanceMetrics');
+    expect(body).not.toHaveProperty('enableSoftwareInventory');
     expect(body).not.toHaveProperty('enableNetworkVisibility');
+    expect(body).not.toHaveProperty('enableHourBlock');
+    expect(body).not.toHaveProperty('enablePatchDetail');
+    expect(body).not.toHaveProperty('enableVulnerabilityDetail');
+    expect(body).not.toHaveProperty('enablePhysicalPlacement');
+    expect(body).not.toHaveProperty('enableEdrVisibility');
+    expect(body).not.toHaveProperty('canEditTrustPage');
   });
 
   it('applies private cache headers scoped to the authenticated viewer', async () => {
@@ -174,6 +218,91 @@ describe('GET /branding (authenticated)', () => {
     expect(response.headers.get('Cache-Control')).toContain('private');
     expect(response.headers.get('Vary')).toContain('Authorization');
     expect(response.headers.get('Vary')).toContain('Cookie');
+  });
+});
+
+describe('GET /branding partner Custom CSS (#9674)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbState.rows = [];
+  });
+
+  it("serves the partner's CSS ahead of the org's, so the org's rules win the cascade", async () => {
+    partnerCssMock.mockResolvedValue('.portal-card { color: red; }');
+    dbState.rows = [{ customCss: '.portal-card { color: blue; }' }];
+
+    const response = await authenticatedApp.request('/branding');
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).branding.customCss).toBe(
+      '.portal-card { color: red; }\n\n.portal-card { color: blue; }',
+    );
+    expect(partnerCssMock).toHaveBeenCalledWith(ORG_ID);
+  });
+
+  it("serves the org's CSS unchanged when the partner has none", async () => {
+    dbState.rows = [{ customCss: '.portal-card { color: blue; }' }];
+
+    const response = await authenticatedApp.request('/branding');
+
+    expect((await response.json()).branding.customCss).toBe('.portal-card { color: blue; }');
+  });
+
+  it("serves the partner's CSS to an org that has never saved portal settings", async () => {
+    partnerCssMock.mockResolvedValue('.portal-card { color: red; }');
+    dbState.rows = [];
+
+    const response = await authenticatedApp.request('/branding');
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // Only the CSS: no row means no visibility flags, so every gated surface
+    // still fails closed exactly as on the 404 default path.
+    expect(body).toEqual({ branding: { customCss: '.portal-card { color: red; }' } });
+    expect(response.headers.get('Cache-Control')).toContain('private');
+  });
+
+  it('is part of the ETag, so a partner CSS change is not answered 304', async () => {
+    dbState.rows = [{ customCss: null }];
+    partnerCssMock.mockResolvedValue('.a { color: red; }');
+    const etagBefore = (await authenticatedApp.request('/branding')).headers.get('etag');
+    partnerCssMock.mockResolvedValue('.a { color: green; }');
+
+    const res = await authenticatedApp.request('/branding', { headers: { 'if-none-match': etagBefore ?? '' } });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).branding.customCss).toBe('.a { color: green; }');
+  });
+});
+
+describe('GET /branding canEditTrustPage (Trust Center W3d)', () => {
+  afterEach(() => { capabilitiesMock.mockImplementation(async () => ({ canEditTrustPage: false })); });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbState.rows = [{ enableSecurity: true }];
+  });
+
+  it('is false when the editor gate refuses (flag off, or not an org-admin contact)', async () => {
+    capabilitiesMock.mockResolvedValue({ canEditTrustPage: false });
+    const response = await authenticatedApp.request('/branding');
+    expect(response.status).toBe(200);
+    expect((await response.json()).branding.canEditTrustPage).toBe(false);
+    expect(capabilitiesMock).toHaveBeenCalledWith({ id: 'pu1', orgId: ORG_ID });
+  });
+
+  it('is true when the flag is on and the session user is an org-admin contact', async () => {
+    capabilitiesMock.mockResolvedValue({ canEditTrustPage: true });
+    const response = await authenticatedApp.request('/branding');
+    expect((await response.json()).branding.canEditTrustPage).toBe(true);
+  });
+
+  it('is part of the ETag, so a capability change is not answered 304', async () => {
+    capabilitiesMock.mockResolvedValue({ canEditTrustPage: false });
+    const etagOff = (await authenticatedApp.request('/branding')).headers.get('etag');
+    capabilitiesMock.mockResolvedValue({ canEditTrustPage: true });
+    const res = await authenticatedApp.request('/branding', { headers: { 'if-none-match': etagOff ?? '' } });
+    expect(res.status).toBe(200);
+    expect((await res.json()).branding.canEditTrustPage).toBe(true);
   });
 });
 
@@ -225,7 +354,14 @@ describe('GET /branding/:domain (public)', () => {
     expect(body.branding).not.toHaveProperty('enableHardwareHealth');
     expect(body.branding).not.toHaveProperty('enableHardwareInventory');
     expect(body.branding).not.toHaveProperty('enablePerformanceMetrics');
+    expect(body.branding).not.toHaveProperty('enableSoftwareInventory');
     expect(body.branding).not.toHaveProperty('enableNetworkVisibility');
+    expect(body.branding).not.toHaveProperty('enableHourBlock');
+    expect(body.branding).not.toHaveProperty('enablePatchDetail');
+    expect(body.branding).not.toHaveProperty('enableVulnerabilityDetail');
+    expect(body.branding).not.toHaveProperty('enablePhysicalPlacement');
+    expect(body.branding).not.toHaveProperty('enableEdrVisibility');
+    expect(body.branding).not.toHaveProperty('canEditTrustPage');
     expect(response.headers.get('Cache-Control')).toContain('public');
 
     // Same reasoning as the authenticated case: the mock ignores the
@@ -245,7 +381,13 @@ describe('GET /branding/:domain (public)', () => {
       'enableHardwareHealth',
       'enableHardwareInventory',
       'enablePerformanceMetrics',
+      'enableSoftwareInventory',
       'enableNetworkVisibility',
+      'enableHourBlock',
+      'enablePatchDetail',
+      'enableVulnerabilityDetail',
+      'enablePhysicalPlacement',
+      'enableEdrVisibility',
     ]) {
       expect(Object.keys(dbState.selected ?? {})).not.toContain(flag);
     }
@@ -266,6 +408,26 @@ describe('GET /branding/:domain (public)', () => {
     const body = await response.json();
     expect(body.branding.chromeAccent).toBe('teal');
     expect(Object.keys(dbState.selected ?? {})).toContain('chromeAccent');
+  });
+
+  it("layers the partner's CSS ahead of the org's on the public domain lookup (#9674)", async () => {
+    partnerCssMock.mockResolvedValue('.portal-card { color: red; }');
+    dbState.rows = [{
+      orgId: ORG_ID,
+      customDomain: 'portal.example.test',
+      domainVerified: true,
+      customCss: '.portal-card { color: blue; }',
+    }];
+
+    const publicApp = new Hono();
+    publicApp.route('/', brandingRoutes);
+    const response = await publicApp.request('/branding/portal.example.test');
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).branding.customCss).toBe(
+      '.portal-card { color: red; }\n\n.portal-card { color: blue; }',
+    );
+    expect(partnerCssMock).toHaveBeenCalledWith(ORG_ID);
   });
 
   it('returns 404 when the domain is unverified or unknown', async () => {

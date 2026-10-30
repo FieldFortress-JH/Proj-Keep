@@ -77,6 +77,9 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   // --- org-required ---
   { pattern: /^\/discovery(\/.*)?$/, kind: 'org-required' },
   { pattern: /^\/monitoring(\/.*)?$/, kind: 'org-required' },
+  // AI operator recipe library + task list (#6171 R1b): needs one org. Exact
+  // match only — /operator/tasks/:id (org-or-all, #5205 W07) is registered below.
+  { pattern: /^\/operator\/?$/, kind: 'org-required' },
   // Their APIs 400 without an org (backup dashboard, C2C connections/jobs,
   // DR plans) — the pages render OrgRequiredState in fleet view.
   { pattern: /^\/backup(\/.*)?$/, kind: 'org-required' },
@@ -125,6 +128,8 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   // #5288 — Jobs is the new nav home for automations (same page component,
   // same org-scope semantics); /automations/* now just redirects here.
   { pattern: /^\/jobs(\/.*)?$/, kind: 'org-or-all' },
+  // Tool Catalog W3 (#5218): Flows list/detail — owner-scoped rows, org filter optional.
+  { pattern: /^\/flows(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/vulnerabilities$/, kind: 'org-or-all' },
   { pattern: /^\/security(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/sensitive-data(\/.*)?$/, kind: 'org-or-all' },
@@ -140,6 +145,8 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   { pattern: /^\/audit-baselines(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/logs(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/tickets(\/.*)?$/, kind: 'org-or-all' },
+  // Endpoint message send history (#8742): fleet state, narrowed by the selected org.
+  { pattern: /^\/endpoint-messages(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/billing(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/contracts(\/.*)?$/, kind: 'org-or-all' },
   // W03 IA split: the agreements area is the same fleet-state surface the
@@ -157,9 +164,23 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   { pattern: /^\/snmp(\/.*)?$/, kind: 'org-or-all' },
   { pattern: /^\/dns-security$/, kind: 'org-or-all' },
   { pattern: /^\/onedrive$/, kind: 'org-or-all' },
+  // The multi-tab chat lives at /ai/chat; /wisp/chat and /workspace only redirect to it.
+  { pattern: /^\/ai\/chat$/, kind: 'org-or-all' },
+  { pattern: /^\/wisp\/chat$/, kind: 'org-or-all' },
   { pattern: /^\/workspace$/, kind: 'org-or-all' },
 
+  // The Sites list and a site's detail (#9794) list/show sites fleet-wide or
+  // in the selected org — not MSP-level settings — so they sit above the
+  // /settings catch-all, which would hide the fleet scope line.
+  { pattern: /^\/settings\/sites(\/[^/]+)?$/, kind: 'org-or-all' },
+
   // --- partner-settings ---
+  // Wisp thread page (W06 #9918): its subject is one grant (partner-wide or one
+  // org), never the switcher's org, so no scope line. Not catalog — its reads
+  // opt out of ambient orgId per request (skipOrgIdInjection) instead.
+  { pattern: /^\/ai\/wisp\/thread\/[^/]+$/, kind: 'partner-settings' },
+  // The Wisp home (W08 #9921): same subject as the thread page — one grant.
+  { pattern: /^\/wisp$/, kind: 'partner-settings' },
   { pattern: /^\/settings(\/.*)?$/, kind: 'partner-settings' },
   { pattern: /^\/integrations(\/.*)?$/, kind: 'partner-settings' },
   { pattern: /^\/partner(\/.*)?$/, kind: 'partner-settings' },
@@ -174,6 +195,8 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   // Public Quick Support landing page. The one-time code in the URL is the only
   // credential — an end user reaching it has no Breeze account at all.
   { pattern: /^\/quick$/, kind: 'auth' },
+  // Public caller-verification card. The URL token is the only credential.
+  { pattern: /^\/verify\/[^/]+$/, kind: 'auth' },
 ];
 
 function normalize(pathname: string): string {
@@ -204,6 +227,17 @@ export function getRouteScope(pathname: string): RouteScopeKind | null {
  */
 export function isSingleDocumentRoute(pathname: string): boolean {
   return /^\/billing\/(quotes|invoices)\/[^/]+$/.test(normalize(pathname));
+}
+
+/**
+ * Pages whose own heading names the scope ("Devices & Assets · All
+ * organizations", #9035). They keep their org-or-all classification, but
+ * ContextScopeLine skips the fleet line: with the switcher pill and the
+ * org-switch toast it would be the third statement of the same fact, and the
+ * row it costs pushes the first table row below the fold.
+ */
+export function isScopeInHeadingRoute(pathname: string): boolean {
+  return normalize(pathname) === '/devices';
 }
 
 /**

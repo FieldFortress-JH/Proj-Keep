@@ -167,24 +167,35 @@ By default, when a technician starts a remote desktop session the person sitting
 | **Notify** *(default)* | A desktop notification appears — "*Jordan Lee connected to your computer*" — and the session begins immediately. No approval is required. |
 | **Consent** | A dialog asks the user to **Allow** or **Deny** before the technician can see the screen. The technician's view does not start until the user allows it. |
 
-When a session is active, a small indicator ("*Jordan Lee is connected*" with a live timer) is shown at the top of the user's screen for the duration of the session, and a "*Remote session ended*" notice appears when the technician disconnects. Both can be turned off per policy.
+When a session is active, a small indicator ("*Jordan Lee is connected*" with a live timer) is shown at the top of the user's screen for the duration of the session, and a "*Remote session ended*" notice appears when the technician disconnects. Both can be turned off per policy. The on-screen indicator is drawn on Windows, and by Breeze Assist on macOS and Linux; without Assist, macOS and Linux show the start and end notices only.
 
 **What the end user sees in Consent mode**
 
-The consent dialog asks the user to allow or deny the remote session, with **Deny selected by default** — a privacy prompt never grants access on a stray keypress. If the user doesn't respond before the prompt times out, Breeze applies the policy's fallback (see below). The countdown starts only once the prompt is confirmed on screen, and a prompt that expired while the session was locked or disconnected counts as "could not be shown", not as unanswered.
+The prompt asks the user to allow or deny the remote session, naming the technician (to the level set by *Technician identity shown*) and their organization. It is drawn by one of two renderers, and which one appears depends on whether Breeze Assist is running in the user's session:
+
+| Renderer | When it is used | What it looks like |
+|----------|-----------------|--------------------|
+| **Breeze Assist card** | Breeze Assist is running in the signed-in user's session. | A branded card with **Allow** and **Deny** buttons. |
+| **Native dialog** | Breeze Assist is not running, but the Breeze user helper in that session can draw a system dialog. | A **Remote Support Request** dialog: a system message box with **Yes** / **No** on Windows, an **Allow** / **Deny** dialog on macOS, a `zenity` dialog on Linux (requires `zenity` installed and a graphical display). |
+
+Consent mode therefore works without Breeze Assist. Both renderers show a **30-second countdown** (the API ships the length with the session start). The countdown starts only once the prompt is confirmed on screen, and the technician's view does not start until the user answers.
+
+**Deny is the default button on both renderers**, so a stray Enter keypress never grants access. (Native dialogs defaulted to Yes / Allow on agents released before this was changed in [#10187](https://github.com/LanternOps/breeze/issues/10187); update the agent to get the Deny default.) If the user doesn't answer in time, the dialog closes itself and Breeze applies the policy's fallback on Windows (see *When consent can't be asked* below); on macOS and Linux an unanswered prompt is refused, because they can't tell whether the screen was locked. A prompt that expired while the session was locked or disconnected counts as "could not be shown", not as unanswered.
+
+A session is refused most commonly when someone is signed in and **neither** renderer can reach them: Breeze Assist is not running and the user helper cannot draw a native dialog (for example a Linux session with no display or without `zenity`).
 
 **Settings (per Configuration Policy → Remote Access)**
 
 | Setting | Options | Default | Effect |
 |---------|---------|---------|--------|
 | Session prompt mode | Off / Notify / Consent | **Notify** | Whether the user is notified and/or must consent. |
-| When consent can't be asked | Proceed / Block | **Proceed** | What happens when **no one is signed in** to the session being viewed, or when the signed-in user doesn't respond in time. **Proceed** connects anyway; **Block** refuses the session. An explicit **Deny** always blocks regardless of this setting. With current agents, a session where someone **is** signed in but the prompt can't be shown to them (Breeze Assist not running or not responding) is always refused, whatever this is set to. |
+| When consent can't be asked | Proceed / Block | **Proceed** | What happens when **no one is signed in** to the session being viewed, or when the signed-in user doesn't respond in time. **Proceed** connects anyway; **Block** refuses the session. An explicit **Deny** always blocks regardless of this setting. With current agents, a session where someone **is** signed in but the prompt can't be shown to them (neither Breeze Assist nor the native dialog can reach them) is always refused, whatever this is set to. |
 | Notify on session end | On / Off | **On** | Whether the "session ended" notice is shown. |
 | Show active-session indicator | On / Off | **On** | Whether the top-of-screen indicator appears during the session. |
-| Technician identity shown | Name & email / Name only / Generic | **Name & email** | How much of the technician's identity is revealed to the end user. **Generic** shows "*A technician*" with no name or email. |
+| Technician identity shown | Name & email / Name only / Generic | **Name & email** | How much of the technician's identity is revealed to the end user, in the prompt and the notices. **Name & email** shows both, **Name only** omits the address, and **Generic** shows "*A technician*" with no name or email. |
 
 <Aside>
-  These surfaces are drawn by the **Breeze Helper** running in the signed-in user's desktop session. On an unattended machine (no user signed in), there is no one to notify or ask — in **Consent** mode, Breeze then applies the *"When consent can't be asked"* fallback. With **Proceed** (the default), unattended and headless machines are never locked out. If a user is signed in but the Helper can't show them the prompt, current agents refuse the session instead of connecting without asking. Only Windows reports whether the screen is locked, so on macOS and Linux a prompt that times out is refused.
+  These surfaces are drawn in the signed-in user's desktop session by Breeze Assist or, when Assist isn't running, by the Breeze user helper's native dialogs. On an unattended machine (no user signed in), there is no one to notify or ask — in **Consent** mode, Breeze then applies the *"When consent can't be asked"* fallback. With **Proceed** (the default), unattended and headless machines are never locked out. If a user is signed in but neither can show them the prompt, current agents refuse the session instead of connecting without asking. Only Windows reports whether the screen is locked, so on macOS and Linux a prompt that times out is refused.
 </Aside>
 
 <Aside type="note">
@@ -233,6 +244,67 @@ The viewer toolbar includes a keyboard shortcut menu that adapts to the target d
 
 Select a shortcut from the menu to inject it into the remote session. This avoids the problem of your local operating system intercepting the key combination before it reaches the viewer.
 
+### Viewer Shortcuts
+
+The Breeze Viewer keeps its own shortcuts behind one prefix chord that remote applications do not use, so every other key combination reaches the remote:
+
+| Action | Windows / Linux | macOS |
+|--------|-----------------|-------|
+| Fullscreen (toggle) | Ctrl+Alt+Shift+F | ⌃⌥⌘F |
+| Paste as keystrokes (**Paste Text**) | Ctrl+Alt+Shift+V | ⌃⌥⌘V |
+| **Release stuck keys** (in the toolbar's overflow menu) | Ctrl+Alt+Shift+R | ⌃⌥⌘R |
+
+From v0.122.1, Ctrl/Cmd+Shift+V and Ctrl/Cmd+Shift+F are no longer viewer shortcuts: they go to the remote, so paste-as-plain-text and Find in Files work in remote applications.
+
+### Keyboard and Mouse Input
+
+- **Nothing stays held down.** When the viewer window loses focus or the session drops, the viewer and agent release every key and mouse button they pressed on the remote. If a key still seems stuck, use **Release stuck keys**.
+- **German and French keyboards** (QWERTZ and AZERTY) type the right letters on Windows and Linux remotes.
+
+### Keyboard Mode
+
+The **Keyboard mode** control in the Breeze Viewer toolbar (v0.123.0+) sets how your keystrokes reach the remote:
+
+- **Type what I see** (default). The remote resolves each key through its own keyboard layout, so the characters you see on your keys are what gets typed. IME composition (Chinese, Japanese, Korean input) and dead keys (for example ´ then E for É) are sent as finished text once you commit them. The remote sees nothing until the composition is committed.
+- **Physical keys**. The viewer sends the physical key position, which keeps distinctions such as the numpad and the right-hand modifier keys. It needs a WebRTC session and an agent from v0.123.0 or later; on an older agent or a WebSocket session the option is disabled and its tooltip says why.
+
+The mode is remembered for each device, and the last mode you chose becomes the default for devices that have no choice of their own. Keyboard mode does not apply to VNC sessions.
+
+### Viewer Options
+
+The toolbar's **More options** menu (v0.123.0+) adds:
+
+| Option | What it does |
+|--------|--------------|
+| **View only** | Stops sending your keyboard and mouse to the remote, so you can watch without clicking anything by accident. Turning it on releases any held keys first, and an indicator shows while it is on. Nothing is sent to the device; it only affects your viewer. |
+| **Block remote input** | Blocks the keyboard and mouse at the remote device while you work. WebRTC sessions only. The option is disabled when the device does not support it, and the toggle shows the device's confirmed state rather than assuming the request worked. |
+| **Stats overlay** | Shows round-trip time, frame rate, bitrate, packet loss, codec and connection path. Off by default. |
+| **Copy screenshot** / **Save screenshot** | Captures the current frame to your clipboard, or saves it as a PNG in your Pictures folder (Downloads if there is none). Screenshots stay on your machine and are never uploaded. |
+| **Fit to window** / **100% (scroll)** | Scales the remote screen to the window, or shows it at one remote pixel per screen point with scrollbars. |
+
+Scaling and audio are remembered per device, along with keyboard mode. These preferences are stored by the Breeze Viewer on your computer and are never sent to Breeze.
+
+**Fullscreen keyboard lock.** In fullscreen, the viewer captures system shortcuts such as Alt+Tab, the Windows key and Esc, so they reach the remote instead of your computer. Exit fullscreen with the toolbar button or the fullscreen shortcut. Where the platform does not support keyboard lock, nothing changes and **Send Keys** remains the way to send those combinations.
+
+**macOS viewer.** Cmd+H, Cmd+M and Cmd+W go to the remote; Hide, Minimize and Close Window are still in the menu bar. Cmd+Q asks before quitting while sessions are open.
+
+### Clipboard
+
+On a WebRTC session the clipboard syncs in both directions: text up to 1 MiB and PNG or JPEG images up to 8 MiB. Each direction is a separate setting on the **Remote Access** feature of a configuration policy: **Clipboard: remote → viewer (copy from remote)** and **Clipboard: viewer → remote (paste to remote)**. Copying from the remote is the data-egress direction (whatever the end user copies reaches the technician) and is off by default on hosted Breeze.
+
+The **Clipboard** chip in the viewer toolbar (it reads **Clipboard off** when both directions are disabled) shows what policy allows in each direction (*Remote → local* and *Local → remote*, each **On** or **Disabled by policy**) and the last transfer. Its menu has two actions:
+
+- **Copy remote clipboard** brings the remote clipboard to your machine, for example when the viewer was in the background when something was copied on the remote.
+- **Send clipboard to remote** pushes your clipboard to the remote, for applications where you paste from a menu rather than with a keyboard shortcut.
+
+Pressing the remote's paste shortcut sends your clipboard first. If it can't be delivered (too large, disabled by policy, or the connection dropped), the paste is cancelled with a *Nothing pasted* message instead of pasting whatever was on the remote clipboard before. Connecting to a session no longer overwrites your local clipboard with the remote's.
+
+Clipboard v2 needs agent and Breeze Viewer v0.122.1 or later. With an older agent the chip reports that the agent did not report clipboard status: text only, policy unknown. On a VNC session the clipboard is text only.
+
+<Aside type="caution" title="Known gap: images copied on a Windows device">
+  An image copied on a Windows device does not reach the viewer yet. The desktop session runs as SYSTEM and cannot read the user's copied image formats. Text copies work in both directions, and images pasted *into* a Windows device are not affected. A fix is planned for a follow-up release.
+</Aside>
+
 ### Login Screen (macOS)
 
 WebRTC remote desktop cannot control a Mac at the login window. macOS blocks remote keyboard and mouse input there for third-party agents, so a session would show the login screen while ignoring every click and keystroke. The agent therefore refuses to start a WebRTC session while the Mac is at the login window:
@@ -262,6 +334,12 @@ Network Proxy lets you access web-based admin UIs on an agent's local network wi
 <Aside type="note">
   If the target device uses a self-signed certificate and you didn't check the box up front, the request fails with an untrusted-certificate error and the session shows a **Reconnect allowing self-signed certificate** button in place. Clicking it opens a fresh session to the same target with certificate verification skipped — it does not change any persistent trust settings, and it only applies to that session.
 </Aside>
+
+**Path mode and host mode:**
+
+By default Network Proxy runs in **path mode**: the device's pages are served under your Breeze hostname, and Breeze rewrites links and sandboxes the frame. Some device UIs still misbehave, usually ones that build absolute URLs or depend on their own cookies or local storage.
+
+If your administrator has set up a dedicated tunnel domain, a partner can turn on **Serve Network Proxy from a dedicated origin** in **Settings → Partner → Remote Access**. Each tunnel then gets its own origin, so the device UI behaves as it does on its own address. The setting applies to every organization under the partner. If your browser blocks cookies or storage for the embedded device page, a notice appears with an **Open In New Tab** button. Without a second domain, nothing changes and path mode keeps working. Administrators: see [Network Proxy Dedicated Origin](/deploy/network-proxy-tunnel-origin/).
 
 **Session lifetime:**
 
@@ -403,6 +481,12 @@ Clicking a row in the session history re-opens a live detail panel for that sess
 
 ---
 
+## Who's Connected
+
+When a colleague already has a live **Desktop**, **Terminal** or VNC session on a device, the device page shows a banner such as *Someone else has a session on this device* (or *N other people have sessions on this device*), with one row per person naming them, the session type and how long it has been open (or *connecting…*). Your own sessions are not listed. The banner is informational only: it never blocks or ends a session. It refreshes every 60 seconds while the tab is visible, and straight away when you return to the tab or the device's status changes. It needs `remote:access` and `devices:read`; an offline device shows no banner.
+
+---
+
 ## Session Lifecycle
 
 All session types follow the same state machine:
@@ -478,6 +562,8 @@ To free session capacity, close active sessions from the Active Sessions list on
 
 **All sessions are audit logged.** Every session creation, state transition, and termination is recorded with the actor identity, device identifier, start time, end time, duration in seconds, and bytes transferred. Audit records are immutable.
 
+**Clipboard activity is summarised, never recorded.** Each desktop session writes one `session_clipboard_summary` audit entry describing its clipboard activity. Clipboard content is never logged.
+
 **Consent is audit logged.** When session consent or notification is enabled by policy, each session records whether the end user granted, denied, or had consent bypassed (with the reason — for example, no user logged in), alongside the technician identity disclosed.
 
 **Remote access requires the `remote:access` permission.** This permission is not granted by default on all roles. Navigate to **Settings → Roles** if a user receives "Access denied" when creating a session.
@@ -495,6 +581,7 @@ To free session capacity, close active sessions from the Active Sessions list on
 | GET | `/remote/sessions/:id` | Get session details |
 | GET | `/remote/sessions/history` | Session statistics (total sessions, total duration, average duration) |
 | DELETE | `/remote/sessions/stale` | Terminate all pending, connecting, and active sessions |
+| GET | `/remote/devices/:deviceId/active-sessions` | Live sessions on a device (all users), for the [Who's Connected](#whos-connected) banner |
 | GET | `/remote/ice-servers` | Get ICE/TURN server configuration for WebRTC |
 | POST | `/remote/sessions/:id/offer` | Send SDP offer from browser to device |
 | POST | `/remote/sessions/:id/ice` | Exchange ICE candidates between browser and device |
@@ -645,12 +732,39 @@ sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
 
 If the process shows up in `ps` but nothing is drawn, FUSE is working and the problem is the desktop stack, not packaging — typically a host GTK module or `gvfs` build that is incompatible with the bundled runtime. Run the AppImage from a terminal and read the messages: `Failed to load module` and `undefined symbol` lines name the offending host library. Starting with a clean environment (`env -i DISPLAY=$DISPLAY HOME=$HOME ~/Downloads/breeze-viewer-linux.AppImage`) confirms whether a host module is being injected.
 
+### Gray window with no controls on NVIDIA
+
+On the NVIDIA driver, webkit2gtk's DMA-BUF renderer can fail to paint anything: the viewer window opens solid gray, with no toolbar, no transport badge and no buttons. The viewer now works around this itself. At startup on Linux it checks whether the NVIDIA kernel driver is loaded (`/proc/driver/nvidia/version` or `/sys/module/nvidia` exists) and, if so, sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` before its first window opens. webkit2gtk then falls back to its older compositing path. Run from a terminal, the viewer prints a line saying it did this.
+
+The viewer never overrides a value you set yourself:
+
+- **Gray window on a machine without the NVIDIA driver** (nouveau, some virtual machines): force the workaround on.
+
+  ```bash
+  WEBKIT_DISABLE_DMABUF_RENDERER=1 ~/Downloads/breeze-viewer-linux.AppImage
+  ```
+
+- **NVIDIA machine where the DMA-BUF renderer works and you want to keep it**: set the variable to `0` and the viewer leaves it alone.
+
+  ```bash
+  WEBKIT_DISABLE_DMABUF_RENDERER=0 ~/Downloads/breeze-viewer-linux.AppImage
+  ```
+
+To make either choice permanent, export the variable from your shell profile or put it in a small launcher script.
+
+<Aside type="caution" title="Do not set LIBGL_ALWAYS_SOFTWARE or GDK_BACKEND">
+  Workarounds posted for other webkit2gtk apps often also set `LIBGL_ALWAYS_SOFTWARE=1` and `GDK_BACKEND=x11`. Neither is needed for the gray window. `LIBGL_ALWAYS_SOFTWARE=1` moves all rendering onto the CPU, which makes remote video slow. `GDK_BACKEND=x11` forces XWayland on a Wayland desktop. If you added either to a launcher script for the viewer, remove it.
+</Aside>
+
 ---
 
 ## Troubleshooting
 
 **Linux viewer does nothing when run.**
 The AppImage needs FUSE 2 to mount itself. On Debian 13 / Ubuntu 24.04+ the package is `libfuse2t64`, not `libfuse2`. See [Linux viewer (AppImage)](#linux-viewer-appimage) for the per-distribution package names and the `--appimage-extract-and-run` fallback.
+
+**Linux viewer opens a gray window with no toolbar or buttons.**
+This is webkit2gtk's DMA-BUF renderer failing, most often on the NVIDIA driver. The viewer disables that renderer automatically when it detects the NVIDIA driver; on other hosts, launch it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`. See [Gray window with no controls on NVIDIA](#gray-window-with-no-controls-on-nvidia).
 
 **Linux viewer always connects on the WebSocket transport, never WebRTC.**
 The host's webkit2gtk build does not expose `RTCPeerConnection`, so the viewer skips WebRTC and uses the WebSocket (JPEG) transport. The session window shows a notice saying so, and the browser console logs `WebRTC is unavailable in this WebView (no RTCPeerConnection global)`. Installing the GStreamer plugin sets usually restores it — see [WebRTC needs webkit2gtk built with the GStreamer plugins](#webrtc-needs-webkit2gtk-built-with-the-gstreamer-plugins). This is a property of the host, not of the device you are connecting to.
@@ -668,7 +782,7 @@ The viewer should automatically fall back to the WebSocket transport after a tim
 **Poor video quality, high latency, or stalls — where are the WebRTC diagnostics?**
 While a desktop session is live, the device emits two periodic diagnostic lines: `Viewer WebRTC stats` (RTT, jitter, packet loss, frame drops as reported by the viewer) and `Desktop WebRTC metrics` (`captureMs`, `convertMs`, `encodeMs`, frames captured/encoded/sent, bandwidth). Both are shipped to **Devices → Select Device → Agent Logs** for the duration of the session regardless of `log_shipping_level`, so you do not need to lower the level to see them. Read `captureMs` against `encodeMs`: a high `captureMs` with a low `encodeMs` means the screen capturer is the bottleneck, not the encoder.
 
-On macOS with `isService=true` the desktop-helper writes the same lines locally to `/Library/Application Support/Breeze/logs/desktop-helper.log`; on Windows they are in `C:\ProgramData\Breeze\logs\user-helper.log`. If the helper logs `Log shipping disabled: helper config is missing required keys` at startup, the listed `agent.yaml` keys are absent and nothing from that process reaches Agent Logs — re-enrol or repair the config, then restart the helper.
+On macOS with `isService=true` the desktop-helper writes the same lines locally to `/Library/Application Support/Breeze/logs/desktop-helper.log`; on Windows they are in `C:\ProgramData\Breeze\logs\user-helper.log`. The Windows user-role helper (toasts, chat, user-context scripts) runs as the logged-in user and writes `%LOCALAPPDATA%\Breeze\logs\user-helper.log` in that user's profile instead. Windows helpers have no log-shipping credentials of their own, so they relay their warning and error lines to the agent, which records them in Agent Logs under component `helper` with `helperRole` and `helperSessionId` (capped at about 20 lines a minute per helper). If the helper logs `Log shipping disabled: helper config is missing required keys` at startup, the listed `agent.yaml` keys are absent and nothing from that process reaches Agent Logs — re-enrol or repair the config, then restart the helper.
 
 **Session limit hit (429).**
 The organisation or user limit on concurrent sessions has been reached. Call `DELETE /remote/sessions/stale` to free capacity, or navigate to the Active Sessions list and close sessions that are no longer needed.

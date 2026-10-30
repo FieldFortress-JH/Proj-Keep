@@ -114,6 +114,27 @@ describe('portal layout chrome accent', () => {
   });
 });
 
+describe('PortalLayout approvals badge (#8200)', () => {
+  it('counts only pending requests the customer can decide, and treats a failed read as zero', () => {
+    expect(SOURCE).toContain('portalApi.getApprovals(');
+    expect(SOURCE).toContain('pendingOnly: true');
+    expect(SOURCE).toMatch(/canDecide/);
+    expect(SOURCE).toMatch(/statusCode === 200/);
+    expect(SOURCE).toMatch(/buildPortalNavItems\(branding,[^)]*approvalsPendingCount\)/);
+  });
+
+  it('only asks when ticketing is on', () => {
+    expect(SOURCE).toMatch(/branding\.enableTickets !== false[\s\S]{0,200}getApprovals/);
+  });
+
+  it('renders the badge in both the rail and the phone menu', () => {
+    const occurrences = SOURCE.match(/item\.badge/g) ?? [];
+    expect(occurrences.length).toBeGreaterThanOrEqual(4);
+    expect(SOURCE.match(/data-testid=\{`portal-nav-badge-\$\{/g)?.length ?? 0).toBe(1);
+    expect(SOURCE.match(/data-testid=\{`portal-nav-badge-mobile-/g)?.length ?? 0).toBe(1);
+  });
+});
+
 describe('PortalLayout custom CSS (#5940)', () => {
   it('builds the saved customCss via the shared sanitizer', () => {
     expect(SOURCE).toContain("import { buildPortalCustomCss } from '../lib/customCss'");
@@ -131,5 +152,31 @@ describe('PortalLayout custom CSS (#5940)', () => {
 
   it('gives the header the class the branding docs document as the customCss target', () => {
     expect(SOURCE).toMatch(/<header class="portal-header /);
+  });
+});
+
+describe('PortalLayout welcome message (#9675)', () => {
+  it('derives it from branding through the landing-page helper', () => {
+    expect(SOURCE).toContain("import { landingWelcomeMessage } from '../lib/welcomeMessage'");
+    expect(SOURCE).toContain('landingWelcomeMessage(branding, pathname)');
+    // The landing match compares app-relative paths: a raw Astro.url.pathname
+    // would carry the base (/c/quotes) and never match under a base path.
+    const stripIdx = SOURCE.indexOf('const pathname = stripBase(Astro.url.pathname)');
+    expect(stripIdx).toBeGreaterThan(-1);
+    expect(stripIdx).toBeLessThan(SOURCE.indexOf('landingWelcomeMessage(branding, pathname)'));
+  });
+
+  it("renders it as escaped plain text that keeps the MSP's line breaks, never as HTML", () => {
+    const el = SOURCE.match(/<p[^>]*data-testid="portal-welcome"[^>]*>([\s\S]*?)<\/p>/);
+    expect(el).not.toBeNull();
+    expect(el![0]).toContain('whitespace-pre-line');
+    expect(el![0]).not.toContain('set:html');
+    expect(el![1].trim()).toBe('{welcomeMessage}');
+  });
+
+  it('places it inside the page sheet, ahead of the page content', () => {
+    const welcomeIdx = SOURCE.indexOf('data-testid="portal-welcome"');
+    expect(welcomeIdx).toBeGreaterThan(SOURCE.indexOf('data-testid="portal-sheet"'));
+    expect(welcomeIdx).toBeLessThan(SOURCE.indexOf('<slot />'));
   });
 });

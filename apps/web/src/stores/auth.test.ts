@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Tokens, User } from './auth';
 import { applyResolvedLocalePreferences } from '@/lib/appearance';
+import { entitlementsCache } from '../lib/entitlementsCache';
 import {
   apiAcceptInvite,
   apiConfirmPhone,
@@ -29,6 +30,7 @@ import {
   useAuthStore,
   waitForPendingRefresh,
   validateCfTerminalNavigationUrl,
+  ensureSessionPermissions,
 } from './auth';
 
 vi.mock('@simplewebauthn/browser', () => ({
@@ -2304,6 +2306,24 @@ describe('fetchAndApplyPreferences locale wiring', () => {
 });
 
 describe('apiRegisterPartner recovery action', () => {
+  it.each([
+    [{ catalogVersion: 'launch-2026-10', capacity: 250, billingPeriod: 'annual' }, true],
+    [{ catalogVersion: 'launch-2026-10', capacity: 150, billingPeriod: 'annual' }, false],
+    [{ catalogVersion: 'launch-2026-10', capacity: 250, billingPeriod: 'annual', redirect: '//evil.test' }, false],
+  ])('validates purchase preference from sign-in recovery responses', async (purchaseSelection, accepted) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(makeResponse({ verified: false, status: 'sign_in', purchaseSelection })));
+    const result = await apiVerifyEmail('token');
+    expect(result.status).toBe('sign_in');
+    if (accepted) expect(result.purchaseSelection).toEqual(purchaseSelection);
+    else expect(result).not.toHaveProperty('purchaseSelection');
+  });
+  it('sends optional approved purchase intent to the registration API', async () => {
+    const doFetch = vi.fn().mockResolvedValue(makeResponse({ success: true, message: 'Check email' }));
+    vi.stubGlobal('fetch', doFetch);
+    const purchaseSelection = { catalogVersion: 'launch-2026-10' as const, capacity: 250, billingPeriod: 'annual' as const };
+    await apiRegisterPartner('Acme', 'jane@acme.test', 'pw', 'Jane', purchaseSelection);
+    expect(JSON.parse(doFetch.mock.calls[0]![1].body)).toEqual({ companyName: 'Acme', email: 'jane@acme.test', password: 'pw', name: 'Jane', acceptTerms: true, purchaseSelection });
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -2475,12 +2495,57 @@ describe('MFA enrollment API bindings', () => {
 });
 
 describe('MFA enrollment session adoption', () => {
+  it.each(['totp', 'sms', 'passkey'] as const)('records the enrolled %s method in shared user state', (method) => {
+    useAuthStore.getState().login(baseUser, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, method, {
+      accessToken: `replacement-${method}`,
+      expiresInSeconds: 900,
+    })).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: true, mfaMethod: method });
+    expect(useAuthStore.getState().tokens?.accessToken).toBe(`replacement-${method}`);
+  });
+
+  it('records disabled MFA in shared state while adopting the replacement session', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+    const tokens = { accessToken: 'replacement-disabled', expiresInSeconds: 900 };
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation, tokens)).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: false, mfaMethod: null });
+    expect(useAuthStore.getState().tokens).toEqual(tokens);
+  });
+
+  it('records the factor change without replacement tokens when the issuing session cannot be installed', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation)).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: false, mfaMethod: null });
+    expect(useAuthStore.getState().tokens).toEqual(baseTokens);
+  });
+
+  it('does not apply a disable response to a newer login', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+    const newerTokens = { accessToken: 'newer-session', expiresInSeconds: 900 };
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, newerTokens);
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation, {
+      accessToken: 'stale-disable',
+      expiresInSeconds: 900,
+    })).toBe(false);
+    expect(useAuthStore.getState().tokens).toEqual(newerTokens);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
+  });
+
   it('refuses a terminal response after logout', () => {
     useAuthStore.getState().login(baseUser, baseTokens);
     const generation = useAuthStore.getState().sessionGeneration;
     useAuthStore.getState().logout();
 
-    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, {
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, 'totp', {
       accessToken: 'stale',
       expiresInSeconds: 900,
     })).toBe(false);
@@ -2493,7 +2558,7 @@ describe('MFA enrollment session adoption', () => {
     const newerTokens = { accessToken: 'newer', expiresInSeconds: 900 };
     useAuthStore.getState().login(baseUser, newerTokens);
 
-    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, {
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, 'totp', {
       accessToken: 'stale',
       expiresInSeconds: 900,
     })).toBe(false);
@@ -2701,5 +2766,175 @@ describe('fetchWithAuth — a rejected body password never looks like session de
     expect(replace).toHaveBeenCalledWith(
       `/login?next=${encodeURIComponent('/settings/profile')}&reason=session-expired`,
     );
+  });
+});
+
+// #8862: the profile page mirrors its SSO re-auth grant into sessionStorage so
+// a remount can restore it. Signing out must not leave it for the next session
+// on the same tab (the server would reject it, but the page would arm the
+// passkey card with a proof it cannot use).
+describe('logout() and the stashed SSO re-auth grant (#8862)', () => {
+  it('clears the stashed grant', async () => {
+    const { SSO_REAUTH_GRANT_KEY, stashSsoReauthGrant } = await import('@/lib/ssoReauthGrant');
+    sessionStorage.clear();
+    stashSsoReauthGrant('3f2504e0-4f89-41d3-9a0c-0305e82c3301', 'passkey', 'user-1');
+    expect(sessionStorage.getItem(SSO_REAUTH_GRANT_KEY)).not.toBeNull();
+
+    useAuthStore.getState().logout();
+
+    expect(sessionStorage.getItem(SSO_REAUTH_GRANT_KEY)).toBeNull();
+  });
+});
+
+describe('logout resets the entitlements cache (#9907)', () => {
+  it('clears a cached snapshot and invalidates in-flight requests', () => {
+    entitlementsCache.value = { plan: 'pro', entitlements: [] };
+    const generation = entitlementsCache.generation;
+    useAuthStore.getState().logout();
+    expect(entitlementsCache.value).toBeNull();
+    expect(entitlementsCache.generation).toBe(generation + 1);
+  });
+});
+
+// #9927 / #9586: a persisted (or freshly auto-logged-in) user object without
+// `permissions` hid every permission-gated nav item, and nothing re-read
+// /users/me until the next login-page sign-in. The shell now asks for them.
+describe('ensureSessionPermissions (#9927)', () => {
+  const ME = {
+    id: 'user-1',
+    email: 'user@example.com',
+    name: 'User One',
+    preferences: {},
+    partnerDefaultLocale: null,
+    permissions: [{ resource: 'devices', action: 'read' }],
+    isPlatformAdmin: false,
+    canManagePartnerWide: true,
+  };
+  const meCalls = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).includes('/users/me')).length;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.removeItem('breeze-auth');
+    useAuthStore.setState({
+      user: null,
+      tokens: null,
+      isAuthenticated: false,
+      isLoading: false,
+      mfaPending: false,
+      mfaTempToken: null
+    });
+  });
+
+  it('fetches /users/me and applies permissions when the session user has none', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(ME));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login(baseUser, baseTokens);
+
+    await ensureSessionPermissions();
+
+    expect(meCalls(fetchMock)).toBe(1);
+    expect(useAuthStore.getState().user?.permissions).toEqual(ME.permissions);
+    expect(useAuthStore.getState().user?.canManagePartnerWide).toBe(true);
+  });
+
+  it('does nothing when permissions are already known (an empty list is known)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(ME));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login({ ...baseUser, permissions: [] }, baseTokens);
+
+    await ensureSessionPermissions();
+
+    expect(meCalls(fetchMock)).toBe(0);
+    expect(useAuthStore.getState().user?.permissions).toEqual([]);
+  });
+
+  it('waits for an access token instead of racing the cookie restore', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(ME));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.setState({ user: baseUser, isAuthenticated: true, tokens: null });
+
+    await ensureSessionPermissions();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // The token landing (cookie restore) must still get its one read: the
+    // once-per-session guard may not be spent while the token was missing.
+    useAuthStore.setState({ tokens: baseTokens });
+    await ensureSessionPermissions();
+    expect(meCalls(fetchMock)).toBe(1);
+    expect(useAuthStore.getState().user?.permissions).toEqual(ME.permissions);
+  });
+
+  it('warns when /users/me answers without a permission list (nav stays hidden)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse({ ...ME, permissions: undefined }));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login(baseUser, baseTokens);
+
+    await ensureSessionPermissions();
+
+    expect(useAuthStore.getState().user?.permissions).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('no permissions list'));
+  });
+
+  it('drops a /users/me answer that belongs to a different user than the stored one', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse({ ...ME, id: 'someone-else' }));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login(baseUser, baseTokens);
+
+    await ensureSessionPermissions();
+
+    expect(useAuthStore.getState().user?.permissions).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('different user'));
+  });
+
+  it('does nothing without a signed-in session', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(ME));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await ensureSessionPermissions();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('asks at most once per session, even when /users/me fails, and again after a new login', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse({ error: 'boom' }, false, 500));
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login(baseUser, baseTokens);
+
+    await ensureSessionPermissions();
+    await ensureSessionPermissions();
+    expect(meCalls(fetchMock)).toBe(1);
+    // A failed read leaves the gate closed: missing permissions never mean "allow".
+    expect(useAuthStore.getState().user?.permissions).toBeUndefined();
+
+    useAuthStore.getState().login(baseUser, baseTokens);
+    await ensureSessionPermissions();
+    expect(meCalls(fetchMock)).toBe(2);
+  });
+
+  it('drops a /users/me answer that lands after the session changed hands', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let resolveMe: (r: Response) => void = () => {};
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Promise<Response>((resolve) => { resolveMe = resolve; })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    useAuthStore.getState().login(baseUser, baseTokens);
+
+    const pending = ensureSessionPermissions();
+    // Same-document sign-out, then a different account signs in on the tab.
+    useAuthStore.getState().logout();
+    useAuthStore.getState().login({ ...baseUser, id: 'user-2', email: 'other@example.com' }, baseTokens);
+    resolveMe(makeResponse(ME));
+    await pending;
+
+    expect(useAuthStore.getState().user?.id).toBe('user-2');
+    expect(useAuthStore.getState().user?.permissions).toBeUndefined();
+    expect(useAuthStore.getState().user?.canManagePartnerWide).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('response dropped'));
   });
 });

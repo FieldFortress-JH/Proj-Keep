@@ -28,8 +28,11 @@ import {
 import { asList } from '@/lib/asList';
 import { useEdrReadiness, type EdrReadiness } from "./useEdrReadiness";
 import BuiltinPackageDetail from "./BuiltinPackageDetail";
+import BuiltinPackagesPanel, { type BuiltinPackageRow } from "./BuiltinPackagesPanel";
+import { useDefaultOwnerScope } from "../../hooks/useDefaultOwnerScope";
 import { useTranslation } from "react-i18next";
 import { i18n } from "@/lib/i18n";
+import { replaceUrl } from '../../lib/replaceUrl';
 type SoftwareItem = {
   id: string;
   /** Owning org for an org-scoped (non-built-in) package; unset for partner-scoped built-ins. */
@@ -41,6 +44,8 @@ type SoftwareItem = {
   createdAt: string;
   /** Set for built-in integration packages (e.g. Huntress, SentinelOne). */
   integrationProvider?: IntegrationProvider;
+  /** #6958: set for Breeze-pinned built-ins (e.g. 'controld_windows'); immutable outside system scope. */
+  builtinPackageKey?: string;
   partnerId?: string;
   /** Number of uploaded versions; built-in S1 needs >=1 before it can deploy. */
   versionCount?: number;
@@ -77,6 +82,10 @@ const needsInstallerUpload = (item: SoftwareItem): boolean =>
  *                            wizard with those devices pre-selected, then the
  *                            hash is cleared via replaceState so a refresh
  *                            doesn't re-open the wizard.
+ *   #versions=<catalogId>  → consumed once the catalog has loaded (#6960):
+ *                            opens that package on its Versions tab (the
+ *                            Security Agents "upload the SentinelOne MSI" deep
+ *                            link), then the hash is cleared the same way.
  */
 type CatalogView =
   | { tab: "catalog" }
@@ -130,6 +139,94 @@ function ReadinessPill({ status }: { status: EdrReadiness["status"] }) {
     );
   return null;
 }
+/**
+ * Detail body for a Breeze-pinned built-in (#6958). Edit/delete/new-version are
+ * not offered (the API answers 403 outside system scope); the row's required
+ * tenant variables and the documented uninstall command come from
+ * GET /software/builtin-packages (partner scope only).
+ */
+function KeyedBuiltinDetail({
+  row,
+  onDeploy,
+}: {
+  row: BuiltinPackageRow | undefined;
+  onDeploy: () => void;
+}) {
+  return (
+    <div data-testid="builtin-catalog-detail" className="space-y-4">
+      <p className="rounded-md border bg-muted/30 p-4 text-sm text-muted-foreground">
+        {i18n.t("policies:software.softwareCatalog.managedByBreezeHint")}
+      </p>
+      {row && (
+        <dl className="grid gap-3 text-sm sm:grid-cols-[max-content_1fr]">
+          <dt className="font-medium">
+            {i18n.t("policies:software.softwareCatalog.requiredVariables")}
+          </dt>
+          <dd className="flex flex-wrap items-center gap-1">
+            {row.requiredVars.map((name) => (
+              <code key={name} className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                {name}
+              </code>
+            ))}
+            <a href="/settings/variables" className="text-xs text-primary hover:underline">
+              {i18n.t("policies:software.builtinPackagesPanel.setVariablesPerOrganization")}
+            </a>
+          </dd>
+          <dt className="font-medium">
+            {i18n.t("policies:software.softwareCatalog.uninstallCommand")}
+          </dt>
+          <dd>
+            <code className="break-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs select-all">
+              {row.uninstallCommand}
+            </code>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {i18n.t("policies:software.builtinPackagesPanel.breezeDoesNotUninstall")}
+            </p>
+          </dd>
+        </dl>
+      )}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={onDeploy}
+          className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+        >
+          {i18n.t("policies:software.softwareCatalog.deploy2")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function toSoftwareItem(item: Record<string, unknown>): SoftwareItem {
+  return {
+    id: String(item.id),
+    orgId: item.orgId ? String(item.orgId) : undefined,
+    name: String(item.name ?? ""),
+    vendor: String(item.vendor ?? ""),
+    category: String(item.category ?? "utility"),
+    description: String(item.description ?? ""),
+    createdAt: String(item.createdAt ?? ""),
+    integrationProvider:
+      item.integrationProvider === "huntress" ||
+      item.integrationProvider === "sentinelone"
+        ? item.integrationProvider
+        : undefined,
+    builtinPackageKey:
+      typeof item.builtinPackageKey === "string" && item.builtinPackageKey
+        ? item.builtinPackageKey
+        : undefined,
+    partnerId: item.partnerId ? String(item.partnerId) : undefined,
+    versionCount:
+      item.versionCount != null ? Number(item.versionCount) : undefined,
+    methodCount:
+      item.methodCount != null ? Number(item.methodCount) : undefined,
+    methodKinds: Array.isArray(item.methodKinds)
+      ? item.methodKinds.map(String)
+      : undefined,
+  };
+}
+
 export default function SoftwareCatalog() {
   useTranslation("policies");
   useTranslation("policies");
@@ -138,6 +235,10 @@ export default function SoftwareCatalog() {
   const [selectedSoftware, setSelectedSoftware] = useState<SoftwareItem | null>(
     null,
   );
+  // #6958: Breeze-pinned built-ins panel (partner scope only) and its rows,
+  // which the keyed-card detail reads for required variables / uninstall.
+  const { isPartnerScope } = useDefaultOwnerScope();
+  const [builtinRows, setBuiltinRows] = useState<BuiltinPackageRow[]>([]);
   const [showDeployWizard, setShowDeployWizard] = useState(false);
   const [deployCatalogId, setDeployCatalogId] = useState<string | undefined>();
   // Devices carried over from a device-list bulk selection (#2866); seeds the
@@ -199,11 +300,7 @@ export default function SoftwareCatalog() {
         .slice("deploy=".length)
         .split(",")
         .filter(Boolean);
-      window.history.replaceState(
-        null,
-        "",
-        window.location.pathname + window.location.search,
-      );
+      replaceUrl(window.location.pathname + window.location.search);
       if (ids.length === 0) return;
       setDeployCatalogId(undefined); // no package preselected — user picks first
       setDeployDeviceIds(ids);
@@ -213,6 +310,45 @@ export default function SoftwareCatalog() {
     window.addEventListener("hashchange", consumeDeployHash);
     return () => window.removeEventListener("hashchange", consumeDeployHash);
   }, []);
+  // #6960: consume #versions=<catalogId> once the catalog is loaded — open that
+  // package on its Versions tab (an unknown id opens nothing), then clear the
+  // hash so a refresh doesn't re-open it.
+  useEffect(() => {
+    if (loading) return;
+    const consumeVersionsHash = () => {
+      const raw = window.location.hash.replace(/^#/, "");
+      if (!raw.startsWith("versions=")) return;
+      const id = raw.slice("versions=".length);
+      replaceUrl(window.location.pathname + window.location.search);
+      const open = (item: SoftwareItem) => {
+        setDetailTab("versions");
+        setSelectedSoftware(item);
+      };
+      const loaded = catalogItems.find((candidate) => candidate.id === id);
+      if (loaded) {
+        open(loaded);
+        return;
+      }
+      // The list is one page: fetch a package outside it by id. An unknown or
+      // inaccessible id opens nothing.
+      if (!id) return;
+      void (async () => {
+        try {
+          const response = await fetchWithAuth(`/software/catalog/${encodeURIComponent(id)}`);
+          if (!response.ok) return;
+          const payload = (await response.json()) as { data?: unknown };
+          if (payload?.data && typeof payload.data === "object") {
+            open(toSoftwareItem(payload.data as Record<string, unknown>));
+          }
+        } catch (err) {
+          console.warn("[software] could not open the package from the #versions link", err);
+        }
+      })();
+    };
+    consumeVersionsHash();
+    window.addEventListener("hashchange", consumeVersionsHash);
+    return () => window.removeEventListener("hashchange", consumeVersionsHash);
+  }, [loading, catalogItems]);
   // Summary cards for the Deployments tab. Re-runs whenever the list view
   // becomes active again (e.g. returning from a deployment's detail), so the
   // counts stay fresh without a manual refresh control.
@@ -260,30 +396,7 @@ export default function SoftwareCatalog() {
       const payload = await response.json();
       const data = asList(payload);
       if (Array.isArray(data)) {
-        setCatalogItems(
-          data.map((item: Record<string, unknown>) => ({
-            id: String(item.id),
-            orgId: item.orgId ? String(item.orgId) : undefined,
-            name: String(item.name ?? ""),
-            vendor: String(item.vendor ?? ""),
-            category: String(item.category ?? "utility"),
-            description: String(item.description ?? ""),
-            createdAt: String(item.createdAt ?? ""),
-            integrationProvider:
-              item.integrationProvider === "huntress" ||
-              item.integrationProvider === "sentinelone"
-                ? item.integrationProvider
-                : undefined,
-            partnerId: item.partnerId ? String(item.partnerId) : undefined,
-            versionCount:
-              item.versionCount != null ? Number(item.versionCount) : undefined,
-            methodCount:
-              item.methodCount != null ? Number(item.methodCount) : undefined,
-            methodKinds: Array.isArray(item.methodKinds)
-              ? item.methodKinds.map(String)
-              : undefined,
-          })),
-        );
+        setCatalogItems(data.map(toSoftwareItem));
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load catalog");
@@ -558,6 +671,21 @@ export default function SoftwareCatalog() {
         </FilterSelect>
       </div>
 
+      {isPartnerScope && (
+        <BuiltinPackagesPanel
+          onPackagesLoaded={setBuiltinRows}
+          onProvisioned={() => {
+            void fetchCatalog();
+          }}
+          onOpenCatalogItem={(catalogId) => {
+            const item = catalogItems.find((candidate) => candidate.id === catalogId);
+            if (!item) return;
+            setDetailTab("details");
+            setSelectedSoftware(item);
+          }}
+        />
+      )}
+
       {filteredSoftware.length === 0 && !loading ? (
         <div className="rounded-lg border bg-card p-12 text-center">
           <Package className="mx-auto h-12 w-12 text-muted-foreground/50" />
@@ -576,6 +704,7 @@ export default function SoftwareCatalog() {
           {filteredSoftware.map((item) => (
             <div
               key={item.id}
+              data-testid={`catalog-card-${item.id}`}
               className="group rounded-lg border bg-card p-5 shadow-xs transition hover:-translate-y-1 hover:shadow-md"
               role="button"
               tabIndex={0}
@@ -629,13 +758,22 @@ export default function SoftwareCatalog() {
                       ownership badge; built-ins keep their own pill below. */}
                   {!item.orgId &&
                     item.partnerId &&
-                    !isIntegrationProvider(item.integrationProvider) && (
+                    !isIntegrationProvider(item.integrationProvider) &&
+                    !item.builtinPackageKey && (
                       <ScopeBadge
                         orgId={null}
                         partnerId={item.partnerId}
                         isSystem={false}
                       />
                     )}
+                  {item.builtinPackageKey && (
+                    <span
+                      data-testid="builtin-pill"
+                      className="inline-flex items-center rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary"
+                    >
+                      {i18n.t("policies:software.softwareCatalog.builtIn")}
+                    </span>
+                  )}
                   {isIntegrationProvider(item.integrationProvider) && (
                     <div className="flex items-center gap-1.5">
                       <ReadinessPill
@@ -772,6 +910,7 @@ export default function SoftwareCatalog() {
                 )}
                 {!selectedSoftware.orgId &&
                   selectedSoftware.partnerId &&
+                  !selectedSoftware.builtinPackageKey &&
                   !isIntegrationProvider(
                     selectedSoftware.integrationProvider,
                   ) && (
@@ -834,6 +973,17 @@ export default function SoftwareCatalog() {
                     openDeploy(id);
                   }}
                 />
+              ) : selectedSoftware.builtinPackageKey ? (
+                <KeyedBuiltinDetail
+                  row={builtinRows.find(
+                    (row) => row.key === selectedSoftware.builtinPackageKey,
+                  )}
+                  onDeploy={() => {
+                    const id = selectedSoftware.id;
+                    setSelectedSoftware(null);
+                    openDeploy(id);
+                  }}
+                />
               ) : (
                 <div>
                   {selectedSoftware.description && (
@@ -869,6 +1019,7 @@ export default function SoftwareCatalog() {
               <SoftwareVersionManager
                 catalogId={selectedSoftware.id}
                 embedded
+                builtinReadOnly={Boolean(selectedSoftware.builtinPackageKey)}
               />
             )}
           </div>

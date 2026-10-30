@@ -12,6 +12,13 @@ vi.mock('../services/auditEvents', () => ({
   writeRouteAudit: vi.fn()
 }));
 
+const { linkedMock } = vi.hoisted(() => ({ linkedMock: vi.fn() }));
+vi.mock('./updateRingLinkedPolicies', () => ({
+  getRingLinkedPolicies: linkedMock,
+  linkedPolicyPayload: (l: unknown[]) => ({ linkedPolicies: l, linkedPolicyCount: l.length }),
+}));
+import { writeRouteAudit } from '../services/auditEvents';
+
 vi.mock('./updateRingsHelpers', () => ({
   resolveRingDeviceCounts: vi.fn().mockResolvedValue(new Map()),
   resolveRingDeviceIds: vi.fn().mockResolvedValue([]),
@@ -144,6 +151,7 @@ describe('updateRings routes', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    linkedMock.mockResolvedValue([]);
     vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
       c.set('auth', {
         user: { id: 'user-123', email: 'partner@example.com', name: 'Partner User' },
@@ -177,12 +185,10 @@ describe('updateRings routes', () => {
         // approval counts
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockReturnValue({
-              groupBy: vi.fn().mockResolvedValue([
-                { status: 'approved', count: 5 },
-                { status: 'pending', count: 2 }
-              ])
-            })
+            where: vi.fn().mockResolvedValue([
+              { patchId: 'p1', status: 'approved', ringId: null, updatedAt: new Date('2026-02-01') },
+              { patchId: 'p2', status: 'pending', ringId: RING_ID, updatedAt: new Date('2026-02-01') }
+            ])
           })
         } as any)
         // recent jobs
@@ -220,7 +226,7 @@ describe('updateRings routes', () => {
         } as any)
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockReturnValue({ groupBy: vi.fn().mockResolvedValue([]) })
+            where: vi.fn().mockResolvedValue([])
           })
         } as any)
         .mockReturnValueOnce({
@@ -297,12 +303,10 @@ describe('updateRings routes', () => {
             })
           })
         } as any)
-        // approval counts
+        // approval rows
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockReturnValue({
-              groupBy: vi.fn().mockResolvedValue([])
-            })
+            where: vi.fn().mockResolvedValue([])
           })
         } as any)
         // recent jobs
@@ -704,7 +708,7 @@ describe('updateRings routes', () => {
       expect(updateFields).not.toHaveProperty('sources');
     });
 
-    it('PATCH does not write appRules yet (#8184 W01: read-only) — the DB update never sees it', async () => {
+    const patchRing = (row: Record<string, unknown>) => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
@@ -714,24 +718,56 @@ describe('updateRings routes', () => {
       } as any);
       const setMock = vi.fn().mockReturnValue({
         where: vi.fn().mockReturnValue({
-          returning: vi.fn().mockResolvedValue([makeRing()])
+          returning: vi.fn().mockResolvedValue([makeRing(row)])
         })
       });
       vi.mocked(db.update).mockReturnValueOnce({ set: setMock } as any);
-
-      const res = await app.request(`/update-rings/${RING_ID}`, {
+      return { setMock };
+    };
+    const patch = (body: Record<string, unknown>) =>
+      app.request(`/update-rings/${RING_ID}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
-        body: JSON.stringify({
-          name: 'Renamed',
-          appRules: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }]
-        })
+        body: JSON.stringify(body)
       });
+
+    it('PATCH persists appRules (#8184)', async () => {
+      const rules = [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }];
+      const { setMock } = patchRing({ appRules: rules });
+
+      const res = await patch({ name: 'Renamed', appRules: rules });
 
       expect(res.status).toBe(200);
       const updateFields = setMock.mock.calls[0]![0] as Record<string, unknown>;
       expect(updateFields.name).toBe('Renamed');
-      expect(updateFields).not.toHaveProperty('appRules');
+      expect(updateFields.appRules).toEqual(rules);
+      expect((await res.json()).appRules).toEqual(rules);
+    });
+
+    it('PATCH can clear appRules with an empty array (#8184)', async () => {
+      const { setMock } = patchRing({ appRules: [] });
+      const res = await patch({ appRules: [] });
+      expect(res.status).toBe(200);
+      expect((setMock.mock.calls[0]![0] as Record<string, unknown>).appRules).toEqual([]);
+    });
+
+    it('PATCH omitting appRules leaves the column untouched (#8184)', async () => {
+      const { setMock } = patchRing({});
+      const res = await patch({ name: 'Renamed' });
+      expect(res.status).toBe(200);
+      expect(setMock.mock.calls[0]![0]).not.toHaveProperty('appRules');
+    });
+
+    it('PATCH rejects duplicate appRules (same canonical key) with 400 (#8184)', async () => {
+      vi.mocked(db.update).mockClear();
+      const res = await patch({
+        appRules: [
+          { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+          { source: 'custom', packageId: 'mozilla.firefox', action: 'block' }
+        ]
+      });
+      expect(res.status).toBe(400);
+      expect(vi.mocked(db.update)).not.toHaveBeenCalled();
     });
   });
 
@@ -795,6 +831,118 @@ describe('updateRings routes', () => {
       });
 
       expect(res.status).toBe(403);
+    });
+  });
+
+
+  describe('linked policies (#8909)', () => {
+    const LINKED = [
+      { id: 'pol-partner', name: 'Partner-wide policy', orgId: null },
+      { id: 'pol-org', name: 'Org policy', orgId: 'org-1' },
+    ];
+    const ringSelect = (row: Record<string, unknown>) =>
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([row]) })
+        })
+      } as any);
+    const updateOk = (returning?: unknown) =>
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue(Object.assign(Promise.resolve(undefined), {
+            returning: vi.fn().mockResolvedValue([returning ?? makeRing({ enabled: false })])
+          }))
+        })
+      } as any);
+
+    beforeEach(() => { linkedMock.mockReset(); vi.mocked(writeRouteAudit).mockClear(); });
+
+    it('DELETE returns linkedPolicies + count and audits the count and ids', async () => {
+      linkedMock.mockResolvedValue(LINKED);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, name: 'Test Ring' });
+      updateOk();
+      const res = await app.request(`/update-rings/${RING_ID}`, { method: 'DELETE', headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.linkedPolicyCount).toBe(2);
+      expect(body.linkedPolicies).toEqual(LINKED);
+      expect(linkedMock).toHaveBeenCalledWith(RING_ID);
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'update_ring.delete',
+        details: expect.objectContaining({ linkedPolicyCount: 2, linkedPolicyIds: ['pol-partner', 'pol-org'] }),
+      }));
+    });
+
+    it('DELETE/PATCH-disable: a failing lookup is a 500 and the ring is not written', async () => {
+      linkedMock.mockRejectedValue(new Error('boom'));
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, name: 'Test Ring' });
+      const del = await app.request(`/update-rings/${RING_ID}`, { method: 'DELETE', headers: { Authorization: 'Bearer token' } });
+      expect(del.status).toBe(500);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, autoApprove: {}, enabled: true });
+      const patch = await app.request(`/update-rings/${RING_ID}`, {
+        method: 'PATCH', headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(patch.status).toBe(500);
+      expect(db.update).not.toHaveBeenCalled();
+      expect(writeRouteAudit).not.toHaveBeenCalled();
+    });
+
+    it('DELETE with no links reports zero', async () => {
+      linkedMock.mockResolvedValue([]);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, name: 'Test Ring' });
+      updateOk();
+      const res = await app.request(`/update-rings/${RING_ID}`, { method: 'DELETE', headers: { Authorization: 'Bearer token' } });
+      const body = await res.json();
+      expect(body.linkedPolicyCount).toBe(0);
+      expect(body.linkedPolicies).toEqual([]);
+    });
+
+    it('PATCH enabled:false returns linked policies and audits the count', async () => {
+      linkedMock.mockResolvedValue(LINKED);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, autoApprove: {}, enabled: true });
+      updateOk(makeRing({ enabled: false }));
+      const res = await app.request(`/update-rings/${RING_ID}`, {
+        method: 'PATCH', headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.linkedPolicyCount).toBe(2);
+      expect(body.linkedPolicies).toEqual(LINKED);
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'update_ring.update',
+        details: expect.objectContaining({ linkedPolicyCount: 2, linkedPolicyIds: ['pol-partner', 'pol-org'] }),
+      }));
+    });
+
+    it('PATCH that does not disable the ring does not look up links', async () => {
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID, autoApprove: {}, enabled: true });
+      updateOk(makeRing({ name: 'x' }));
+      const res = await app.request(`/update-rings/${RING_ID}`, {
+        method: 'PATCH', headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'x' }),
+      });
+      expect(res.status).toBe(200);
+      expect(linkedMock).not.toHaveBeenCalled();
+      expect((await res.json()).linkedPolicyCount).toBeUndefined();
+    });
+
+    it('GET /:id/linked-policies returns the payload', async () => {
+      linkedMock.mockResolvedValue(LINKED);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID });
+      const res = await app.request(`/update-rings/${RING_ID}/linked-policies`, { headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ linkedPolicies: LINKED, linkedPolicyCount: 2 });
+    });
+
+    it('GET /:id/linked-policies is 404 for unknown ring and 403 for another partner', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) } as any);
+      expect((await app.request(`/update-rings/${RING_ID}/linked-policies`)).status).toBe(404);
+      ringSelect({ id: RING_ID, partnerId: PARTNER_ID_2 });
+      expect((await app.request(`/update-rings/${RING_ID}/linked-policies`)).status).toBe(403);
+      expect(linkedMock).not.toHaveBeenCalled();
     });
   });
 

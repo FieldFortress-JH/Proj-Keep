@@ -173,6 +173,7 @@ const ticketColumns = {
   priority: tickets.priority,
   source: tickets.source,
   workKind: tickets.workKind,
+  ticketType: tickets.ticketType,
   categoryId: tickets.categoryId,
   assignedTo: tickets.assignedTo,
   deviceId: tickets.deviceId,
@@ -191,9 +192,16 @@ const ticketColumns = {
   resolutionSlaMinutes: tickets.resolutionSlaMinutes,
   slaBreachedAt: tickets.slaBreachedAt,
   slaBreachReason: tickets.slaBreachReason,
+  responseDueAt: tickets.responseDueAt,
+  resolutionDueAt: tickets.resolutionDueAt,
+  responseWarnAt: tickets.responseWarnAt,
+  resolutionWarnAt: tickets.resolutionWarnAt,
   deletedAt: tickets.deletedAt,
   createdAt: tickets.createdAt,
   updatedAt: tickets.updatedAt,
+  migrationWindowId: tickets.migrationWindowId,
+  mergedIntoTicketId: tickets.mergedIntoTicketId,
+  mergedAt: tickets.mergedAt,
   changeXid: sql<string>`${tickets.partnerFeedXid}::text`,
 };
 
@@ -220,6 +228,7 @@ export function toPartnerTicketRecord(row: TicketRow, ref: TicketExternalRef | n
     priority: row.priority!,
     source: row.source!,
     workKind: row.workKind!,
+    ticketType: row.ticketType!,
     categoryId: row.categoryId ?? null,
     assigneeId: row.assignedTo ?? null,
     deviceId: row.deviceId ?? null,
@@ -242,8 +251,16 @@ export function toPartnerTicketRecord(row: TicketRow, ref: TicketExternalRef | n
     resolutionSlaMinutes: row.resolutionSlaMinutes ?? null,
     slaBreachedAt: iso(row.slaBreachedAt ?? null),
     slaBreachReason: truncateText(row.slaBreachReason ?? null, 1000),
+    responseDueAt: iso(row.responseDueAt ?? null),
+    resolutionDueAt: iso(row.resolutionDueAt ?? null),
+    responseWarnAt: iso(row.responseWarnAt ?? null),
+    resolutionWarnAt: iso(row.resolutionWarnAt ?? null),
     createdAt: iso(row.createdAt ?? null)!,
     updatedAt: iso(row.updatedAt ?? null)!,
+    migrationWindowId: row.migrationWindowId ?? null,
+    // #8972: set on a merge tombstone (read-only); null on every other ticket.
+    mergedIntoTicketId: row.mergedIntoTicketId ?? null,
+    mergedAt: iso(row.mergedAt ?? null),
     changeVersion: String(row.changeXid),
   };
   return { ...withoutRevision, revision: computePartnerExportRevision(withoutRevision) };
@@ -278,6 +295,10 @@ export function toPartnerTicketCommentRecord(row: CommentRow, orgId: string): Pa
     newValue: truncateText(row.newValue ?? null, 2000),
     createdAt: iso(row.createdAt)!,
     editedAt: iso(row.editedAt ?? null),
+    migrationWindowId: row.migrationWindowId ?? null,
+    originalAuthor: row.originalAuthorKind
+      ? { name: row.authorName ?? null, email: row.originalAuthorEmail ?? null, kind: row.originalAuthorKind }
+      : null,
   };
   return { ...withoutRevision, revision: computePartnerExportRevision(withoutRevision) };
 }

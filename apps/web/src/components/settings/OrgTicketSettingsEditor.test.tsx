@@ -47,9 +47,19 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
     json: vi.fn().mockResolvedValue(payload)
   }) as unknown as Response;
 
+const APPROVAL_URL = `/orgs/${ORG_ID}/ticketing/approval-settings`;
+const APPROVAL = {
+  enabled: { value: true, source: 'org' },
+  budgetTrigger: { value: true, source: 'default' },
+  afterHoursTrigger: { value: true, source: 'default' },
+  enforcement: { value: 'hard', source: 'partner' },
+  requestTtlHours: { value: 48, source: 'org' },
+};
+
 function mockApi(settings: unknown = SETTINGS) {
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
+    if (url === APPROVAL_URL) return makeJsonResponse({ data: APPROVAL });
     if (url === `/orgs/organizations/${ORG_ID}/ticket-settings` && !init?.method) {
       return makeJsonResponse({ data: settings });
     }
@@ -241,4 +251,150 @@ describe('OrgTicketSettingsEditor', () => {
     await waitFor(() => expect(onSave).toHaveBeenCalled());
   });
 
+
+  describe('customer approval overrides', () => {
+    const approvalPatch = () => {
+      const call = fetchMock.mock.calls.find(([url, init]) => String(url) === APPROVAL_URL && init?.method === 'PATCH');
+      return call ? JSON.parse(String(call[1]!.body)) : null;
+    };
+
+    it('shows overridden values and the inherited source for the rest', async () => {
+      mockApi();
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-approval-ttl');
+      expect((screen.getByTestId('org-approval-ttl') as HTMLInputElement).value).toBe('48');
+      expect((screen.getByTestId('org-approval-enabled') as HTMLSelectElement).value).toBe('true');
+      // enforcement is inherited from the partner: blank override, source shown
+      expect((screen.getByTestId('org-approval-enforcement') as HTMLSelectElement).value).toBe('');
+      expect(screen.getByTestId('org-approval-enforcement-source')).toHaveTextContent(/partner/i);
+    });
+
+    it('clearing an override sends null for that field only', async () => {
+      mockApi();
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-approval-ttl');
+      fireEvent.click(screen.getByTestId('org-approval-ttl-clear'));
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(approvalPatch()).not.toBeNull());
+      expect(approvalPatch()).toEqual({ requestTtlHours: null });
+    });
+
+    it('first PATCH ok + approval PATCH 500: shows the specific message and no plain "saved" toast', async () => {
+      mockApi();
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input, init) => {
+        if (String(input) === APPROVAL_URL && init?.method === 'PATCH') return makeJsonResponse({}, false, 500);
+        return base(input, init);
+      });
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-approval-ttl');
+      fireEvent.click(screen.getByTestId('org-approval-ttl-clear'));
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(approvalPatch()).not.toBeNull());
+      await waitFor(() =>
+        expect(showToast).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'error', message: expect.stringContaining('saved, but the customer approval') }),
+        ),
+      );
+      expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+      expect(onSave).not.toHaveBeenCalled();
+    });
+
+    it('does not PATCH approval settings when nothing changed', async () => {
+      mockApi();
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-approval-ttl');
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(onSave).toHaveBeenCalled());
+      expect(approvalPatch()).toBeNull();
+    });
+
+    it('setting an inherited field sends its typed value', async () => {
+      mockApi();
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-approval-ttl');
+      fireEvent.change(screen.getByTestId('org-approval-enforcement'), { target: { value: 'soft' } });
+      fireEvent.change(screen.getByTestId('org-approval-budget-trigger'), { target: { value: 'false' } });
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(approvalPatch()).not.toBeNull());
+      expect(approvalPatch()).toEqual({ enforcement: 'soft', budgetTrigger: false });
+    });
+  });
+
+  describe('business calendar override (#8973)', () => {
+    const CAL_A = '11111111-1111-4111-8111-111111111111';
+    const CAL_B = '22222222-2222-4222-8222-222222222222';
+    const OVERRIDE_URL = `/business-calendars/orgs/${ORG_ID}/override`;
+    const cal = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
+      id, name, ownerScope: 'partner', orgId: null, partnerId: 'p', isPartnerDefault: false,
+      archivedAt: null, inherited: true, currentRevision: null, holidays: [], ...extra,
+    });
+
+    function mockCalendars(resolved: Record<string, unknown>, list: unknown[]) {
+      mockApi();
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url === `/business-calendars?orgId=${ORG_ID}`) return makeJsonResponse({ data: list });
+        if (url === `/business-calendars/resolved?orgId=${ORG_ID}`) {
+          return makeJsonResponse({ data: { calendarId: null, revisionId: null, ...resolved } });
+        }
+        if (url === OVERRIDE_URL && init?.method === 'PUT') return makeJsonResponse({ data: {} });
+        return base(input, init);
+      });
+    }
+    const overrideCalls = () =>
+      fetchMock.mock.calls.filter(([u, init]) => String(u) === OVERRIDE_URL && (init as RequestInit)?.method === 'PUT');
+
+    it('blank picker shows the inherited calendar and where it comes from', async () => {
+      mockCalendars(
+        { source: 'partner', calendarName: 'Support hours', overrideCalendarId: null },
+        [cal(CAL_A, 'Support hours', { isPartnerDefault: true })],
+      );
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      const source = await screen.findByTestId('org-business-calendar-source');
+      expect(source.textContent).toBe('Inherited: Support hours (partner default)');
+      expect((screen.getByTestId('org-business-calendar') as HTMLSelectElement).value).toBe('');
+    });
+
+    it('shows 24x7 when there is no partner default', async () => {
+      mockCalendars({ source: 'none', calendarName: null, overrideCalendarId: null }, []);
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      const source = await screen.findByTestId('org-business-calendar-source');
+      expect(source.textContent).toBe('Inherited: 24×7 (no partner default)');
+    });
+
+    it('saving a chosen calendar PUTs its id; archived calendars are not offered', async () => {
+      mockCalendars(
+        { source: 'partner', calendarName: 'Support hours', overrideCalendarId: null },
+        [cal(CAL_A, 'Support hours', { isPartnerDefault: true }), cal(CAL_B, 'Old', { archivedAt: '2026-01-01T00:00:00Z' })],
+      );
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-business-calendar-source');
+      const select = screen.getByTestId('org-business-calendar') as HTMLSelectElement;
+      expect(Array.from(select.options).map((o) => o.value)).toEqual(['', CAL_A]);
+      fireEvent.change(select, { target: { value: CAL_A } });
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(overrideCalls()).toHaveLength(1));
+      expect(JSON.parse((overrideCalls()[0][1] as RequestInit).body as string)).toEqual({ calendarId: CAL_A });
+    });
+
+    it('clearing an override PUTs calendarId null; an unchanged picker does not PUT', async () => {
+      mockCalendars(
+        { source: 'org', calendarName: 'Support hours', overrideCalendarId: CAL_A },
+        [cal(CAL_A, 'Support hours')],
+      );
+      render(<OrgTicketSettingsEditor orgId={ORG_ID} onDirty={onDirty} onSave={onSave} />);
+      await screen.findByTestId('org-business-calendar');
+      await waitFor(() => expect((screen.getByTestId('org-business-calendar') as HTMLSelectElement).value).toBe(CAL_A));
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(overrideCalls()).toHaveLength(0);
+
+      fireEvent.change(screen.getByTestId('org-business-calendar'), { target: { value: '' } });
+      fireEvent.click(screen.getByTestId('org-ticket-save'));
+      await waitFor(() => expect(overrideCalls()).toHaveLength(1));
+      expect(JSON.parse((overrideCalls()[0][1] as RequestInit).body as string)).toEqual({ calendarId: null });
+    });
+  });
 });

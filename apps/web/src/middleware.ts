@@ -121,6 +121,50 @@ export function relaxExistingCsp(
   return directives.join('; ');
 }
 
+// Capability-URL pages (/verify/<token>) set `Referrer-Policy: no-referrer` themselves (#8964); the
+// app-wide value is only a default and must not overwrite a page-level choice.
+function setDefaultReferrerPolicy(headers: Headers): void {
+  if (!headers.has('Referrer-Policy')) headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+}
+
+/**
+ * SOC 2 header hardening (RoboShadow/ZAP "CSP: Wildcard Directive").
+ *
+ * The build-time Astro CSP (astro.config.mjs) carries
+ * `connect-src 'self' https: ws: wss:` because the per-deployment API origin is
+ * only known at runtime. Replace that directive with the env-resolved one from
+ * lib/csp.ts (PUBLIC_API_URL, Sentry DSN, CSP_CONNECT_HOSTS) on every response,
+ * and drop the empty directive the Astro styleDirective join emits (`;;`).
+ */
+export function tightenCspConnectSrc(csp: string, connectSrcDirective: string): string {
+  const directives = csp
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const index = directives.findIndex((directive) => /^connect-src(\s|$)/i.test(directive));
+  if (index === -1) {
+    directives.push(connectSrcDirective);
+  } else {
+    directives[index] = connectSrcDirective;
+  }
+
+  return directives.join('; ');
+}
+
+const HTML_CONTENT_TYPE = /^text\/html\b/i;
+
+/**
+ * ZAP "Storable and Cacheable Content": HTML documents (login, app shell) are
+ * per-user and must never be stored by a shared cache or heuristically cached
+ * by the browser. A route that chose its own Cache-Control keeps it.
+ */
+function setDefaultHtmlNoStore(headers: Headers): void {
+  if (headers.has('Cache-Control')) return;
+  if (!HTML_CONTENT_TYPE.test(headers.get('Content-Type') ?? '')) return;
+  headers.set('Cache-Control', 'no-store');
+}
+
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export const onRequest = defineMiddleware(async (context, next) => {
@@ -143,6 +187,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   if (REDIRECT_STATUSES.has(response.status)) {
     headers.set('Cache-Control', 'no-store');
   }
+  setDefaultHtmlNoStore(headers);
 
   const strictDevCsp = import.meta.env.DEV && readFlag('CSP_STRICT_DEV');
 
@@ -150,7 +195,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // Use CSP_STRICT_DEV=1 when you explicitly want CSP enforcement in local dev.
   if (import.meta.env.DEV && !strictDevCsp) {
     headers.delete('Content-Security-Policy');
-    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    setDefaultReferrerPolicy(headers);
     headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
     headers.set('X-Frame-Options', 'SAMEORIGIN');
     headers.set('X-Content-Type-Options', 'nosniff');
@@ -178,10 +223,13 @@ export const onRequest = defineMiddleware(async (context, next) => {
     if (existingCsp) {
       headers.set(
         'Content-Security-Policy',
-        relaxExistingCsp(existingCsp, {
-          allowInlineScript: allowUnsafeInlineScript,
-          allowInlineStyle: allowUnsafeInlineStyle
-        })
+        tightenCspConnectSrc(
+          relaxExistingCsp(existingCsp, {
+            allowInlineScript: allowUnsafeInlineScript,
+            allowInlineStyle: allowUnsafeInlineStyle
+          }),
+          resolveConnectSrcDirective({ isDev: import.meta.env.DEV })
+        )
       );
     } else {
       headers.set(
@@ -193,7 +241,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
         })
       );
     }
-    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    setDefaultReferrerPolicy(headers);
     headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
     headers.set('X-Frame-Options', 'SAMEORIGIN');
     headers.set('X-Content-Type-Options', 'nosniff');
@@ -225,9 +273,10 @@ export const onRequest = defineMiddleware(async (context, next) => {
     if (!/\bstyle-src-attr\b/i.test(patchedCsp)) {
       patchedCsp = `${patchedCsp}; style-src-attr 'unsafe-inline'`;
     }
+    patchedCsp = tightenCspConnectSrc(patchedCsp, resolveConnectSrcDirective({ isDev: import.meta.env.DEV }));
     headers.set('Content-Security-Policy', patchedCsp);
   }
-  headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  setDefaultReferrerPolicy(headers);
   headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
   headers.set('X-Frame-Options', 'DENY');
   headers.set('X-Content-Type-Options', 'nosniff');

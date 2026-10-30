@@ -127,6 +127,7 @@ export const CommandTypes = {
   PERIPHERAL_POLICY_SYNC: 'peripheral_policy_sync',
   PERIPHERAL_POLICY_SYNC_V2: 'peripheral_policy_sync_v2',
   AGENT_ROLLBACK_V1: 'agent_rollback_v1',
+  PAM_RECONCILE_V2: 'pam_reconcile_v2',
 
   // Log shipping
   SET_LOG_LEVEL: 'set_log_level',
@@ -155,6 +156,9 @@ export const CommandTypes = {
 
   // Safe mode reboot (Windows only)
   REBOOT_SAFE_MODE: 'reboot_safe_mode',
+  // #8729: immediate reboot that force-closes running apps (/f on Windows).
+  // Queued only by POST /devices/:id/force-reboot (step-up, interactive session).
+  FORCE_REBOOT: 'force_reboot',
   // Wake-on-LAN — sent to a relay agent on the target's LAN, not the offline target itself
   WAKE_ON_LAN: 'wake_on_lan',
   // On-demand inventory refresh — agent re-runs every send*Inventory collector,
@@ -163,6 +167,29 @@ export const CommandTypes = {
   REFRESH_INVENTORY: 'refresh_inventory',
   // Self-uninstall (remote wipe)
   SELF_UNINSTALL: 'self_uninstall',
+
+  // User-session messaging (#8293). The agent has handled notify_user for a
+  // while; registering it here is what makes it queueable. Partner-trust gated
+  // (GATED_COMMAND_TYPES), never a lifecycle type: it carries operator content.
+  NOTIFY_USER: 'notify_user',
+  // PAM outcome notice (#8928): tells the user who handed an elevation request
+  // to IT that it was denied (with the technician's reason) or expired.
+  // Fire-and-forget; no result handler. Partner-trust GATED like notify_user,
+  // because the deny reason is technician free text. Claimable only by agents
+  // reporting pamUserNotifyProtocolVersion 1 or 2 (commandDispatch claim gate).
+  PAM_REQUEST_NOTIFY: 'pam_request_notify',
+  // Endpoint messaging W02 (#8742): withdraw a message already on screen.
+  // Carries no operator content (only the message id), so it is a lifecycle
+  // type: a restricted partner can still take a message down.
+  RETRACT_MESSAGE: 'retract_message',
+  // Endpoint live chat W03 (#8743). Technician -> device-user chat over the
+  // Assist helper (Windows console session only). All three are `live`
+  // (commandOfflinePolicy: refused offline, never queued). open/message carry
+  // operator content and are partner-trust gated; close carries none and is a
+  // lifecycle type.
+  CHAT_OPEN: 'chat_open',
+  CHAT_MESSAGE: 'chat_message',
+  CHAT_CLOSE: 'chat_close',
   // Backup
   BACKUP_RUN: 'backup_run',
   BACKUP_STOP: 'backup_stop',
@@ -212,6 +239,10 @@ export const CommandTypes = {
   // Incident response
   COLLECT_EVIDENCE: 'collect_evidence',
   EXECUTE_CONTAINMENT: 'execute_containment',
+
+  // Caller verification (#6354 W02): a short, interactive confirmation card
+  // for the explicitly selected console user. Never queued (see LIVE).
+  CALLER_VERIFY: 'caller_verify',
 } as const;
 
 

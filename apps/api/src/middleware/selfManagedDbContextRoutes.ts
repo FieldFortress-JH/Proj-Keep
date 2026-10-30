@@ -28,6 +28,19 @@ interface SelfManagedRoute {
 }
 
 const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
+  // YARA rule test upload (#6263 W04-2): the sandboxed `breeze-yarac match`
+  // child runs up to 30 s; inside the request transaction it would pin a
+  // pooled connection idle-in-transaction (#1105). The handler reads the set
+  // in a short caller-scoped context and audits afterwards.
+  { method: 'POST', pattern: /^\/api\/v1\/security\/yara\/rule-sets\/[0-9a-f-]{36}\/test\/?$/i },
+  // IOC sweep create and cancel (#6263 W05-6): the per-user create limiter
+  // is a Redis round-trip that must precede any DB context (#1105); the
+  // service then takes its own caller-scoped transaction (per-org advisory
+  // locks, FOR UPDATE on the sweep) and audits + enqueues the pump only
+  // after it commits. Preview and the reads keep the request's context.
+  { method: 'POST', pattern: /^\/api\/v1\/security\/sweeps\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/security\/sweeps\/[0-9a-f-]{36}\/cancel\/?$/i },
+  { method: 'POST', pattern: /^\/api\/v1\/security\/sweeps\/groups\/[0-9a-f-]{36}\/cancel\/?$/i },
   { method: 'POST', pattern: /^\/api\/v1\/invoices\/[^/]+\/autopay\/charge-now\/?$/ },
   // Autopay routes own short authorized contexts; no outer request transaction.
   { method: 'GET', pattern: /^\/api\/v1\/billing\/autopay\/?$/ },
@@ -111,6 +124,18 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // asserts no DB context is held across that call.
   { method: 'POST', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/autopay-confirmation\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/invoices\/public\/[^/]+\/autopay-confirmation\/?$/ },
+  // #9585: customer-portal invoice detail and PDF. Branding, online-payment
+  // availability, the autopay offers and an on-demand render's partner row are
+  // partner-axis reads, each in a system context of its own; under the portal
+  // request transaction each took a SECOND pooled connection while the first sat
+  // idle (the #9446/#9454 lock-queue stall). The handlers open their own org
+  // transactions with the middleware's exact scope (portalOrgDbAccessContext) and
+  // run the system reads with none open. HEAD runs the GET handler (Hono), so it
+  // must opt out with it.
+  { method: 'GET', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/?$/ },
+  { method: 'HEAD', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/?$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/pdf\/?$/ },
+  { method: 'HEAD', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/pdf\/?$/ },
   // #6175 Network Visibility overview. Portal auth has already resolved the
   // owning partner, so the handler opens one org-scoped context with
   // currentPartnerId populated for SELECT-only partner-wide network_monitors
@@ -119,6 +144,16 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // #5861 PR 2: the per-asset list opens the same org-scoped context as the
   // overview, so it must opt out of the portal request transaction too.
   { method: 'GET', pattern: /^\/api\/v1\/portal\/network\/assets\/?$/ },
+  // #8973 W4 Gate B1: portal ticket create. portalTicketsEnabledMiddleware
+  // opens one org-scoped context with currentPartnerId (the validated owning
+  // partner) BEFORE its enable_tickets read, so createTicket's business-calendar
+  // resolver can read a partner-wide default through the SELECT-only branch.
+  // Every other portal ticket route keeps the generic request transaction.
+  { method: 'POST', pattern: /^\/api\/v1\/portal\/tickets\/?$/ },
+  // #8973 W4 D12 apply-revision: walks open tickets in 500-row chunks, each
+  // in its own short caller-scoped transaction (FOR UPDATE SKIP LOCKED), so
+  // no request transaction holds every touched ticket's row lock to the end.
+  { method: 'POST', pattern: /^\/api\/v1\/business-calendars\/[0-9a-f-]{36}\/apply-revision\/?$/i },
   // Stripe key verification — savePartnerStripeKey calls accounts.retrieve.
   { method: 'POST', pattern: /^\/api\/v1\/partner\/stripe-connect\/key\/?$/ },
   // Stripe cache lazy refresh — getPartnerStripeAccountSnapshot may call accounts.retrieve.
@@ -212,6 +247,13 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // enqueues, so it keeps the ambient transaction (same call as
   // `quotes/bulk-send`).
   { method: 'POST', pattern: /^\/api\/v1\/devices\/bulk\/restore\/?$/ },
+  // #9796 bulk site move — same connection-hold reason as bulk restore. `runBulkIsolated` moves
+  // each device (row lock + guarded UPDATE + denormalized rewrite) in its own short RLS
+  // transaction, up to BULK_SITE_MOVE_CAP. Under the ambient request transaction every row lock
+  // would be held until the last device finished, and a Postgres error late in the batch would
+  // roll back every move already reported `moved`. The handler's whole-batch pre-read opens its
+  // own caller-scoped context too.
+  { method: 'POST', pattern: /^\/api\/v1\/devices\/bulk\/site\/?$/ },
   // Parked-device assignment. Each assignment runs in its own short system
   // transaction (one per device for a bulk batch of up to 50), and the list
   // opens its own system read. Under the ambient request transaction every one
@@ -425,6 +467,25 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // for the length of the accept. The handler opens its own short
   // withAuthDbAccessContext for the org-scoped lookup instead.
   { method: 'POST', pattern: /^\/api\/v1\/quotes\/[^/]+\/accept-on-behalf\/?$/ },
+  // Record signed agreement (#8865 W1c) — the agreement counterpart of
+  // accept-on-behalf, same reason: the handler reads the org owner + template
+  // in a short withAuthDbAccessContext, then runs the request insert + freeze
+  // as ONE transaction under runOutsideDbContext(withSystemDbAccessContext).
+  // Without this entry the ambient request transaction stays held alongside
+  // the system one — two pooled connections for the whole freeze.
+  { method: 'POST', pattern: /^\/api\/v1\/contracts\/agreement-requests\/record-signed\/?$/ },
+  // Agreement request send (#9075 W2b) — the quotes/:id/send shape: the
+  // handler runs the draft→sent transition in a short withAuthDbAccessContext
+  // and the returned deferred email (agreementRequestLifecycle,
+  // DeferredAgreementRequestEmail) after it COMMITS, so no request-row lock
+  // and no pooled connection is held across SMTP. `/link` and `/void` stay on
+  // the ambient transaction (they mail nothing). The public
+  // /agreements/public/* routes need no entry: they carry no auth middleware,
+  // so no ambient transaction is ever opened there.
+  { method: 'POST', pattern: /^\/api\/v1\/contracts\/agreement-requests\/[^/]+\/send\/?$/ },
+  // #9075 W3b — remind re-mails the same link: identical shape to send (a short
+  // auth transaction for the counter bump, the deferred email after it commits).
+  { method: 'POST', pattern: /^\/api\/v1\/contracts\/agreement-requests\/[^/]+\/remind\/?$/ },
   // #3922 review round 2 — revision AUTHORING is the second network-touching
   // route on this surface, and the quieter one. `createRevision` runs
   // `validateBaseUrl` → `assertSafeUrl` on the operator-supplied base URL,
@@ -505,6 +566,17 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   { method: 'POST', pattern: /^\/api\/v1\/edr\/connections\/?$/ },
   { method: 'PATCH', pattern: /^\/api\/v1\/edr\/connections\/[^/]+\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/edr\/connections\/[^/]+\/test\/?$/ },
+  // #8167 W03 PR-B — vendor push opt-in / opt-out / test event: each makes a
+  // vendor push-settings call between short `withAuthDbAccessContext` phases.
+  { method: 'POST', pattern: /^\/api\/v1\/edr\/connections\/[^/]+\/push\/?$/ },
+  { method: 'DELETE', pattern: /^\/api\/v1\/edr\/connections\/[^/]+\/push\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/edr\/connections\/[^/]+\/push\/test\/?$/ },
+  // #8167 W03 — EDR response actions. `dispatchEdrAction` must COMMIT its
+  // `edr_actions` row (and audit) before the one vendor call, and must not hold
+  // a pooled connection across vendor HTTP (#1105): impossible inside the
+  // ambient request transaction. It asserts no context is held and opens its
+  // own short caller-scoped / system contexts. `GET /edr/actions` keeps the tx.
+  { method: 'POST', pattern: /^\/api\/v1\/edr\/actions\/?$/ },
   // Caller verification (#6354 W01): the three Graph-backed operations
   // (directory picker search, authoritative sync, manual binding) each open
   // short `withAuthDbAccessContext` phases around a Microsoft Graph read, so
@@ -546,9 +618,22 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // transaction — between them, with no context held. clientAiAuth and
   // helperAuth consult this registry too; only the send POST opts out.
   { method: 'POST', pattern: /^\/api\/v1\/ai\/sessions\/[^/]+\/messages\/?$/ },
+  // #9427 — the AI chat attach stream stays open for a whole turn. It reads the
+  // owner-bound session in one short withAuthDbAccessContext before streaming
+  // and does no DB work inside the stream; under the ambient request
+  // transaction it would pin a pooled connection for the turn's length (#1105).
+  { method: 'GET', pattern: /^\/api\/v1\/ai\/sessions\/[^/]+\/stream\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/ai\/script-builder\/sessions\/[^/]+\/messages\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/client-ai\/sessions\/[^/]+\/messages\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/helper\/chat\/sessions\/[^/]+\/messages\/?$/ },
+  // #10190 W04: the helper config names the caller-verify logo by the sha the
+  // heartbeat's promptIdentity block carries, through the heartbeat's own
+  // resolver. On a device-cache miss that resolver opens a short system read
+  // of its own (and may start a background logo load); under the ambient
+  // request transaction that read would hold a second pooled connection
+  // (#1105 / #2417). The handler reads permissions and branding in one short
+  // helper context (helperDbAccessContext) and resolves the logo after it.
+  { method: 'GET', pattern: /^\/api\/v1\/helper\/config\/?$/ },
   // AI model registry W05 (#7603, D12): the continuation route makes a
   // provider call (the summary) and takes/settles a budget reservation in
   // their own system transactions; it must not hold the request's connection
@@ -562,6 +647,11 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // #2417). The handler reads the owner-bound session in one short
   // withAuthDbAccessContext and runs the loader reads with no context held.
   { method: 'GET', pattern: /^\/api\/v1\/ai\/models\/choices\/(chat|ai-agents)\/?$/ },
+  // #8333: the recovery-media catalog looks up the signed release manifest
+  // (safeFetch, 1-2 s) once per arch. Its only DB work is the permission gate,
+  // which opens its own short context; the handler itself is read-only and
+  // touches no table, so it needs no ambient request transaction.
+  { method: 'GET', pattern: /^\/api\/v1\/backup\/bmr\/boot-media\/?$/ },
 ];
 
 /**

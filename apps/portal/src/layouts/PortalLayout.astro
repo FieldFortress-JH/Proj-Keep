@@ -1,13 +1,14 @@
 ---
 import '../styles/globals.css';
 import { ClientRouter } from 'astro:transitions';
-import { apiGet } from '../lib/api';
+import { apiGet, portalApi } from '../lib/api';
 import { buildServerApiConfig, loadPortalBranding, loadPortalProfile } from '../lib/server';
 import { buildPortalNavItems } from '../lib/navItems';
 import { stripBase, withBase } from '../lib/basePath';
 import { buildDocAccentCss } from '../lib/docAccent';
 import { isPortalChromeAccent, PORTAL_CHROME_ACCENT_DEFAULT } from '@breeze/shared';
 import { buildPortalCustomCss } from '../lib/customCss';
+import { landingWelcomeMessage } from '../lib/welcomeMessage';
 
 interface Props {
   title: string;
@@ -38,7 +39,23 @@ const profile = await loadPortalProfile(Astro.request);
 // Fail-open when the flag is absent (shared-domain portals get no branding row);
 // the API's 403 gate on /portal/tickets/* is the real enforcement.
 const paymentMethods = await apiGet('/portal/payment-methods', { ...buildServerApiConfig(Astro.request), timeoutMs: 3000 });
-const navItems = buildPortalNavItems(branding, paymentMethods.statusCode === 200);
+// Customer work approval (#8200): the nav badge counts pending requests this
+// customer can decide. It rides the tickets flag, and any non-200 (gate 403,
+// 401, outage) reads as zero: a badge must never break the shell.
+let approvalsPendingCount = 0;
+if (branding.enableTickets !== false) {
+  const approvals = await portalApi.getApprovals(
+    { ...buildServerApiConfig(Astro.request), timeoutMs: 3000 },
+    { pendingOnly: true }
+  );
+  if (approvals.statusCode === 200) {
+    approvalsPendingCount = (approvals.data?.data ?? []).filter((a) => a.canDecide === true).length;
+  }
+}
+const navItems = buildPortalNavItems(branding, paymentMethods.statusCode === 200, approvalsPendingCount);
+// The org's welcome message (#9675): saved in Settings > Organization >
+// Customer portal, greeted with on the landing page only (null elsewhere).
+const welcomeMessage = landingWelcomeMessage(branding, pathname);
 
 const accentCss = buildDocAccentCss(docAccent ?? branding.primaryColor);
 // Org-authored portal styling (#5940) — saved via the branding editor and
@@ -121,6 +138,15 @@ const isActive = (href: string) => {
                 ]}
               ></span>
               {item.label}
+              {item.badge !== undefined && item.badge > 0 && (
+                <span
+                  data-testid={`portal-nav-badge-${item.href.slice(1)}`}
+                  aria-label={`${item.badge} waiting`}
+                  class="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-semibold leading-5 text-primary-foreground"
+                >
+                  {item.badge}
+                </span>
+              )}
             </a>
           ))}
         </nav>
@@ -183,6 +209,15 @@ const isActive = (href: string) => {
                       ]}
                     ></span>
                     {item.label}
+                    {item.badge !== undefined && item.badge > 0 && (
+                      <span
+                        data-testid={`portal-nav-badge-mobile-${item.href.slice(1)}`}
+                        aria-label={`${item.badge} waiting`}
+                        class="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-semibold leading-5 text-primary-foreground"
+                      >
+                        {item.badge}
+                      </span>
+                    )}
                   </a>
                 ))}
               </nav>
@@ -251,6 +286,13 @@ const isActive = (href: string) => {
               sheet && 'rounded-lg border border-border/70 bg-card px-4 py-6 sm:px-9 sm:py-8',
             ]}
           >
+            {/* Plain text the MSP typed: an escaped text node, line breaks kept
+                by pre-line. Never set:html (lib/welcomeMessage.ts). */}
+            {welcomeMessage && (
+              <p data-testid="portal-welcome" class="mb-6 whitespace-pre-line break-words border-b border-border/70 pb-5 text-sm leading-relaxed text-foreground/80">
+                {welcomeMessage}
+              </p>
+            )}
             <slot />
 
             {/* A ledger page has a foot. Partner footer text when the firm

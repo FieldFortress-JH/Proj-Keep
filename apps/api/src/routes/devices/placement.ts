@@ -16,6 +16,7 @@ import { PERMISSIONS } from '../../services/permissions';
 import { writeRouteAudit } from '../../services/auditEvents';
 import {
   deletePlacement,
+  PlacementConcurrentUpdateError,
   placementBodySchema,
   readPlacement,
   savePlacement,
@@ -48,7 +49,7 @@ placementRoutes.get(
     return c.json({
       subject: { kind: subject.kind, id: subject.id, orgId: subject.orgId, siteId: subject.siteId },
       authority: { kind: 'device', id: device.id, linked: false },
-      placement: await readPlacement('device', device.id),
+      placement: await readPlacement('device', device.id, device.orgId),
     });
   },
 );
@@ -66,8 +67,19 @@ placementRoutes.put(
     if (!device) return c.json({ error: 'Device not found' }, 404);
 
     const subject = subjectOf(device);
-    const before = await readPlacement('device', device.id);
-    const placement = await savePlacement(subject, c.req.valid('json'));
+    const before = await readPlacement('device', device.id, device.orgId);
+    let placement;
+    try {
+      placement = await savePlacement(subject, c.req.valid('json'));
+    } catch (err) {
+      if (err instanceof PlacementConcurrentUpdateError) {
+        return c.json(
+          { error: 'The placement was changed by a concurrent update; reload and try again.', code: 'PLACEMENT_CONCURRENT_UPDATE' },
+          409,
+        );
+      }
+      throw err;
+    }
 
     writeRouteAudit(c, {
       orgId: device.orgId,
@@ -97,19 +109,17 @@ placementRoutes.delete(
     if (device === SITE_ACCESS_DENIED) return c.json({ error: 'Access to this site denied' }, 403);
     if (!device) return c.json({ error: 'Device not found' }, 404);
 
-    const before = await readPlacement('device', device.id);
+    const before = await readPlacement('device', device.id, device.orgId);
     await deletePlacement({ kind: 'device', id: device.id });
 
-    if (before) {
-      writeRouteAudit(c, {
-        orgId: device.orgId,
-        action: 'asset.placement.delete',
-        resourceType: 'device',
-        resourceId: device.id,
-        resourceName: device.hostname,
-        details: { before, after: null },
-      });
-    }
+    writeRouteAudit(c, {
+      orgId: device.orgId,
+      action: 'asset.placement.delete',
+      resourceType: 'device',
+      resourceId: device.id,
+      resourceName: device.hostname,
+      details: before ? { before, after: null } : { before: null, after: null, noop: true },
+    });
 
     return c.json({ success: true });
   },

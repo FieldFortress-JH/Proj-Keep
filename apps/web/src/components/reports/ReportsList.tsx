@@ -54,10 +54,14 @@ import {
   type TechnicianTimeSummary,
   type AiUsageByClientSummary,
   type ArAgingSummary,
+  type MrrRenewalsSummary,
+  type QuoteWinRateSummary,
+  type ClientProfitabilitySummary,
   type ReportType as SharedReportType
 } from '@breeze/shared';
 import { useTranslation } from 'react-i18next';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 // Derived from the canonical tuple in `@breeze/shared`
 // (`packages/shared/src/reportTypes.ts`) rather than hand-listed. The
@@ -221,7 +225,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
     setView(next);
     const hash = formatReportsListHash(next);
     if (hash) window.location.hash = hash;
-    else window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    else replaceUrl(`${window.location.pathname}${window.location.search}`);
   }, [setView]);
   const [partnerWideIncomplete, setPartnerWideIncomplete] = useState(false);
 
@@ -470,6 +474,12 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
             | ArAgingSummary
             // #7608 W10 — AI usage by client.
             | AiUsageByClientSummary
+            // #9828 — MRR & renewals.
+            | MrrRenewalsSummary
+            // #9828 — quote win rate.
+            | QuoteWinRateSummary
+            // #9828 — Client profitability.
+            | ClientProfitabilitySummary
             | undefined,
           // Drives the scorecard trend chip ("79, up from 74 last month")
           // when the stored run snapshot captured a prior baseline.

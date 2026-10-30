@@ -41,12 +41,22 @@ export type BodyLimitRule =
   | 'ticket-attachment'
   | 'org-document'
   | 'quote-acceptance-evidence'
+  | 'agreement-signed-copy'
+  | 'edr-webhook'
+  | 'flow-webhook'
+  | 'yara-test-sample'
+  | 'wisp-thread-attachment'
   // Route-level limits TIGHTER than the global default, so `bodyLimitForPath`
   // never returns them — the route's own gate is the one that answers. They
   // share this namespace so all body-limit 413s group on one tag.
   | 'agent-logs'
   | 'agent-process-sample'
-  | 'agent-pam-observation';
+  | 'agent-pam-observation'
+  // #8839: agentAuthMiddleware's own ceiling while it buffers a wrapped agent
+  // route's body before opening the org transaction (agentRequestBody.ts). It
+  // sits ABOVE every agent carve-out here, so behind the global gate it only
+  // answers if the gate is ever bypassed or reordered.
+  | 'agent-wrapped-body';
 
 export interface BodyLimitPolicy {
   rule: BodyLimitRule;
@@ -55,6 +65,19 @@ export interface BodyLimitPolicy {
 }
 
 export function bodyLimitForPath(path: string): BodyLimitPolicy {
+  // EDR vendor push webhook (W03 PR-B): unauthenticated ingress whose body is
+  // only a hint (opaque ids), so it is capped BELOW the default. GravityZone
+  // batches events; 256 KB is ample and bounds pre-auth work.
+  if (/^\/api\/v1\/webhooks\/edr\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) {
+    return { rule: 'edr-webhook', maxSize: 256 * 1024, error: 'Request body too large' };
+  }
+  // Flow webhook ingress (Tool Catalog W05): public, HMAC/token authenticated in
+  // the handler, so the cap must hold before the body is read. 262,144 B is
+  // FLOW_RUN_LIMITS.webhookMaxBodyBytes (packages/shared); kept literal because
+  // this module is deliberately free of imports.
+  if (/^\/api\/v1\/webhooks\/flows\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) {
+    return { rule: 'flow-webhook', maxSize: 262_144, error: 'Request body too large' };
+  }
   // Dev-push uploads agent binaries (~20MB); skip the default 1MB limit.
   if (path.startsWith('/api/v1/dev/push')) {
     return { rule: 'dev-push', maxSize: 150 * 1024 * 1024, error: 'Binary too large (max 150MB)' };
@@ -163,6 +186,32 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
       maxSize: 10 * 1024 * 1024 + 64 * 1024,
       error: 'Evidence file too large (max 10 MB)',
     };
+  }
+  // Record signed agreement (#8865 W1c): one multipart form with an optional
+  // externally signed copy (PDF/PNG/JPEG), capped at 10 MiB by the route and
+  // agreementRequestService. Same 64 KiB slack as the evidence carve-out.
+  if (path.match(/^\/api\/v1\/contracts\/agreement-requests\/record-signed$/)) {
+    return {
+      rule: 'agreement-signed-copy',
+      maxSize: 10 * 1024 * 1024 + 64 * 1024,
+      error: 'Signed copy too large (max 10 MB)',
+    };
+  }
+  // YARA rule test upload (#6263 W04-2): one raw octet-stream sample, capped
+  // at 10 MiB (YARA_TEST_SAMPLE_MAX_BYTES) by the route's own exact check,
+  // which answers YARA_TEST_TOO_LARGE inside this 64 KiB slack. Every other
+  // /security/yara path stays at the default.
+  if (/^\/api\/v1\/security\/yara\/rule-sets\/[0-9a-f-]{36}\/test$/i.test(path)) {
+    return { rule: 'yara-test-sample', maxSize: 10 * 1024 * 1024 + 64 * 1024, error: 'File too large (max 10 MB)' };
+  }
+  // Wisp thread attachment (W04 6b): one multipart text file OR a JSON
+  // `{ text, label }` paste, capped at 5 MiB of decoded text by the route
+  // (THREAD_ATTACHMENT_MAX_BYTES, 413 too_large). 1 MiB of headroom covers the
+  // multipart envelope and the JSON escaping of pasted text; the route
+  // registers the same ceiling (WISP_THREAD_ATTACHMENT_BODY_LIMIT). The JSON
+  // siblings under /wisp/thread stay at the default.
+  if (/^\/api\/v1\/wisp\/thread\/[^/]+\/attachments$/.test(path)) {
+    return { rule: 'wisp-thread-attachment', maxSize: 6 * 1024 * 1024, error: 'Attachment too large (max 5 MiB)' };
   }
   if (path === '/api/v1/users/me/avatar') {
     return {

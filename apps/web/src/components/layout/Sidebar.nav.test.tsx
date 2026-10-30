@@ -32,6 +32,7 @@ vi.mock('./BrandHeader', () => ({ default: () => null }));
 
 import Sidebar, { navSections, topLevelNav } from './Sidebar';
 import { GO_TO_SHORTCUTS } from '../../lib/keyboard/goToShortcuts';
+import { SETTINGS_CATALOG } from '../../lib/settingsCatalog';
 import { i18n, loadLocale } from '../../lib/i18n';
 import en from '../../locales/en/common.json';
 import ptBR from '../../locales/pt-BR/common.json';
@@ -104,9 +105,19 @@ describe('navSections structure (#1321, #1324)', () => {
       // nav entry under Billing.
       '/settings/deliverable-templates',
     ]);
-    expect(hrefsOf('service-desk')).toEqual(['/tickets', '/timesheet']);
+    expect(hrefsOf('service-desk')).toEqual([
+      '/tickets',
+      // #7900 W3 — one entry per ticket type (filtered via the hash).
+      '/tickets#type=incident',
+      '/tickets#type=service_request',
+      '/tickets#type=problem',
+      '/tickets#type=change',
+      '/timesheet',
+    ]);
     expect(hrefsOf('fleet-management')).toEqual([
       '/devices/groups',
+      // #9794 — Sites sits next to Device Groups (spec Decision 1).
+      '/settings/sites',
       // Parked devices awaiting assignment (full partner admins only).
       '/devices/unassigned',
       '/configuration-policies',
@@ -116,12 +127,15 @@ describe('navSections structure (#1321, #1324)', () => {
       '/monitoring',
       '/discovery',
       '/onedrive',
+      '/endpoint-messages',
     ]);
   });
 
   it('keeps every AI surface together and every platform-admin surface in Administration', () => {
+    // #10135: Wisp · Breeze AI · Workers{…} · Breeze AI for Office (the Workers
+    // heading is not an item; see Sidebar.aiSection.test.tsx).
     expect(hrefsOf('ai')).toEqual([
-      '/fleet', '/workspace', '/settings/ai-agents', '/ai-agents/runs', '/ai-agents/impact', '/ai-agents/fix-memory', '/ai-agents/fleet-design', '/settings/ai-usage', '/settings/ai-script-authoring', '/settings/tool-sources', '/ai-for-office',
+      '/wisp', '/ai/chat', '/settings/ai-agents', '/ai-agents/runs', '/operator', '/fleet', '/ai-agents/impact', '/ai-for-office',
     ]);
     const admin = section('administration');
     expect(admin.items.length).toBeGreaterThan(0);
@@ -133,21 +147,15 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(topLevelNav.map((i) => i.href)).not.toContain('/onedrive');
   });
 
-  it('labels the AI usage entry "AI Usage" — the budget editor moved to org settings (#6004)', () => {
-    const item = section('ai').items.find((i) => i.href === '/settings/ai-usage');
-    expect(item?.name).toBe('AI Usage');
-    expect(item?.labelKey).toBe('nav.aiUsage');
-  });
-
-  it('adds a Script authoring entry to the AI section, after AI Usage (#5612 W05)', () => {
-    const item = section('ai').items.find((i) => i.href === '/settings/ai-script-authoring');
-    expect(item).toBeDefined();
-    expect(item?.labelKey).toBe('nav.scriptAuthoring');
-    expect(item?.requiredPermission).toEqual({ resource: 'ai_agents', action: 'read' });
-    const hrefs = hrefsOf('ai');
-    const usageIdx = hrefs.indexOf('/settings/ai-usage');
-    const scriptIdx = hrefs.indexOf('/settings/ai-script-authoring');
-    expect(scriptIdx).toBe(usageIdx + 1);
+  it('moves AI Usage (#6004) and Script authoring (#5612 W05) to Settings → AI (#10135)', () => {
+    expect(hrefsOf('ai')).not.toContain('/settings/ai-usage');
+    expect(hrefsOf('ai')).not.toContain('/settings/ai-script-authoring');
+    expect(SETTINGS_CATALOG.find((e) => e.href === '/settings/ai-usage')).toMatchObject({
+      group: 'ai', name: 'AI Usage', labelKey: 'nav.aiUsage', partnerScopeOnly: true,
+    });
+    expect(SETTINGS_CATALOG.find((e) => e.href === '/settings/ai-script-authoring')).toMatchObject({
+      group: 'ai', labelKey: 'nav.scriptAuthoring', requiredPermission: { resource: 'ai_agents', action: 'read' },
+    });
   });
 
   it('each moved href appears in exactly one section (no duplicate membership)', () => {
@@ -220,6 +228,31 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(item?.name).toBe('Deliverable Templates');
     expect(item?.labelKey).toBe('nav.deliverableTemplates');
     expect(item?.partnerScopeOnly).toBe(true);
+  });
+});
+
+describe('endpoint messages nav entry', () => {
+  it('lives in Fleet Management, once, gated on endpoint_messages:read', () => {
+    const hits = [...topLevelNav, ...navSections.flatMap((s) => s.items)].filter((i) => i.href === '/endpoint-messages');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.labelKey).toBe('nav.endpointMessages');
+    expect(hits[0]!.requiredPermission).toEqual({ resource: 'endpoint_messages', action: 'read' });
+    expect(section('fleet-management').items).toContain(hits[0]);
+  });
+});
+
+describe('sites nav entry (#9794)', () => {
+  it('sits in Fleet Management right after Device Groups, gated only on sites:read (Decisions 1-2)', () => {
+    const hits = [...topLevelNav, ...navSections.flatMap((s) => s.items)].filter((i) => i.href === '/settings/sites');
+    expect(hits).toHaveLength(1);
+    const item = hits[0]!;
+    expect(item.labelKey).toBe('nav.sites');
+    expect(item.testId).toBe('nav-sites');
+    expect(item.requiredPermission).toEqual({ resource: 'sites', action: 'read' });
+    // Shown to org-scoped users and single-site orgs alike: no scope gate.
+    expect(item.partnerScopeOnly).toBeFalsy();
+    const fleet = section('fleet-management').items;
+    expect(fleet.indexOf(item)).toBe(fleet.findIndex((i) => i.href === '/devices/groups') + 1);
   });
 });
 

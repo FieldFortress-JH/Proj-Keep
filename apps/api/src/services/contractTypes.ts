@@ -68,6 +68,9 @@ export type ContractServiceErrorCode =
   | 'GROUP_DELETED'
   // #4693: a formerly site-scoped device line whose site was deleted.
   | 'SITE_DELETED'
+  // #9664: a manual line with NULL manual_quantity. Reads show it unresolved;
+  // generation refuses (never bills it as quantity 0).
+  | 'MANUAL_QUANTITY_MISSING'
   | 'CONTRACT_NOT_FOUND'
   | 'PERIOD_NOT_FOUND'
   | 'CONTRACT_CREATE_FAILED'
@@ -113,14 +116,22 @@ export type ContractServiceErrorCode =
   // NOT distinguish missing / foreign / RLS-invisible (catalogService.ts:680) —
   // a 404 that fires only for foreign ids enumerates other partners' catalogs.
   | 'CATALOG_ITEM_NOT_FOUND'
-  // #4547 W01: an hour_block row reached a billing/estimate path before the
-  // engine that understands it shipped. 500: only a hand-forged row gets here,
-  // because no validator accepts the type until W03.
-  | 'HOUR_BLOCK_NOT_ENABLED'
   // #8181: a block period close locked N time entries but marked a different
   // number, or found its ledger row already written under the contract lock.
   // The caller's transaction aborts — fee, claim and drawdown roll back together.
-  | 'HOUR_BLOCK_CLOSE_MISMATCH';
+  | 'HOUR_BLOCK_CLOSE_MISMATCH'
+  // #4547 W03 (index C10): a second live block-hours line for the organization
+  // (409) / an edit of a field a block does not allow, or of a retired block (400).
+  | 'HOUR_BLOCK_EXISTS'
+  | 'HOUR_BLOCK_FIELD_LOCKED'
+  // #9346 adopt-draft: the folded-in contract must be a draft (400), the
+  // receiving one draft or active (400), and they must differ (400).
+  | 'ADOPT_SOURCE_NOT_DRAFT'
+  | 'ADOPT_TARGET_INVALID_STATE'
+  | 'ADOPT_SELF'
+  // #9346: a source deliverable's name is already used on the target (or by
+  // another moved one). `details.names` lists every colliding name.
+  | 'DUPLICATE_NAME';
 
 export class ContractServiceError extends Error {
   constructor(
@@ -162,6 +173,12 @@ export interface ContractLineAudit {
   /** Column NAMES whose persisted value changed. Empty on a no-op patch.
    *  Absent for add/remove. Never a value — see the no-free-text rule. */
   changedFields?: string[];
+  /** #4547 W03: true when a remove retired a block-hours line (history exists)
+   *  instead of deleting it. Absent for every other line and for add/update. */
+  retired?: boolean;
+  /** #4547 W03: block lines only. Before/after of the columns a mid-period edit moves; the next
+   *  close reads them. Numbers and enum values only — never free text (the audit no-free-text rule). */
+  blockChanges?: Record<string, { before: string | number | null; after: string | number | null }>;
   oldUnitPrice?: string;   // only when unitPrice changed
   newUnitPrice?: string;   // also set on add
 }

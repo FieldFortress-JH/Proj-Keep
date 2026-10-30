@@ -80,7 +80,6 @@ type OrganizationFormValues = {
   slug: string;
   type: 'customer' | 'internal';
   status: 'active' | 'trial' | 'suspended' | 'churned' | 'offboarding';
-  maxDevices: number;
   contractStart?: string;
   contractEnd?: string;
 };
@@ -399,7 +398,14 @@ export default function OrganizationsBoardPage() {
   };
   const handleCloseModal = () => setModalMode('closed');
   /** LIST-STATE UPDATE ONLY: the modal stays open on its own `done` phase. */
-  const handleArchiveComplete = (archivedId: string) => setOrganizations((prev) => prev.filter((o) => o.id !== archivedId));
+  const handleArchiveComplete = (archivedId: string) => {
+    setOrganizations((prev) => prev.filter((o) => o.id !== archivedId));
+    // Header org switcher reads the global store; without this it keeps listing the archived org (#8371).
+    useOrgStore
+      .getState()
+      .fetchOrganizations()
+      .catch((storeErr: unknown) => console.warn('[OrganizationsBoardPage] org store refresh failed after archive', storeErr));
+  };
   const handleArchiveDoneClose = () => {
     setTargetOrg(null);
     handleCloseModal();

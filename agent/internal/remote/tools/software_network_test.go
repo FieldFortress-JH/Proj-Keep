@@ -84,10 +84,11 @@ func swPolicyReason(t *testing.T, err error, want string) {
 
 // installPayload builds a minimal, otherwise-valid software_install payload.
 func installPayload(downloadURL string, policy any) map[string]any {
+	fileType, fileName := hostInstaller("pkg")
 	p := map[string]any{
 		"downloadUrl":  downloadURL,
-		"fileName":     "pkg.exe",
-		"fileType":     "exe",
+		"fileName":     fileName,
+		"fileType":     fileType,
 		"softwareName": "Acme",
 		"version":      "1.0.0",
 	}
@@ -520,6 +521,11 @@ func TestInstallSoftware_ErrorNeverLeaksTheDownloadURL(t *testing.T) {
 	if strings.Contains(result.Error, secret) || strings.Contains(result.Error, "10.0.0.5") {
 		t.Fatalf("download error leaked the URL: %q", result.Error)
 	}
+	// Positive anchor: the refusal must come from the network path, or this
+	// test passes on any earlier failure without exercising the leak at all.
+	if !strings.Contains(result.Error, netpolicy.ReasonPrivateAddressNotAllowed) {
+		t.Fatalf("expected the network-policy refusal %q, got %q", netpolicy.ReasonPrivateAddressNotAllowed, result.Error)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +760,44 @@ func TestDownloadFile_WritesThePackage(t *testing.T) {
 	}
 	if string(got) != string(body) {
 		t.Fatalf("downloaded %q, want %q", got, body)
+	}
+}
+
+// Some vendor download CDNs answer Go's default "Go-http-client" User-Agent
+// with 403 while serving the same URL when an explicit User-Agent is sent
+// (#8711). Every hop, redirects included, must carry the
+// agent's own User-Agent.
+func TestDownloadFile_SendsAgentUserAgent(t *testing.T) {
+	var seen []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.UserAgent())
+		http.Redirect(w, r, "/pkg.exe", http.StatusFound)
+	})
+	mux.HandleFunc("/pkg.exe", func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.UserAgent())
+		if ua := r.UserAgent(); ua == "" || strings.HasPrefix(ua, "Go-http-client") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte("installer-bytes"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	if err := downloadFile(server.Client(), server.URL+"/start", swTempFile(t)); err != nil {
+		t.Fatalf("downloadFile: %v (user agents seen: %q)", err, seen)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 requests (redirect + download), got %d: %q", len(seen), seen)
+	}
+	// Independent literal, not the production constant, so emptying or
+	// changing the constant fails here too.
+	const want = "BreezeRMM-Agent/1.0"
+	for i, ua := range seen {
+		if ua != want {
+			t.Fatalf("request %d sent User-Agent %q, want %q", i, ua, want)
+		}
 	}
 }
 

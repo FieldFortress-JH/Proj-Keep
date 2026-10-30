@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Bir cihazda test et",
       "selectDevice": "Cihaz",
-      "run": "Testi çalıştır"
+      "run": "Testi çalıştır",
+      "saveToTest": "Değişikliklerinizi test etmek için kaydedin"
     },
     "deliveryPreview": {
       "selectOrg": "Teslimatı önizlemek için bir kuruluş seçin.",
@@ -192,7 +193,8 @@
     "script": "Betik denetimi",
     "network_check": "Ağ denetimi",
     "hardware_health": "Donanım sağlığı",
-    "time_sync": "Saat eşitleme"
+    "time_sync": "Saat eşitleme",
+    "container_image_currency": "Kapsayıcı imajı güncelliği"
   },
   "fields": {
     "operator": "Karşılaştırma",
@@ -244,7 +246,9 @@
     "expectedValue": "Beklenen değer",
     "nameserver": "Ad sunucusu",
     "degradedIsFailure": "Bozulmuşu hata say",
-    "maxResponseMs": "Şundan yavaşsa başarısız (ms)"
+    "maxResponseMs": "Şundan yavaşsa başarısız (ms)",
+    "eventLogCollectionNoSource": "Bilgi ve Uyarı düzeyindeki Uygulama olayları yalnızca {{providers}} sağlayıcılarından toplanır. Diğer kaynakların olayları, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe yalnızca Hata veya Kritik düzeyinde bu kuralla eşleşir (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları).",
+    "eventLogCollectionSourceNotCollected": "Aracı, \"{{source}}\" kaynağından Bilgi veya Uyarı düzeyindeki Uygulama olaylarını, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe toplamaz (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları). Aksi takdirde bu kural yalnızca kaynağın Hata veya Kritik olaylarıyla eşleşir. Yerleşik sağlayıcılar: {{providers}}."
   },
   "operators": {
     "gt": "büyüktür",
@@ -268,6 +272,7 @@
     "system": "Sistem"
   },
   "eventLevels": {
+    "info": "Bilgi",
     "warning": "Uyarı",
     "error": "Hata",
     "critical": "Kritik"
@@ -328,10 +333,13 @@
     "cancel": "İptal",
     "detachConfirm": "{{policy}} politikasından kaldırılsın mı?",
     "errors": {
+      "loadGroups": "Cihaz grupları yüklenemedi.",
       "attach": "Monitör eklenemedi",
       "detach": "Monitör kaldırılamadı",
       "linkedFeature": "Bu ilkenin monitörleri paylaşılan bir özellik ilkesinden geliyor. O ilkeyi düzenleyin veya başka bir ilke seçin."
-    }
+    },
+    "partnerWideGroups": "Tüm kuruluşlar (iş ortağı genelinde)",
+    "organizationGroups": "Kuruluş grupları"
   },
   "policyTab": {
     "title": "Monitörler",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Eski uyarı kuralları",
     "description": "Bir monitör tarafından yönetilmeyen bağımsız uyarı kuralları. Yanıtları, teslimatı ve yükseltmeyi bir arada almak için bunları dönüştürün.",
-    "empty": "Eski kural yok.",
+    "empty": "Dönüştürülmesi gereken bağımsız uyarı kuralı yok.",
     "columns": {
       "name": "Ad",
       "template": "Şablon",
@@ -535,11 +543,13 @@
       "more": "Daha fazla yükle",
       "empty": "Dönüştürme geçmişi yok.",
       "system": "Sistem",
+      "unknownUser": "Bilinmeyen kullanıcı",
       "reverted": "Geri alındı",
       "deadline": "Eski uyarıların emekliye ayrılması kaynak değerlendiriciyi kaldırdıktan sonra geri alma kullanılamaz."
     },
     "errorCodes": {
       "preview_stale": "İlke bu önizlemeden sonra değişti. Dönüştürmeden önce yeniden önizleyin.",
+      "conversion_contended": "Eş zamanlı değişiklikler dönüştürmeyi kesintiye uğrattı. Hiçbir şey değiştirilmedi. Tekrar deneyin.",
       "preview_failed": "Önizleme oluşturulamadı. Daha sonra yeniden deneyin.",
       "equivalence_delta": "Dönüştürülen izleyiciler her cihazda eski kurallar gibi davranmayacak. Dönüştürmeden önce önizlemeyi inceleyin.",
       "CONVERSION_PREREQUISITE_MISSING": "Gerekli bir platform güncellemesi henüz dağıtılmadığı için dönüştürme yapılamıyor.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "Saat ilkesi uygulanmadı",
           "policy_conflict_gpo": "Grup İlkesi saat ayarlarını denetliyor"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "En az gecikme günü"
       }
     }
   },

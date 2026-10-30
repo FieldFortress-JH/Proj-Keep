@@ -14,6 +14,7 @@ import { MONITOR_KINDS } from '@breeze/shared';
  */
 
 const {
+  loadPolicyApplicationProvidersMock,
   hasPermMock,
   mfaOkMock,
   listMonitorDefinitionsMock,
@@ -25,6 +26,7 @@ const {
   selectMock,
   isMonitorAttachableToPolicyMock,
 } = vi.hoisted(() => ({
+  loadPolicyApplicationProvidersMock: vi.fn(async (): Promise<string[]> => []),
   hasPermMock: vi.fn<(resource: string, action: string) => boolean>(() => true),
   mfaOkMock: vi.fn(() => true),
   listMonitorDefinitionsMock: vi.fn(),
@@ -40,6 +42,8 @@ const {
   // that the route respects the pre-check's answer.
   isMonitorAttachableToPolicyMock: vi.fn(async () => true),
 }));
+
+vi.mock('../services/eventLogPolicyProviders', () => ({ loadPolicyApplicationProviders: loadPolicyApplicationProvidersMock }));
 
 vi.mock('../middleware/auth', () => ({
   authMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
@@ -160,6 +164,8 @@ function selectChain<T>(rows: T) {
 
 vi.mock('../db', () => ({
   db: { select: selectMock },
+  hasDbAccessContext: () => true,
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
 }));
 
 import { monitorDefinitionRoutes } from './monitorDefinitions';
@@ -254,6 +260,7 @@ function jsonRequest(app: Hono, method: string, path: string, body?: unknown) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  loadPolicyApplicationProvidersMock.mockResolvedValue([]);
   hasPermMock.mockReturnValue(true);
   mfaOkMock.mockReturnValue(true);
   selectMock.mockReturnValue(selectChain([]));
@@ -291,14 +298,14 @@ describe('GET /monitor-definitions', () => {
 });
 
 describe('GET /monitor-definitions/kinds', () => {
-  it('returns twenty-one monitor kinds with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
+  it('returns twenty-two monitor kinds with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
     const res = await jsonRequest(buildApp(), 'GET', '/kinds');
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       data: Array<{ kind: string; overridableKeys: string[]; defaultSeverity: string; agentDelivered: boolean }>;
     };
-    expect(body.data).toHaveLength(21);
+    expect(body.data).toHaveLength(22);
     expect(body.data).toHaveLength(MONITOR_KINDS.length);
     expect(new Set(body.data.map((d) => d.kind))).toEqual(new Set(MONITOR_KINDS));
     for (const entry of body.data) {
@@ -379,6 +386,81 @@ describe('POST /monitor-definitions', () => {
       error: 'INVALID_MONITOR',
       details: 'condition does not match kind cpu',
     });
+  });
+});
+
+describe('event_log collection warnings at save (#8174)', () => {
+  const infoCondition = (sourcePattern: string) => ({
+    category: 'application',
+    level: 'info',
+    sourcePattern,
+    countThreshold: 1,
+    windowMinutes: 60,
+  });
+
+  it.each(['POST', 'PATCH'])('%s uses scoped policy providers for advisory warnings', async (method) => {
+    const row = { ...monitorRow(), kind: 'event_log', condition: infoCondition('Dell UPS Local Node Manager') };
+    createMonitorDefinitionMock.mockResolvedValue(row);
+    updateMonitorDefinitionMock.mockResolvedValue(row);
+    const request = () => jsonRequest(buildApp(), method, method === 'POST' ? '' : `/${MONITOR_ID}`, method === 'POST' ? validCreateBody() : { name: 'Renamed' });
+    expect((await (await request()).json()).warnings).toHaveLength(1);
+    loadPolicyApplicationProvidersMock.mockResolvedValue(['Dell UPS Local Node Manager']);
+    expect((await (await request()).json()).warnings).toBeUndefined();
+    expect(loadPolicyApplicationProvidersMock).toHaveBeenLastCalledWith({ orgId: ORG_ID, partnerId: null });
+  });
+
+  it('does not query providers for other monitor kinds or composites without event logs', async () => {
+    for (const row of [monitorRow(), monitorRow({ kind: 'composite', condition: { children: [{ kind: 'cpu', condition: {} }] } })]) {
+      createMonitorDefinitionMock.mockResolvedValue(row);
+      await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+    }
+    expect(loadPolicyApplicationProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it('queries providers for an event-log composite child', async () => {
+    loadPolicyApplicationProvidersMock.mockResolvedValue(['Dell UPS Local Node Manager']);
+    createMonitorDefinitionMock.mockResolvedValue(monitorRow({ kind: 'composite', condition: { children: [
+      { kind: 'event_log', condition: infoCondition('Dell UPS') },
+    ] } }));
+    const response = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+    expect((await response.json()).warnings).toBeUndefined();
+    expect(loadPolicyApplicationProvidersMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST returns warnings for an info-level Application source outside the agent allowlist', async () => {
+    const created = { ...monitorRow(), kind: 'event_log', condition: infoCondition('Application Error') };
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data).toEqual(created);
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0]).toContain('Application Error');
+    expect(body.warnings[0]).toContain('MsiInstaller');
+  });
+
+  it('POST omits warnings for an allowlisted provider', async () => {
+    const created = { ...monitorRow(), kind: 'event_log', condition: infoCondition('MsiInstaller') };
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ data: created });
+  });
+
+  it('PATCH returns warnings computed from the saved row (a partial patch carries no kind)', async () => {
+    const updated = { ...monitorRow(), kind: 'event_log', condition: infoCondition('VSS') };
+    updateMonitorDefinitionMock.mockResolvedValue(updated);
+
+    const res = await jsonRequest(buildApp(), 'PATCH', `/${MONITOR_ID}`, { name: 'Renamed' });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0]).toContain('VSS');
   });
 });
 

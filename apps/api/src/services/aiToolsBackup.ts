@@ -36,6 +36,12 @@ import { resolveSelectedSnapshotPaths, selectedSnapshotPathError } from './backu
 import { inArray } from 'drizzle-orm';
 import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 import { restoreIntegrityRefusalForActor } from './backupRestoreActorGate';
+import { sumStoredSnapshotBytes } from './backupStoredBytes';
+import {
+  getProviderCoverageForDevices,
+  listBackupHealthRows,
+  summarizeBackupHealth,
+} from './backupHealthReadModel';
 
 type BackupHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -49,6 +55,51 @@ function getOrgId(auth: AuthContext): string | null {
 
 function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
   return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/** Critical vendor rows listed in get_backup_status's org summary. */
+const VENDOR_ATTENTION_LIMIT = 10;
+
+const VENDOR_NOT_READ_NOTE = 'Vendor backups were not read: this caller has no accessible organizations.';
+const VENDOR_READ_FAILED_NOTE = 'Vendor backups could not be read (error). Do not conclude there are none.';
+
+/**
+ * Third-party (vendor) backup health for get_backup_status's org summary,
+ * from the unified backup read model's provider leg — the same rows Wisp
+ * readiness counts when it says backups are watchable (#10404). Returns null
+ * when the caller has no accessible org list (system scope, or none), so the
+ * tool says it did not read vendors instead of implying there are none.
+ */
+async function vendorBackupSummary(auth: AuthContext) {
+  const orgIds = auth.orgId ? [auth.orgId] : auth.accessibleOrgIds;
+  if (!orgIds || orgIds.length === 0) return null;
+  const scope = { orgIds };
+  const summary = await summarizeBackupHealth(scope, { sources: ['provider'] });
+  // Critical rows straight from the read model's health filter (it walks past
+  // healthy rows in batches), one read across every org in scope.
+  const attention = await listBackupHealthRows(scope, {
+    sources: ['provider'],
+    filter: { health: ['critical'] },
+    page: { limit: VENDOR_ATTENTION_LIMIT },
+  });
+  return {
+    endpoints: summary.endpoints,
+    // Unlinked vendor devices and M365 accounts are counted here, not in
+    // `endpoints`; an org protected only by those must not read as zero.
+    providerOnly: summary.providerOnly,
+    m365Accounts: summary.m365Accounts,
+    byHealth: summary.byHealth,
+    byStatus: summary.byStatus,
+    byRecency: summary.byRecency,
+    needsAttention: attention.rows.map((r) => ({
+      orgName: r.orgName,
+      name: r.name,
+      status: r.status,
+      lastSuccessAt: r.lastSuccessAt,
+      errorsCount: r.errorsCount,
+    })),
+    needsAttentionTruncated: attention.nextCursor !== null,
+  };
 }
 
 /** Wrap handler in try-catch so DB/runtime errors return JSON instead of crashing */
@@ -307,7 +358,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'get_backup_status',
-      description: 'Get backup health summary for a device or the entire organization.',
+      description: 'Get backup health summary for a device or the entire organization, covering Breeze backups and synced third-party backup vendors.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -340,7 +391,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
         const dc = orgWhere(auth, devices.orgId);
         if (dc) deviceConditions.push(dc);
-        const [device] = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices)
+        const [device] = await db.select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId }).from(devices)
           .where(and(...deviceConditions)).limit(1);
         if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
@@ -376,20 +427,34 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           .orderBy(desc(backupJobs.completedAt))
           .limit(1);
 
-        // Total snapshot count and size
+        // Total snapshot count and STORED size — an incremental counts the
+        // bytes it uploaded, not its full logical size (#9631).
         const snapOrgCond = orgWhere(auth, backupSnapshots.orgId);
-        const [snapshotStats] = await db.select({
-          count: sql<number>`count(*)`,
-          totalSize: sql<number>`coalesce(sum(${backupSnapshots.size}), 0)`,
-        }).from(backupSnapshots)
-          .where(and(eq(backupSnapshots.deviceId, deviceId), ...(snapOrgCond ? [snapOrgCond] : [])));
+        const snapshotStats = await sumStoredSnapshotBytes(
+          and(eq(backupSnapshots.deviceId, deviceId), ...(snapOrgCond ? [snapOrgCond] : [])),
+        );
+
+        // Third-party backup coverage for this device (#10404). The device
+        // passed the org and site checks above, so its own org is the scope.
+        // A vendor read failure must not discard the Breeze job data above.
+        let vendorBackup: { covered: boolean; health: string } | null = null;
+        let vendorBackupNote: string | undefined;
+        try {
+          vendorBackup = (await getProviderCoverageForDevices(device.orgId, [deviceId])).get(deviceId) ?? null;
+        } catch (err) {
+          console.error('[backup:get_backup_status] vendor coverage read failed', { deviceId }, err);
+          vendorBackupNote = VENDOR_READ_FAILED_NOTE;
+        }
 
         return JSON.stringify({
           deviceId,
           latestJob: latestJob ?? null,
           lastSuccessfulBackup: lastSuccess?.completedAt ?? null,
-          snapshotCount: snapshotStats?.count ?? 0,
-          totalBackupSize: snapshotStats?.totalSize ?? 0,
+          snapshotCount: snapshotStats.count,
+          totalBackupSize: snapshotStats.totalBytes,
+          // null = no vendor backup linked to this device.
+          vendorBackup,
+          ...(vendorBackupNote ? { vendorBackupNote } : {}),
         });
       }
 
@@ -427,11 +492,21 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       const sc = orgWhere(auth, backupSnapshots.orgId);
       if (sc) snapshotConditions.push(sc);
 
-      const [storageStats] = await db.select({
-        snapshotCount: sql<number>`count(*)`,
-        totalStorage: sql<number>`coalesce(sum(${backupSnapshots.size}), 0)`,
-      }).from(backupSnapshots)
-        .where(snapshotConditions.length > 0 ? and(...snapshotConditions) : undefined);
+      // Stored bytes, not the sum of logical snapshot sizes (#9631).
+      const storageStats = await sumStoredSnapshotBytes(
+        snapshotConditions.length > 0 ? and(...snapshotConditions) : undefined,
+      );
+
+      // A vendor read failure must not discard the Breeze-native data above.
+      let vendorBackups: Awaited<ReturnType<typeof vendorBackupSummary>> = null;
+      let vendorBackupsNote: string | undefined;
+      try {
+        vendorBackups = await vendorBackupSummary(auth);
+        if (!vendorBackups) vendorBackupsNote = VENDOR_NOT_READ_NOTE;
+      } catch (err) {
+        console.error('[backup:get_backup_status] vendor backup summary failed', { orgId: auth.orgId }, err);
+        vendorBackupsNote = VENDOR_READ_FAILED_NOTE;
+      }
 
       return JSON.stringify({
         configs: {
@@ -440,9 +515,12 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         },
         jobsLast7Days: jobStats ?? {},
         storage: {
-          snapshotCount: storageStats?.snapshotCount ?? 0,
-          totalBytes: storageStats?.totalStorage ?? 0,
+          snapshotCount: storageStats.count,
+          totalBytes: storageStats.totalBytes,
         },
+        // Third-party backup vendors (e.g. Cove) synced into Breeze (#10404).
+        vendorBackups,
+        ...(vendorBackupsNote ? { vendorBackupsNote } : {}),
       });
     }),
   });

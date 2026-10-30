@@ -2,6 +2,10 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import '@/lib/i18n';
 
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(async () => ({ ok: true, json: async () => ({ data: [] }) })),
+}));
+
 import UpdateRingForm, { type UpdateRingFormValues } from './UpdateRingForm';
 
 // #1317: the Update Ring now owns the patch auto-approval gate. These tests
@@ -428,5 +432,163 @@ describe('UpdateRingForm — unrated-patch opt-in (#3758)', () => {
       'Select at least one severity or enable third-party app auto-approval.'
     );
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+});
+
+// #8187: application rules (block / pin) moved from the config policy to the ring.
+describe('UpdateRingForm — application rules (#8187)', () => {
+  it('submits appRules: [] for a ring with no rules', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByPlaceholderText('e.g. Pilot, Broad'), { target: { value: 'Pilot' } });
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).appRules).toEqual([]);
+  });
+
+  it('includes an added block rule in the submit payload', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    fireEvent.change(screen.getByPlaceholderText('e.g. Pilot, Broad'), { target: { value: 'Pilot' } });
+    expect(screen.getByTestId('ring-app-rules-section')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('app-rules-add'));
+    fireEvent.change(screen.getByTestId('app-rules-manual-id'), { target: { value: 'Mozilla.Firefox' } });
+    fireEvent.click(screen.getByTestId('app-rules-manual-add'));
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).appRules).toEqual([
+      expect.objectContaining({ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }),
+    ]);
+  });
+
+  it('loads the stored rules of an edited ring and round-trips them', async () => {
+    const onSubmit = vi.fn();
+    const appRules = [
+      { source: 'third_party', packageId: 'Mozilla.Firefox', displayName: 'Firefox', action: 'block' as const },
+      { source: 'third_party', packageId: 'VideoLAN.VLC', displayName: 'VLC', action: 'pin' as const, pinnedVersion: '3.0.20' },
+    ];
+    render(<UpdateRingForm onSubmit={onSubmit} defaultValues={{ name: 'Pilot', appRules }} />);
+    expect(screen.getByText('Firefox')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('3.0.20')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('app-rule-remove-third_party|mozilla.firefox'));
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).appRules).toEqual([appRules[1]]);
+  });
+
+  it('blocks submit while a pinned rule has no version', async () => {
+    const onSubmit = vi.fn();
+    render(
+      <UpdateRingForm
+        onSubmit={onSubmit}
+        defaultValues={{ name: 'Pilot', appRules: [{ source: 'third_party', packageId: 'A.B', action: 'pin', pinnedVersion: '' }] }}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(screen.getAllByText('Pinned applications need a version.').length).toBeGreaterThan(0));
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+});
+
+// Windows feature releases (25H2 and friends) follow a per-ring policy:
+// block (default), allow the newest, or pin to one release.
+describe('UpdateRingForm — Windows feature updates', () => {
+  const fillName = () =>
+    fireEvent.change(screen.getByPlaceholderText('e.g. Pilot, Broad'), { target: { value: 'Pilot' } });
+
+  it('defaults to block and submits { mode: "block" }', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    expect((screen.getByTestId('ring-feature-updates-mode') as HTMLSelectElement).value).toBe('block');
+    expect(screen.queryByTestId('ring-feature-updates-version')).not.toBeInTheDocument();
+    fillName();
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).featureUpdates).toEqual({ mode: 'block' });
+  });
+
+  it('pin shows product + release and submits the API shape with the release upper-cased', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    fillName();
+    fireEvent.change(screen.getByTestId('ring-feature-updates-mode'), { target: { value: 'pin' } });
+    fireEvent.change(screen.getByTestId('ring-feature-updates-product'), { target: { value: 'windows-11' } });
+    fireEvent.change(screen.getByTestId('ring-feature-updates-version'), { target: { value: '25h2' } });
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).featureUpdates)
+      .toEqual({ mode: 'pin', product: 'windows-11', targetVersion: '25H2' });
+  });
+
+  it('pin without a release blocks submit with a message', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    fillName();
+    fireEvent.change(screen.getByTestId('ring-feature-updates-mode'), { target: { value: 'pin' } });
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(screen.getByText('Enter a release like 25H2.')).toBeInTheDocument());
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('allow submits { mode: "allow" } with no pin fields', async () => {
+    const onSubmit = vi.fn();
+    render(<UpdateRingForm onSubmit={onSubmit} />);
+    fillName();
+    fireEvent.change(screen.getByTestId('ring-feature-updates-mode'), { target: { value: 'allow' } });
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).featureUpdates).toEqual({ mode: 'allow' });
+  });
+
+  it('editing a pinned ring pre-fills the pin and round-trips it', async () => {
+    const onSubmit = vi.fn();
+    render(
+      <UpdateRingForm
+        onSubmit={onSubmit}
+        defaultValues={{ name: 'Pilot', featureUpdates: { mode: 'pin', product: 'windows-10', targetVersion: '22H2' } }}
+      />
+    );
+    expect((screen.getByTestId('ring-feature-updates-mode') as HTMLSelectElement).value).toBe('pin');
+    expect((screen.getByTestId('ring-feature-updates-product') as HTMLSelectElement).value).toBe('windows-10');
+    expect((screen.getByTestId('ring-feature-updates-version') as HTMLInputElement).value).toBe('22H2');
+    fireEvent.click(screen.getByRole('button', { name: /save ring/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect((onSubmit.mock.calls[0][0] as UpdateRingFormValues).featureUpdates)
+      .toEqual({ mode: 'pin', product: 'windows-10', targetVersion: '22H2' });
+  });
+});
+
+// #9565: a new ring defaulted to rollout order 0 no matter which rings already
+// existed. It now defaults to one past the highest existing order; editing a
+// ring keeps its own stored order.
+describe('UpdateRingForm — default rollout order (#9565)', () => {
+  const orderInput = () => screen.getByLabelText(/rollout order/i) as HTMLInputElement;
+
+  it('defaults a new ring to max(existing order) + 1', () => {
+    render(<UpdateRingForm onSubmit={vi.fn()} existingRingOrders={[0, 3, 1]} />);
+    expect(orderInput().value).toBe('4');
+  });
+
+  it('defaults to 0 when there are no existing rings', () => {
+    render(<UpdateRingForm onSubmit={vi.fn()} existingRingOrders={[]} />);
+    expect(orderInput().value).toBe('0');
+  });
+
+  it('never defaults past the schema maximum of 100', () => {
+    render(<UpdateRingForm onSubmit={vi.fn()} existingRingOrders={[100]} />);
+    expect(orderInput().value).toBe('100');
+  });
+
+  it('keeps an edited ring at its stored order', () => {
+    render(
+      <UpdateRingForm
+        onSubmit={vi.fn()}
+        existingRingOrders={[0, 3, 1]}
+        defaultValues={{ name: 'Pilot', ringOrder: 1 }}
+      />,
+    );
+    expect(orderInput().value).toBe('1');
   });
 });

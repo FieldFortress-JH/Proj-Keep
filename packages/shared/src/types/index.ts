@@ -4,6 +4,7 @@
 
 import type { EmailTemplateId } from '../utils/emailTemplates';
 import type { AiApprovalSettings } from '../validators/aiApprovalSettings';
+import type { FlowLimitsSettings } from '../validators/flowBudgets';
 
 export * from './auth';
 export * from './deviceOptions';
@@ -16,13 +17,14 @@ export * from './edr';
 export * from './aiModelRegistry';
 export * from './aiModelQuality';
 export * from './mdm';
+export * from './hourBlock';
 
 // ============================================
 // Multi-Tenancy Types
 // ============================================
 
 export type PartnerType = 'msp' | 'enterprise' | 'internal';
-export type PlanType = 'free' | 'pro' | 'enterprise' | 'unlimited';
+export type PlanType = (typeof PARTNER_PLANS)[number];
 export type OrgType = 'customer' | 'internal';
 // `offboarding` (#2774): terminal-intent drain state — users locked out, agents
 // kept authenticated (self_uninstall-only) until drained, then auto-`churned`.
@@ -222,6 +224,12 @@ export type VpnProvider =
   | 'zerotier'
   | 'openvpn'
   | 'cloudflare-warp'
+  // Enterprise VPN / SSE clients (#8763).
+  | 'zscaler'
+  | 'globalprotect'
+  | 'cisco-secure-client'
+  | 'forticlient'
+  | 'netskope'
   | 'generic';
 
 /** How the agent recognized the VPN — a raw signal, not a trust ranking. */
@@ -342,7 +350,8 @@ export interface DeviceMetrics {
 
 export interface DeviceGroup {
   id: string;
-  orgId: string;
+  orgId: string | null;
+  partnerId: string | null;
   siteId: string | null;
   name: string;
   type: DeviceGroupType;
@@ -533,7 +542,7 @@ export interface Policy {
 // Alert Types
 // ============================================
 
-import { ACTOR_TYPES, AUDIT_RESULTS, NOTIFICATION_CHANNEL_TYPES } from '../constants';
+import { ACTOR_TYPES, AUDIT_RESULTS, NOTIFICATION_CHANNEL_TYPES, PARTNER_PLANS } from '../constants';
 
 export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 export type AlertStatus = 'active' | 'acknowledged' | 'resolved' | 'suppressed' | 'dismissed';
@@ -629,13 +638,6 @@ export interface AuditLog {
 
 export type DateFormat = 'MM/DD/YYYY' | 'DD/MM/YYYY' | 'YYYY-MM-DD';
 export type TimeFormat = '12h' | '24h';
-export type BusinessHoursPreset = '24/7' | 'business' | 'extended' | 'custom';
-
-export interface DaySchedule {
-  start: string;
-  end: string;
-  closed?: boolean;
-}
 
 export interface InheritableSecuritySettings {
   minLength?: number;
@@ -697,12 +699,11 @@ export interface InheritableEventLogSettings {
 
 export interface InheritableDefaultSettings {
   policyDefaults?: Record<string, string>;
+  /** Org level only: a `device_groups.id` (static group) applied at enrollment (#9617). */
   deviceGroup?: string;
-  alertThreshold?: string;
   autoEnrollment?: {
     enabled: boolean;
     requireApproval: boolean;
-    sendWelcome: boolean;
   };
   agentUpdatePolicy?: string;
   maintenanceWindow?: string;
@@ -788,15 +789,16 @@ export interface EffectiveOrgSettings {
   locked: string[];
 }
 
+/** `partners.settings.networkProxy` (#8155). Partner-only: there is no org override. */
+export interface PartnerNetworkProxySettings {
+  dedicatedTunnelOrigin?: boolean;
+}
+
 export interface PartnerSettings {
   timezone?: string;
   dateFormat?: DateFormat;
   timeFormat?: TimeFormat;
   language?: SupportedLocale;
-  businessHours?: {
-    preset: BusinessHoursPreset;
-    custom?: Record<string, DaySchedule>;
-  };
   contact?: {
     name?: string;
     email?: string;
@@ -822,11 +824,19 @@ export interface PartnerSettings {
   // override lives at the same key on organizations.settings; the org wins.
   // Resolved only by resolveAiApprovalTimeout (validators/aiApprovalSettings).
   aiApprovals?: AiApprovalSettings;
+  // Tool Catalog W05 (#5220) — partner DEFAULT flow caps. Org override lives
+  // at the same key on organizations.settings and may only LOWER these.
+  // Resolved only by resolveFlowLimits (apps/api services/flows/flowLimits.ts);
+  // written only by PUT /api/v1/flows/limits.
+  flows?: FlowLimitsSettings;
   // Partner-level preferred order of organization IDs. The org list endpoint
   // returns matching orgs in this order; orgs not present in the array
   // (newly created or stale entries) are appended in createdAt order.
   organizationOrder?: string[];
   remoteAccessProviders?: InheritableRemoteAccessSettings;
+  // Network Proxy transport (#8155). Partner-only; resolved by
+  // tunnelOriginOptInFromSettings (utils/networkProxyOptIn.ts).
+  networkProxy?: PartnerNetworkProxySettings;
   emailTemplates?: Partial<Record<EmailTemplateId, {
     subject?: string | null;
     heading?: string | null;
@@ -881,6 +891,8 @@ export * from './aiAgentRuns';
 export * from './aiAgentSchedules';
 export * from './aiToolDomains';
 export * from './aiOperator';
+export * from './wispProvenance';
+export * from './aiOperatorRecipes';
 export * from './aiOrigin';
 export * from './orgNarrativeReport';
 export * from './fleetDesign';
@@ -939,6 +951,7 @@ export * from './portalService';
 
 export * from './loginContext';
 export * from './ssoDiscovery';
+export * from './ssoPresets';
 export * from './publicQuote';
 
 // ============================================
@@ -982,6 +995,7 @@ export * from './topologyDiagnostics';
 
 // Physical topology collection contracts (M2 #5998)
 export * from './topologyPhysical';
+export * from './topologyUnifiV2';
 
 // Interface measurement telemetry contracts (M3 #5999)
 export * from './topologyTelemetry';
@@ -992,6 +1006,8 @@ export * from './topologyInvestigation';
 export * from './topologyAi';
 
 export * from './securityScan';
+export * from './yara';
+export * from './securityScanSweep';
 
 // Metric anomaly episodes (spec 2026-09-21)
 export * from './metricAnomalyEpisodes';
@@ -1006,3 +1022,13 @@ export * from './businessReports';
 export * from './backupStatusReport';
 export * from './aiModelChoices';
 export * from './autopay';
+
+// Windows System Restore checkpoint requests (#4609 W05)
+export * from './restorePoint';
+
+// Wisp memory blocks (#9906 W03)
+export * from './wispMemory';
+export * from './wispConcerns';
+export * from './wispActivity';
+export * from './wispTimeline';
+export * from './wisp';

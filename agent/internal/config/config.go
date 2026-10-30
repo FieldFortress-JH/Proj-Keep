@@ -91,10 +91,24 @@ type Config struct {
 	// this field existed, whenever the org's binding mode requires one). This
 	// is a known, accepted gap for already-enrolled fleets at rollout, not a
 	// bug in agents enrolled after this field landed.
-	DeviceID                     string `mapstructure:"device_id"`
-	HeartbeatIntervalSeconds     int    `mapstructure:"heartbeat_interval_seconds"`
-	MetricsIntervalSeconds       int    `mapstructure:"metrics_interval_seconds"`
-	ProcessSampleIntervalSeconds int    `mapstructure:"process_sample_interval_seconds"`
+	DeviceID string `mapstructure:"device_id"`
+	// WsFirstReconnectWindowSeconds bounds the random spread of the first
+	// WebSocket redial after a stable connection drops (W09, #8148). Default
+	// DefaultWsFirstReconnectWindowSeconds; 0..300 accepted. 0 (and anything
+	// <= 5) reproduces the 1-5 s spread shipped in #9145. An explicit 0 is
+	// meaningful, so the default is applied by Default() before the file is
+	// unmarshalled over it, never by "if zero" at the use site.
+	WsFirstReconnectWindowSeconds int `mapstructure:"ws_first_reconnect_window_seconds"`
+	// LoopRetryAfter makes the agent honour a server Retry-After at the loop
+	// level: httputil.Do returns it as RetryAt instead of sleeping into the
+	// caller's deadline, and the periodic heartbeat senders, the UniFi
+	// collector and the log shipper skip that route until then. Heartbeats
+	// and command results are never deferred. Default true; false restores
+	// per-request-only handling (W09, #8148).
+	LoopRetryAfter               bool `mapstructure:"loop_retry_after"`
+	HeartbeatIntervalSeconds     int  `mapstructure:"heartbeat_interval_seconds"`
+	MetricsIntervalSeconds       int  `mapstructure:"metrics_interval_seconds"`
+	ProcessSampleIntervalSeconds int  `mapstructure:"process_sample_interval_seconds"`
 	// PatchScanIntervalHours is the cadence of the (expensive) patch scan, in
 	// hours. Clamped to [1, 168] at the use site; defaults to DefaultPatchScanIntervalHours.
 	PatchScanIntervalHours int      `mapstructure:"patch_scan_interval_hours"`
@@ -139,15 +153,17 @@ type Config struct {
 	// relay TURN, disconnect timeout, etc.) ship regardless.
 	DesktopDebug bool `mapstructure:"desktop_debug"`
 
-	// PAMEnabled gates privileged access management features, including the
-	// dormant local elevation account. Default false.
+	// PAMEnabled opts into dormant elevation-account provisioning at startup.
+	// Default false. After reconciliation, organization PAM policy is authoritative:
+	// an enabled policy provisions the account even when this flag is false.
+	// This flag is not a local opt-out from organization policy.
 	PAMEnabled bool `mapstructure:"pam_enabled"`
 
 	// PAMActuatorStrategy selects the Windows elevation actuator: "sendinput"
 	// (Path A — inject credentials into consent.exe) or "token_launch" (Path B —
 	// suppress consent.exe and launch the target elevated via CreateProcessAsUser
 	// as ~breeze_elev). Default "sendinput". Path B ships dark; flip per-device
-	// via agent.yaml. Ignored when PAMEnabled is false.
+	// via agent.yaml. Managed PAM v2 uses its own launch path.
 	PAMActuatorStrategy string `mapstructure:"pam_actuator_strategy"`
 
 	// Concurrency limits
@@ -210,6 +226,18 @@ type Config struct {
 	// a manifest can be verified by a key other than the one it names.
 	RequireManifestSigningKeyID bool `mapstructure:"require_manifest_signing_key_id" yaml:"require_manifest_signing_key_id"`
 
+	// ECH is the operator opt-out for Encrypted Client Hello on the control
+	// plane connection (#8869). Default true: the dialer dials plain until it
+	// sees the filter signature (plaintext HTTP answered on the TLS port)
+	// twice, then dials that host with ECH and falls back to plain inside the
+	// same dial. One-shot commands (enroll/bootstrap/support) retry with ECH
+	// on the first signature. Set false to never use ECH.
+	ECH bool `mapstructure:"ech" yaml:"ech"`
+
+	// ECHServerEnabled mirrors the server-side ECH kill switch pushed to the
+	// agent. Default true; the control plane can turn ECH off fleet-wide.
+	ECHServerEnabled bool `mapstructure:"ech_server_enabled" yaml:"ech_server_enabled"`
+
 	// HPWarrantyCollectionEnabled is the control-plane switch for device-side
 	// HP warranty collection via HP's CMSL (#5511). Pushed on the heartbeat as
 	// warranty_settings.hp_cmsl_enabled and persisted so the setting survives a
@@ -230,6 +258,14 @@ type Config struct {
 	// Persisted in the same SaveTo that adds the delegated key, so the two
 	// facts can never disagree. See manifestdelegation.go.
 	ManifestDelegationEpoch uint64 `mapstructure:"manifest_delegation_epoch" yaml:"manifest_delegation_epoch"`
+
+	// OwnershipEpoch is the device's PAM ownership epoch as last asserted by
+	// the server in a signed identity assertion v2 (#8202 W4), 0 when none was
+	// ever received. It moves with org_id/site_id: written only by
+	// PersistServerIdentity (never lowered) and enrollment, preserved from disk
+	// by every other save, and reported on each heartbeat so the server can
+	// record which epoch's identity this process has loaded.
+	OwnershipEpoch uint64 `mapstructure:"ownership_epoch" yaml:"ownership_epoch"`
 
 	// mTLS client certificate (Cloudflare API Shield)
 	MtlsCertPEM     string `mapstructure:"mtls_cert_pem"`
@@ -354,6 +390,14 @@ const DefaultPatchScanIntervalHours = 24
 // and that invariant is only enforceable if both sides read one constant.
 const DefaultHeartbeatIntervalSeconds = 60
 
+// DefaultWsFirstReconnectWindowSeconds is the default spread of the first
+// WebSocket redial after a stable connection drops; MaxWsFirstReconnectWindowSeconds
+// is the accepted ceiling (W09, #8148).
+const (
+	DefaultWsFirstReconnectWindowSeconds = 30
+	MaxWsFirstReconnectWindowSeconds     = 300
+)
+
 func Default() *Config {
 	return &Config{
 		HeartbeatIntervalSeconds:     DefaultHeartbeatIntervalSeconds,
@@ -375,8 +419,19 @@ func Default() *Config {
 		AuditMaxSizeMB:               50,
 		AuditMaxBackups:              3,
 
-		AutoUpdate:                 true,
-		PatchExcludeFeatureUpdates: true,
+		// W09 (#8148): defaults live here, before the file is unmarshalled over
+		// them, so an absent key keeps them and an explicit 0/false is honoured.
+		WsFirstReconnectWindowSeconds: DefaultWsFirstReconnectWindowSeconds,
+		LoopRetryAfter:                true,
+
+		ECH:              true,
+		ECHServerEnabled: true,
+
+		AutoUpdate: true,
+		// Windows feature releases are decided by the device's update ring
+		// (heartbeat feature_update_settings); this key is only an operator kill
+		// switch that excludes them regardless of the ring.
+		PatchExcludeFeatureUpdates: false,
 		PatchMinDiskSpaceGB:        2.0,
 		PatchRequireACPower:        true,
 		PatchRebootMaxPerDay:       3,
@@ -817,6 +872,10 @@ func Save(cfg *Config) error {
 // credential the disk does not have yet (the first save of a fresh install).
 // Enrollment, the one caller whose in-memory credentials ARE authoritative,
 // uses SaveEnrollment.
+//
+// #8317 — the same holds for org_id/site_id: once agent.yaml has them, they
+// are preserved from disk (see identitySource); only enrollment and
+// PersistServerIdentity change them.
 func SaveTo(cfg *Config, cfgFile string) error {
 	persistMu.Lock()
 	defer persistMu.Unlock()
@@ -928,6 +987,29 @@ func prepareSaveDir(cfgPath string) error {
 // loadLocked so a read-modify-write of the config file is atomic against every
 // other viper user.
 func saveToLocked(cfg *Config, cfgFile string, source credentialSource) error {
+	identity := identityFromDisk
+	if source == credentialsFromConfig {
+		identity = identityFromConfig
+	}
+	return saveToLockedWithIdentity(cfg, cfgFile, source, identity)
+}
+
+// identitySource selects who is authoritative for org_id/site_id in a save.
+//
+// #8317 — they are written by enrollment and by PersistServerIdentity (a
+// server-signed reassignment) and by nothing else. Every other save passes a
+// *Config the caller loaded at startup — the token-rotation and mTLS paths
+// pass the heartbeat's — so between a reassignment and the restart that
+// applies it those copies still hold the old pair, and a plain SaveTo would
+// write it back over the new one. Same rule as credentials (#2773).
+type identitySource int
+
+const (
+	identityFromDisk identitySource = iota
+	identityFromConfig
+)
+
+func saveToLockedWithIdentity(cfg *Config, cfgFile string, source credentialSource, identity identitySource) error {
 	cfgPath := ResolveSavePath(cfgFile)
 	if err := prepareSaveDir(cfgPath); err != nil {
 		return err
@@ -940,11 +1022,17 @@ func saveToLocked(cfg *Config, cfgFile string, source credentialSource) error {
 		return err
 	}
 
+	orgID, siteID, ownershipEpoch := cfg.OrgID, cfg.SiteID, cfg.OwnershipEpoch
+	if identity == identityFromDisk {
+		orgID, siteID, ownershipEpoch = resolveIdentityForSave(cfgPath, orgID, siteID, ownershipEpoch)
+	}
+
 	viper.Set("agent_id", cfg.AgentID)
 	viper.Set("server_url", cfg.ServerURL)
 	viper.Set("backup_server_url", cfg.BackupServerURL)
-	viper.Set("org_id", cfg.OrgID)
-	viper.Set("site_id", cfg.SiteID)
+	viper.Set("org_id", orgID)
+	viper.Set("site_id", siteID)
+	viper.Set("ownership_epoch", ownershipEpoch)
 	viper.Set("device_id", cfg.DeviceID)
 	viper.Set("heartbeat_interval_seconds", cfg.HeartbeatIntervalSeconds)
 	viper.Set("metrics_interval_seconds", cfg.MetricsIntervalSeconds)
@@ -960,6 +1048,8 @@ func saveToLocked(cfg *Config, cfgFile string, source credentialSource) error {
 	viper.Set("allow_dev_update", cfg.AllowDevUpdate)
 	viper.Set("pinned_manifest_pub_keys", cfg.PinnedManifestPubKeys)
 	viper.Set("require_manifest_signing_key_id", cfg.RequireManifestSigningKeyID)
+	viper.Set("ech", cfg.ECH)
+	viper.Set("ech_server_enabled", cfg.ECHServerEnabled)
 	viper.Set("hp_warranty_collection_enabled", cfg.HPWarrantyCollectionEnabled)
 	viper.Set("manifest_delegation_epoch", cfg.ManifestDelegationEpoch)
 	// helper_auth_token is deliberately NOT set here on any platform: agent.yaml

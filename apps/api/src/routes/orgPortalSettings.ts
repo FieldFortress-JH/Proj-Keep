@@ -3,11 +3,12 @@ import { z } from 'zod';
 import { zValidator } from '../lib/validation';
 import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../db';
-import { organizations, portalBranding } from '../db/schema';
+import { organizations, partners, portalBranding } from '../db/schema';
 import { requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
 import { PERMISSIONS } from '../services/permissions';
 import { writeRouteAudit } from '../services/auditEvents';
-import { updatePortalSettingsSchema, PORTAL_CHROME_ACCENT_KEYS } from '@breeze/shared';
+import { partnerDocumentBrand } from '../services/partnerDocumentBrand';
+import { ERROR_CODES, updatePortalSettingsSchema, PORTAL_CHROME_ACCENT_KEYS } from '@breeze/shared';
 import {
   PORTAL_VISIBILITY_FLAG_KEYS,
   onPortalFlagsChanged,
@@ -18,9 +19,11 @@ import {
 // Registered onto orgRoutes so it inherits orgRoutes' authMiddleware
 // (mounting at the top-level api app would silently skip auth). The public
 // portal lookup routes in routes/portal/branding.ts stay read-only/pre-auth;
-// this is the only write surface. Visual branding (logo/colors) + customDomain
-// are excluded by the strict schema — they ship with the domain-verification
-// project. customCss IS writable here (#5952) — it is the canonical write
+// this is the only write surface. Logo, favicon, secondary/accent colours and
+// customDomain are excluded by the strict schema — they ship with the
+// domain-verification project. primaryColor IS writable here (#9962): it is the
+// org override of the partner's document accent, edited on the org Branding
+// tab. customCss IS writable here (#5952) — it is the canonical write
 // path for portal_branding.custom_css; sanitisation lives in
 // updatePortalSettingsSchema (@breeze/shared) so both this route and any
 // future caller get the same rejection behavior.
@@ -53,13 +56,21 @@ const PORTAL_SETTINGS_DEFAULTS = {
   enableHardwareHealth: false,
   enableHardwareInventory: false,
   enablePerformanceMetrics: false,
+  enableSoftwareInventory: false,
   enableNetworkVisibility: false,
+  enableEdrVisibility: false, // EDR framework W02: strict, fail-closed, inside "Enable all"
   enableNetworkAlerts: false,
+  enableHourBlock: false, // block hours (W04): fail-closed, never in "Enable all"
+  enablePatchDetail: false, // visibility W05: sensitive, fail-closed, never in "Enable all"
+  enableVulnerabilityDetail: false, // visibility W06: sensitive, fail-closed, never in "Enable all"
+  enablePhysicalPlacement: false, // environment visibility W1: sensitive, fail-closed, never in "Enable all"
+  enableTrustPageEditing: false, // Trust Center W3d: permission flag, fail-closed, never in "Enable all"
   chromeAccent: null,
   supportEmail: null,
   supportPhone: null,
   welcomeMessage: null,
   footerText: null,
+  primaryColor: null,
   customCss: null
 } as const;
 
@@ -80,21 +91,29 @@ type PortalSettingsRow = {
   enableHardwareHealth: boolean;
   enableHardwareInventory: boolean;
   enablePerformanceMetrics: boolean;
+  enableSoftwareInventory: boolean;
   enableNetworkVisibility: boolean;
+  enableEdrVisibility: boolean;
   enableNetworkAlerts: boolean;
+  enableHourBlock: boolean;
+  enablePatchDetail: boolean;
+  enableVulnerabilityDetail: boolean;
+  enablePhysicalPlacement: boolean;
+  enableTrustPageEditing: boolean;
   chromeAccent: string | null;
   supportEmail: string | null;
   supportPhone: string | null;
   welcomeMessage: string | null;
   footerText: string | null;
+  primaryColor: string | null;
   customCss: string | null;
 };
 
 // Single projection used by BOTH the GET select and the PATCH .returning():
-// every column not listed here (logoUrl, faviconUrl, primary/secondary/accent
-// colors, customDomain, domainVerified) never reaches the app layer on either
-// path, so a toResponse refactor can't accidentally leak them. customCss WAS
-// in that excluded set before #5952; it is now part of the managed subset.
+// every column not listed here (logoUrl, faviconUrl, secondary/accent colors,
+// customDomain, domainVerified) never reaches the app layer on either path, so
+// a toResponse refactor can't accidentally leak them. customCss (#5952) and
+// primaryColor (#9962) WERE in that excluded set; both are now managed.
 // A function, not a module-scope const: other route tests (orgs.test.ts etc.)
 // mock ../db/schema without portalBranding, and an import-time column deref
 // would crash their whole file at collection.
@@ -115,13 +134,21 @@ const portalSettingsColumns = () => ({
   enableHardwareHealth: portalBranding.enableHardwareHealth,
   enableHardwareInventory: portalBranding.enableHardwareInventory,
   enablePerformanceMetrics: portalBranding.enablePerformanceMetrics,
+  enableSoftwareInventory: portalBranding.enableSoftwareInventory,
   enableNetworkVisibility: portalBranding.enableNetworkVisibility,
+  enableEdrVisibility: portalBranding.enableEdrVisibility,
   enableNetworkAlerts: portalBranding.enableNetworkAlerts,
+  enableHourBlock: portalBranding.enableHourBlock,
+  enablePatchDetail: portalBranding.enablePatchDetail,
+  enableVulnerabilityDetail: portalBranding.enableVulnerabilityDetail,
+  enablePhysicalPlacement: portalBranding.enablePhysicalPlacement,
+  enableTrustPageEditing: portalBranding.enableTrustPageEditing,
   chromeAccent: portalBranding.chromeAccent,
   supportEmail: portalBranding.supportEmail,
   supportPhone: portalBranding.supportPhone,
   welcomeMessage: portalBranding.welcomeMessage,
   footerText: portalBranding.footerText,
+  primaryColor: portalBranding.primaryColor,
   customCss: portalBranding.customCss
 });
 
@@ -145,32 +172,40 @@ function toResponse(orgId: string, row?: PortalSettingsRow) {
     enableHardwareHealth: row.enableHardwareHealth,
     enableHardwareInventory: row.enableHardwareInventory,
     enablePerformanceMetrics: row.enablePerformanceMetrics,
+    enableSoftwareInventory: row.enableSoftwareInventory,
     enableNetworkVisibility: row.enableNetworkVisibility,
+    enableEdrVisibility: row.enableEdrVisibility,
     enableNetworkAlerts: row.enableNetworkAlerts,
+    enableHourBlock: row.enableHourBlock,
+    enablePatchDetail: row.enablePatchDetail,
+    enableVulnerabilityDetail: row.enableVulnerabilityDetail,
+    enablePhysicalPlacement: row.enablePhysicalPlacement,
+    enableTrustPageEditing: row.enableTrustPageEditing,
     chromeAccent: row.chromeAccent,
     supportEmail: row.supportEmail,
     supportPhone: row.supportPhone,
     welcomeMessage: row.welcomeMessage,
     footerText: row.footerText,
+    primaryColor: row.primaryColor,
     customCss: row.customCss
   };
 }
 
-async function resolveAccessibleOrg(c: any): Promise<{ id: string } | Response> {
+export async function resolveAccessibleOrg(c: any): Promise<{ id: string; partnerId: string } | Response> {
   const auth = c.get('auth') as AuthContext;
   const id = c.req.param('id')!;
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
   const orgRows = await db
-    .select({ id: organizations.id })
+    .select({ id: organizations.id, partnerId: organizations.partnerId })
     .from(organizations)
     .where(and(eq(organizations.id, id), isNull(organizations.deletedAt)))
     .limit(1);
   if (!orgRows[0]) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
-  return { id };
+  return { id, partnerId: orgRows[0].partnerId };
 }
 
 export function registerOrgPortalSettingsRoutes(orgRoutes: Hono) {
@@ -190,8 +225,32 @@ export function registerOrgPortalSettingsRoutes(orgRoutes: Hono) {
         .from(portalBranding)
         .where(eq(portalBranding.orgId, org.id))
         .limit(1);
+      // #7510 (settings rule 4): `footerText` is the org override of the
+      // partner's document footer (resolveDocumentFooter, documentFooter.ts),
+      // so report the inherited partner value for the editor to show beside a
+      // blank field. Read-only: not in the PATCH schema, never written here.
+      // Read in the AMBIENT request context, like GET /organizations/:id's
+      // partnerDefaultTaxRate — this route requires `partner` or `system`
+      // scope, and `partners` RLS grants a partner-scoped actor its own row.
+      //
+      // #9962 (settings rules 4 + 5): `primaryColor` is likewise the org
+      // override of the partner's Branding colour on quotes, invoices and the
+      // other customer documents (resolveDocumentBrand). The inherited value is
+      // resolved by the same partnerDocumentBrand the renderers use, so a
+      // partner colour the documents would ignore is reported as none.
+      const [partnerRow] = await db
+        .select({ invoiceFooter: partners.invoiceFooter, settings: partners.settings })
+        .from(partners)
+        .where(eq(partners.id, org.partnerId))
+        .limit(1);
       // No auto-insert on read: defaults are reported until the first PATCH.
-      return c.json({ data: toResponse(org.id, rows[0]) });
+      return c.json({
+        data: {
+          ...toResponse(org.id, rows[0]),
+          partnerInvoiceFooter: partnerRow?.invoiceFooter ?? null,
+          partnerPrimaryColor: partnerDocumentBrand(partnerRow?.settings).primaryColor
+        }
+      });
     }
   );
 
@@ -204,7 +263,7 @@ export function registerOrgPortalSettingsRoutes(orgRoutes: Hono) {
     async (c) => {
       const body = c.req.valid('json');
       if (Object.keys(body).length === 0) {
-        return c.json({ error: 'No updates provided' }, 400);
+        return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
       }
       const org = await resolveAccessibleOrg(c);
       if (org instanceof Response) return org;
@@ -256,7 +315,9 @@ export function registerOrgPortalSettingsRoutes(orgRoutes: Hono) {
             enableHardwareHealth: row.enableHardwareHealth,
             enableHardwareInventory: row.enableHardwareInventory,
             enablePerformanceMetrics: row.enablePerformanceMetrics,
-            enableNetworkVisibility: row.enableNetworkVisibility
+            enableSoftwareInventory: row.enableSoftwareInventory,
+            enableNetworkVisibility: row.enableNetworkVisibility,
+            enableEdrVisibility: row.enableEdrVisibility
           }
         });
       }

@@ -6,6 +6,9 @@
  * Each tool wraps existing DB schema and service logic with org-scoped isolation.
  */
 
+import { ERROR_CODES } from '@breeze/shared';
+import { findPartnerGroupRefs } from './groupFilterRefs';
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal, PARTNER_GROUP_AI_READ_ONLY_BODY } from './deviceGroupOwnership';
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { reportRunOwnerColumns } from './reportRunOwner';
 import type Anthropic from '@anthropic-ai/sdk';
@@ -46,10 +49,6 @@ import {
   notificationChannels,
 } from '../db/schema/alerts';
 import {
-  configurationPolicies,
-  configPolicyFeatureLinks,
-} from '../db/schema/configurationPolicies';
-import {
   listEffectiveServiceMonitors,
   SERVICE_MONITOR_LIST_DEVICE_CAP,
 } from './monitors/listServiceMonitors';
@@ -60,11 +59,6 @@ import {
   EFFECTIVE_PATCH_SEVERITY_SQL,
 } from './patchSeverityOverlay';
 import {
-  addFeatureLink,
-  updateFeatureLink,
-  policyAccessCondition,
-} from './configurationPolicy';
-import {
   reports,
   reportRuns,
 } from '../db/schema/reports';
@@ -74,7 +68,7 @@ import { seriesManagedRefusal } from './reportSeries/types';
 import { eq, and, desc, sql, inArray, gte, lte, isNull, isNotNull, or, SQL } from 'drizzle-orm';
 import { alertSiteScopeByDeviceIds, alertSiteScopeCondition } from '../routes/alerts/helpers';
 import type { AuthContext } from '../middleware/auth';
-import { isAiAgentPrincipal } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 
 async function scheduleAiGroupPeripheralReconciliation(deviceIds: readonly string[]): Promise<void> {
   await Promise.all([...new Set(deviceIds)].map((deviceId) =>
@@ -96,6 +90,7 @@ import {
   reportTypeRequiresPermissions,
 } from './reportTypePermissions';
 import { reportTypeDef } from './reportRegistry';
+import { GENERATE_REPORT_TYPES, isBusinessReportType, type GenerateReportType } from './aiReportTypes';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
 import { filterWindowsToSiteScope, scopeWindowForRead } from './maintenanceSiteScope';
 import {
@@ -144,6 +139,7 @@ import {
   managedAutomationOwnerIsLive,
 } from './aiAgents/managedAutomation';
 import { MANAGED_BY_MONITOR_ERROR } from './monitors/managedRowGuard';
+import { conversionSummariesFor } from './flows/conversion/ledger';
 import type {
   FleetFindingKind,
   FleetFindingSeverity,
@@ -184,7 +180,7 @@ function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContex
  * avoid the write, never catch it.
  */
 function isAgentPrincipalCaller(auth: AuthContext): boolean {
-  return isAiAgentPrincipal(auth);
+  return isAutomationPrincipal(auth);
 }
 
 /**
@@ -215,6 +211,47 @@ function refuseFleetAgentPrincipal(action: string): string {
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+/** #9222: refusal for a business report type run under a site-restricted
+ *  authority. Tickets, time entries, invoices and the AI ledger carry no site
+ *  axis, so the HTTP routes would answer with an unmeasured placeholder; a chat
+ *  tool refuses instead of fabricating a figure. */
+const BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE =
+  'Business report types are not available to site-restricted callers: tickets, time entries, invoices and AI usage have no site dimension.';
+
+/** #9222: the HTTP create/update routes require reports:export plus a fresh-MFA
+ *  session to set `config.emailRecipients` (a business report would mail MSP
+ *  financials off-platform on a timer). The AI tool cannot prove fresh MFA, so
+ *  it refuses recipients on a business type outright; set them in the web UI. */
+const BUSINESS_REPORT_RECIPIENTS_MESSAGE =
+  'Email recipients on a business report must be set in the web UI (requires the export permission and an MFA-verified session).';
+
+function configSetsEmailRecipients(config: unknown): boolean {
+  if (!config || typeof config !== 'object') return false;
+  const r = (config as Record<string, unknown>).emailRecipients;
+  return Array.isArray(r) ? r.length > 0 : Boolean(r);
+}
+
+/**
+ * #9222. The HTTP routes' type gates for the business report types, for the AI
+ * tool: msp_staff audience (ruling F1: an org-scope caller never runs one) and
+ * the per-type read permissions (ruling P8), from the caller's LIVE permission
+ * set. Legacy types pay nothing (no permission lookup). Returns the refusal
+ * body, or null when the caller may proceed to the site-scope check.
+ */
+async function businessReportTypeRefusal(
+  type: unknown,
+  auth: AuthContext,
+): Promise<{ error: string } | null> {
+  if (!isBusinessReportType(type)) return null;
+  if (reportTypeHiddenFromCaller(type, auth)) return { error: 'Insufficient permissions' };
+  if (reportTypeRequiresPermissions(type)) {
+    if (missingReportTypePermission(type, await aiCallerPermissions(auth))) {
+      return { error: 'Insufficient permissions' };
+    }
+  }
+  return null;
 }
 
 /**
@@ -1112,8 +1149,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           deferUntil: { type: 'string', description: 'ISO date to defer until (for defer)' },
           notes: { type: 'string', description: 'Approval/decline notes' },
           configPolicyId: { type: 'string', description: 'Configuration policy UUID to attach patch settings to (for setup_auto_approval). If omitted, creates a new policy.' },
-          autoApprove: { type: 'boolean', description: 'Enable auto-approval of patches (for setup_auto_approval)' },
-          autoApproveSeverities: { type: 'array', items: { type: 'string', enum: ['critical', 'important', 'moderate', 'low'] }, description: 'Which severities to auto-approve (for setup_auto_approval)' },
           scheduleFrequency: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Patch scan frequency (for setup_auto_approval, default: weekly)' },
           scheduleTime: { type: 'string', description: 'Time to run scans in HH:MM format (for setup_auto_approval, default: 02:00)' },
           rebootPolicy: { type: 'string', enum: ['if_required', 'always', 'never'], description: 'Reboot policy after patching (for setup_auto_approval, default: if_required)' },
@@ -1159,7 +1194,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'setup_auto_approval') {
         return JSON.stringify({
-          error: 'Action "setup_auto_approval" is disabled. Patch policies must be managed through configuration policies. Use manage_policy_feature_link with featureType "patch" to configure auto-approval rules on a policy.',
+          error: 'Action "setup_auto_approval" is disabled. Auto-approval and per-app block/pin rules are configured on an Update Ring with manage_update_rings. Link the ring to a configuration policy with manage_policy_feature_link (featureType "patch", featurePolicyId = the ring id).',
         });
       }
 
@@ -1617,116 +1652,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         });
       }
 
-      if (action === 'setup_auto_approval') {
-        // NOTE: this whole action is currently unreachable (see the disabled
-        // early-return above) — defense-in-depth, kept correct so the block is
-        // not a trap if the gate is ever lifted (same convention as the
-        // canManagePartnerWidePolicies check a few lines below). This path
-        // inserts an org configuration_policies row + feature link, which is
-        // exactly the org-wide governance object this contract protects.
-        if (!canMutateOrgWideGovernance(auth)) {
-          return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
-        }
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-
-        const patchSettings = {
-          sources: Array.isArray(input.sources) ? input.sources as string[] : ['os'],
-          autoApprove: typeof input.autoApprove === 'boolean' ? input.autoApprove : true,
-          autoApproveSeverities: Array.isArray(input.autoApproveSeverities) ? input.autoApproveSeverities as string[] : ['critical', 'important'],
-          scheduleFrequency: typeof input.scheduleFrequency === 'string' ? input.scheduleFrequency : 'weekly',
-          scheduleTime: typeof input.scheduleTime === 'string' ? input.scheduleTime : '02:00',
-          rebootPolicy: typeof input.rebootPolicy === 'string' ? input.rebootPolicy : 'if_required',
-        };
-
-        const configPolicyId = input.configPolicyId as string | undefined;
-
-        if (configPolicyId) {
-          // Check if policy exists and user has access.
-          //
-          // NOTE: this whole action is currently unreachable — `setup_auto_approval`
-          // early-returns as disabled above (patch policies are managed through
-          // configuration policies). The two fixes below are defense-in-depth,
-          // kept correct so the block is not a trap if the gate is ever lifted
-          // — configuration policies own these writes.
-          //
-          // `policyAccessCondition`, not a bare org-equality (#3493): a
-          // partner-wide policy stores `org_id NULL`, so the org form would tell
-          // the partner-scoped tech who AUTHORED the policy it "was not found".
-          const policyConditions: SQL[] = [eq(configurationPolicies.id, configPolicyId)];
-          const oc = policyAccessCondition(auth);
-          if (oc) policyConditions.push(oc);
-          const [policy] = await db.select().from(configurationPolicies).where(and(...policyConditions)).limit(1);
-          if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
-
-          // Making a partner-wide policy REACHABLE is not the same as making it
-          // writable. Everything below mutates the policy's patch feature link,
-          // which lands on every org the policy covers — so it takes the same
-          // capability the HTTP feature-link route requires
-          // (routes/configurationPolicies/featureLinks.ts).
-          if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
-            return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
-          }
-
-          // Check if patch feature link already exists
-          const existingLinks = await db.select()
-            .from(configPolicyFeatureLinks)
-            .where(and(
-              eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-              eq(configPolicyFeatureLinks.featureType, 'patch'),
-            )).limit(1);
-
-          if (existingLinks.length > 0) {
-            // Update existing feature link
-            const updated = await updateFeatureLink(existingLinks[0]!.id, { inlineSettings: patchSettings }, configPolicyId);
-            if (!updated) return JSON.stringify({ error: 'Failed to update patch settings — the feature link may have been deleted. Try again.' });
-            return JSON.stringify({
-              success: true,
-              message: `Patch auto-approval settings updated on policy "${policy.name}"`,
-              configPolicyId,
-              featureLinkId: existingLinks[0]!.id,
-              settings: patchSettings,
-            });
-          }
-
-          // Add new patch feature link. addFeatureLink returns null (instead of
-          // throwing) on a duplicate; existingLinks was just checked above so
-          // this is effectively unreachable outside a race, but guard anyway.
-          const link = await addFeatureLink(configPolicyId, 'patch', null, patchSettings);
-          if (!link) return JSON.stringify({ error: 'Patch feature link already exists on this policy' });
-          return JSON.stringify({
-            success: true,
-            message: `Patch auto-approval configured on policy "${policy.name}"`,
-            configPolicyId,
-            featureLinkId: link.id,
-            settings: patchSettings,
-          });
-        }
-
-        // No configPolicyId — create a new config policy with patch settings
-        const [newPolicy] = await db.insert(configurationPolicies).values({
-          orgId,
-          name: `Patch Auto-Approval Policy`,
-          description: `Auto-approve ${patchSettings.autoApproveSeverities.join(', ')} patches on a ${patchSettings.scheduleFrequency} schedule`,
-          status: 'active',
-          createdBy: auth.user.id,
-        }).returning();
-
-        if (!newPolicy) return JSON.stringify({ error: 'Failed to create configuration policy' });
-
-        // newPolicy.id is freshly generated above, so a duplicate feature-link
-        // conflict is not realistically reachable; guard for type-safety only.
-        const link = await addFeatureLink(newPolicy.id, 'patch', null, patchSettings);
-        if (!link) return JSON.stringify({ error: 'Failed to configure patch auto-approval on the new policy' });
-        return JSON.stringify({
-          success: true,
-          message: `Created new policy "${newPolicy.name}" with patch auto-approval`,
-          configPolicyId: newPolicy.id,
-          featureLinkId: link.id,
-          settings: patchSettings,
-          hint: 'Use apply_configuration_policy to assign this policy to an organization, site, or device group.',
-        });
-      }
-
       return JSON.stringify({ error: `Unknown action: ${action}` });
     }),
   });
@@ -1765,6 +1690,16 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     handler: safeHandler('manage_groups', async (input, auth) => {
       const action = input.action as string;
       const orgId = getOrgId(auth);
+      const canReadPartnerGroups = auth.scope === 'partner' && !!auth.partnerId && auth.partnerOrgAccess !== 'none';
+      const groupReadCondition = auth.scope === 'system' ? undefined : or(
+        and(isNotNull(deviceGroups.orgId), orgWhere(auth, deviceGroups.orgId)),
+        canReadPartnerGroups && auth.partnerId
+          ? and(isNull(deviceGroups.orgId), eq(deviceGroups.partnerId, auth.partnerId))
+          : undefined,
+      );
+      const groupReadable = (group: { orgId: string | null; partnerId: string | null }): boolean =>
+        group.orgId !== null || auth.scope === 'system'
+        || (canReadPartnerGroups && group.partnerId === auth.partnerId);
 
       // Device groups are SITE-shaped, so read paths gate on the group's site.
       // update and delete are not read paths: delete removes every member's
@@ -1786,7 +1721,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'list') {
         const conditions: SQL[] = [];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
         if (typeof input.type === 'string') conditions.push(eq(deviceGroups.type, input.type as 'static' | 'dynamic'));
         if (typeof input.siteId === 'string') conditions.push(eq(deviceGroups.siteId, input.siteId as string));
@@ -1804,6 +1739,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 200);
         const rows = await db.select({
           id: deviceGroups.id,
+          orgId: deviceGroups.orgId,
+          partnerId: deviceGroups.partnerId,
           name: deviceGroups.name,
           type: deviceGroups.type,
           siteId: deviceGroups.siteId,
@@ -1819,17 +1756,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'get') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, group.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
         const members = await db.select({
           deviceId: deviceGroupMemberships.deviceId,
+          orgId: deviceGroupMemberships.orgId,
           hostname: devices.hostname,
           status: devices.status,
           osType: devices.osType,
@@ -1837,7 +1775,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           addedAt: deviceGroupMemberships.addedAt,
         }).from(deviceGroupMemberships)
           .leftJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
-          .where(eq(deviceGroupMemberships.groupId, group.id))
+          .where(and(eq(deviceGroupMemberships.groupId, group.id),
+            group.orgId === null && auth.scope !== 'system'
+              ? inArray(deviceGroupMemberships.orgId, auth.accessibleOrgIds ?? []) : undefined,
+          ))
           .limit(limit);
 
         // Exact-device axis (#6096): the GROUP may be in the caller's site, but
@@ -1884,24 +1825,28 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'membership_log') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, group.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
         const rows = await db.select({
           deviceId: groupMembershipLog.deviceId,
+          orgId: groupMembershipLog.orgId,
           hostname: devices.hostname,
           action: groupMembershipLog.action,
           reason: groupMembershipLog.reason,
           createdAt: groupMembershipLog.createdAt,
         }).from(groupMembershipLog)
           .leftJoin(devices, eq(groupMembershipLog.deviceId, devices.id))
-          .where(eq(groupMembershipLog.groupId, group.id))
+          .where(and(eq(groupMembershipLog.groupId, group.id),
+            group.orgId === null && auth.scope !== 'system'
+              ? inArray(groupMembershipLog.orgId, auth.accessibleOrgIds ?? []) : undefined,
+          ))
           .orderBy(desc(groupMembershipLog.createdAt))
           .limit(limit);
 
@@ -1922,6 +1867,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (deviceSiteDenied(auth, (input.siteId as string) ?? null)) {
           return JSON.stringify({ error: 'Access denied: cannot create a group in a site outside your access' });
         }
+        if ((await findPartnerGroupRefs(input.filterConditions)).length > 0) {
+          return JSON.stringify({ error: 'Organization groups cannot reference partner-wide device groups',
+            code: ERROR_CODES.PARTNER_GROUP_FILTER_UNSUPPORTED });
+        }
         const [group] = await db.insert(deviceGroups).values({
           orgId: groupOrgId,
           name: input.name as string,
@@ -1936,11 +1885,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'update') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [existing] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!existing || !groupReadable(existing)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (existing.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, existing.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Exact-device axis, beside the site check and never inside it (#6096 I2).
@@ -1952,6 +1902,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: DEVICE_SCOPE_FLEET_DENIED_MESSAGE });
         }
 
+        if ((await findPartnerGroupRefs(input.filterConditions)).length > 0) {
+          return JSON.stringify({ error: 'Organization groups cannot reference partner-wide device groups',
+            code: ERROR_CODES.PARTNER_GROUP_FILTER_UNSUPPORTED });
+        }
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;
         if (input.filterConditions) updates.filterConditions = input.filterConditions;
@@ -1963,11 +1917,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'delete') {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [existing] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!existing || !groupReadable(existing)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (existing.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, existing.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
         // Exact-device axis (#6096 I2): the delete unmembers every device in the
@@ -1978,7 +1933,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         let result: Awaited<ReturnType<typeof deleteDeviceGroup>>;
         try {
-          result = await deleteDeviceGroup(existing.id, existing.orgId);
+          result = await deleteDeviceGroup(existing.id, { orgId: existing.orgId });
         } catch (err) {
           if (err instanceof DeviceGroupDeleteError) return JSON.stringify({ error: err.message, code: err.code });
           throw err;
@@ -1991,12 +1946,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         if (!Array.isArray(input.deviceIds)) return JSON.stringify({ error: 'deviceIds is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (group.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
 
+        const orgId = group.orgId;
         const deviceIdList = (input.deviceIds as string[]).slice(0, 100);
         // Only add devices that belong to the group's org AND are in the caller's
         // site scope. Site is an app-layer axis (RLS does NOT enforce it), so
@@ -2014,7 +1971,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           .values(insertableIds.map((deviceId) => ({
             groupId: group.id,
             deviceId,
-            orgId: group.orgId,
+            orgId,
             addedBy: 'manual' as const,
           })))
           .onConflictDoNothing()
@@ -2030,11 +1987,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (!input.groupId) return JSON.stringify({ error: 'groupId is required' });
         if (!Array.isArray(input.deviceIds)) return JSON.stringify({ error: 'deviceIds is required' });
         const conditions: SQL[] = [eq(deviceGroups.id, input.groupId as string)];
-        const oc = orgWhere(auth, deviceGroups.orgId);
+        const oc = groupReadCondition;
         if (oc) conditions.push(oc);
 
         const [group] = await db.select().from(deviceGroups).where(and(...conditions)).limit(1);
-        if (!group) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (!group || !groupReadable(group)) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (group.orgId === null) return JSON.stringify(PARTNER_GROUP_AI_READ_ONLY_BODY);
 
         const requestedIds = (input.deviceIds as string[]).slice(0, 100);
         // Only remove devices in the caller's site scope. Site is an app-layer
@@ -2109,6 +2067,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     handler: safeHandler('manage_maintenance_windows', async (input, auth) => {
       const action = input.action as string;
       const orgId = getOrgId(auth);
+
+      if (action === 'create' || action === 'update') {
+        const partnerGroupIds = await findPartnerOwnedGroupIds((input.groupIds as string[] | undefined) ?? []);
+        if (partnerGroupIds.length > 0) return JSON.stringify(partnerGroupTargetRefusal(partnerGroupIds));
+      }
 
       // NOTE (#3654): the create/update/delete blocks further down are dead —
       // this guard and the `action` enum both exclude them. If they are ever
@@ -2470,6 +2433,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
             .limit(limit);
         }
 
+        // W06 (#5221, Decision 9): each row carries its conversion ({ id, state, flowId } | null).
+        const conversions = await conversionSummariesFor(visible.map((a: { id: string }) => a.id));
+        visible = visible.map((a: { id: string }) => ({ ...a, conversion: conversions.get(a.id) ?? null }));
         return JSON.stringify({ automations: visible, showing: visible.length });
       }
 
@@ -2485,11 +2451,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const getDenied = await automationSiteDenied(auto);
         if (getDenied) return JSON.stringify({ error: getDenied });
 
+        const conversion = (await conversionSummariesFor([auto.id])).get(auto.id) ?? null;
         if (isScopeNarrowedCaller(auth)) {
           const { lastRunAt: _lastRunAt, runCount: _runCount, ...restricted } = auto;
-          return JSON.stringify({ automation: restricted });
+          return JSON.stringify({ automation: { ...restricted, conversion } });
         }
-        return JSON.stringify({ automation: auto });
+        return JSON.stringify({ automation: { ...auto, conversion } });
       }
 
       if (action === 'history') {
@@ -2517,7 +2484,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
             limit,
           })).rows;
 
-        return JSON.stringify({ automationId: auto.id, runs: page, showing: page.length });
+        const conversion = (await conversionSummariesFor([auto.id])).get(auto.id) ?? null;
+        return JSON.stringify({ automationId: auto.id, conversion, runs: page, showing: page.length });
       }
 
       if (action === 'create') {
@@ -2613,6 +2581,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [existing] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!existing) return JSON.stringify({ error: 'Automation not found or access denied' });
+        // W06 (#5221, Decision 9): a switched Job is frozen; its flow runs it now.
+        if (existing.convertedToFlowId) {
+          return JSON.stringify({ error: 'automation_converted', flowId: existing.convertedToFlowId });
+        }
         if (isManagedAutomation(existing)) {
           return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: existing.managedByAgentId });
         }
@@ -2633,9 +2605,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (toggleDenied) return JSON.stringify({ error: toggleDenied });
 
         const enabled = action === 'enable';
-        await db.update(automations)
+        // Re-checked after any lock wait: a switch that committed since the read above wins (#10685).
+        const toggled = await db.update(automations)
           .set({ enabled, updatedAt: new Date() })
-          .where(eq(automations.id, existing.id));
+          .where(and(eq(automations.id, existing.id), isNull(automations.convertedToFlowId)))
+          .returning({ id: automations.id });
+        if (toggled.length === 0) {
+          const [now] = await db.select({ flowId: automations.convertedToFlowId }).from(automations).where(eq(automations.id, existing.id)).limit(1);
+          return JSON.stringify(now?.flowId ? { error: 'automation_converted', flowId: now.flowId } : { error: 'Automation not found or access denied' });
+        }
 
         return JSON.stringify({ success: true, message: `Automation "${existing.name}" ${enabled ? 'enabled' : 'disabled'}` });
       }
@@ -2648,6 +2626,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [auto] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!auto) return JSON.stringify({ error: 'Automation not found or access denied' });
+        // W06 (#5221, Decision 9): see the enable/disable branch above.
+        if (auto.convertedToFlowId) {
+          return JSON.stringify({ error: 'automation_converted', flowId: auto.convertedToFlowId });
+        }
         if (isManagedAutomation(auto)) {
           return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: auto.managedByAgentId });
         }
@@ -2888,7 +2870,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           action: { type: 'string', enum: ['list', 'generate', 'data', 'create', 'update', 'delete', 'history', 'download'], description: 'The action to perform' },
           reportId: { type: 'string', description: 'Report UUID (for generate/update/delete/history)' },
           reportRunId: { type: 'string', description: 'Report run UUID (required for download)' },
-          reportType: { type: 'string', enum: ['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary'], description: 'Report type (for generate/data/create)' },
+          reportType: { type: 'string', enum: [...GENERATE_REPORT_TYPES], description: 'Report type (for generate/data/create). Business types are MSP-staff only and refused for site-restricted callers.' },
           name: { type: 'string', description: 'Report name (for create/update)' },
           config: { type: 'object', description: 'Report configuration (filters, options)' },
           schedule: { type: 'string', enum: ['one_time', 'daily', 'weekly', 'monthly'], description: 'Schedule (for create/update)' },
@@ -3004,6 +2986,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (auth.allowedDeviceIds) return JSON.stringify({ error: DEVICE_SCOPE_REPORT_DENIED_MESSAGE });
         if (!input.reportId && !input.reportType) return JSON.stringify({ error: 'reportId or reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #9222: ad-hoc business type — audience + permission gate before any authority lookup.
+        if (!input.reportId) {
+          const refusal = await businessReportTypeRefusal(input.reportType, auth);
+          if (refusal) return JSON.stringify(refusal);
+        }
 
         let reportDef;
         let executionAuthority: ReportExecutionAuthority | null = null;
@@ -3069,6 +3056,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           }
         }
 
+        // #9222: a business type has no site axis — refuse a site-restricted run
+        // (stored definition or ad hoc) rather than mint an unmeasured placeholder.
+        if (
+          isBusinessReportType(reportDef?.type ?? input.reportType)
+          && executionAuthority.scope.kind === 'restricted'
+        ) {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
+
         const reportConfig = (reportDef?.config ?? input.config ?? {}) as Record<string, unknown>;
         try {
           assertReportExecutionPreflight(orgId, reportConfig, executionAuthority);
@@ -3105,9 +3101,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'data') {
         if (!input.reportType) return JSON.stringify({ error: 'reportType is required' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const dataRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (dataRefusal) return JSON.stringify(dataRefusal);
         const executionAuthority = await aiLiveReportAuthority(auth, orgId, 'read');
         if (!executionAuthority) {
           return JSON.stringify({ error: 'Access to report scope denied' });
+        }
+        if (isBusinessReportType(input.reportType) && executionAuthority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
         }
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
@@ -3222,6 +3223,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const resolvedReportOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
         if (!resolvedReportOrg.orgId) return JSON.stringify({ error: resolvedReportOrg.error ?? 'Organization context required' });
         const reportOrgId = resolvedReportOrg.orgId;
+        const createRefusal = await businessReportTypeRefusal(input.reportType, auth);
+        if (createRefusal) return JSON.stringify(createRefusal);
+        if (isBusinessReportType(input.reportType) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
         const authority = await aiLiveReportAuthority(auth, reportOrgId, 'write');
         if (
           !authority
@@ -3229,10 +3235,13 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         ) {
           return JSON.stringify({ error: 'Access to report scope denied' });
         }
+        if (isBusinessReportType(input.reportType) && authority.scope.kind === 'restricted') {
+          return JSON.stringify({ error: BUSINESS_REPORT_SITE_RESTRICTED_MESSAGE });
+        }
         const [report] = await db.insert(reports).values({
           orgId: reportOrgId,
           name: input.name as string,
-          type: input.reportType as 'device_inventory' | 'software_inventory' | 'alert_summary' | 'compliance' | 'performance' | 'executive_summary',
+          type: input.reportType as GenerateReportType,
           config: (input.config as Record<string, unknown>) ?? {},
           schedule: (input.schedule as 'one_time' | 'daily' | 'weekly' | 'monthly') ?? 'one_time',
           format: (input.format as 'csv' | 'pdf' | 'excel') ?? 'csv',
@@ -3255,6 +3264,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Multi-org report series W02: a child's shared fields belong to its
         // series (spec §3.3 "Child writers").
         if (existing.seriesId) return JSON.stringify(seriesManagedRefusal(existing.seriesId));
+        if (isBusinessReportType(existing.type) && configSetsEmailRecipients(input.config)) {
+          return JSON.stringify({ error: BUSINESS_REPORT_RECIPIENTS_MESSAGE });
+        }
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;

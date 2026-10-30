@@ -41,6 +41,21 @@ vi.mock('./actorContext', () => ({
 // above don't provide. Its own classification behavior is unit-tested where
 // it lives, policyDecidable.test.ts; this file only needs to prove
 // `revalidateApprovedIntentForRelease` CONSULTS it and reacts to ok/rejected.
+// B-W04 (#6158): the mcp_api origin rebuild (its own suite covers the internals).
+vi.mock('../mcpPrincipalAuth', () => ({
+  rebuildMcpOriginAuthContext: vi.fn(async () => ({
+    auth: {
+      principal: { kind: 'api_key', apiKeyId: 'key-1' },
+      user: { id: 'user-1' },
+      token: {},
+      orgId: 'org-1',
+      accessibleOrgIds: ['org-1'],
+      canAccessOrg: (id: string) => id === 'org-1',
+    },
+    credential: { kind: 'api_key', scopes: ['ai:execute'] },
+  })),
+  checkMcpOriginReleaseAuthority: vi.fn(() => ({ ok: true })),
+}));
 vi.mock('./policyDecidable', () => ({
   validateAuthorizationKeys: vi.fn((keys: string[]) => ({ ok: keys, rejected: [] })),
 }));
@@ -53,8 +68,39 @@ vi.mock('../../config/env', () => ({
 vi.mock('../aiAgents/sweepActMode', () => ({
   checkSweepScheduleBrake: vi.fn(async () => ({ ok: true })),
 }));
+// Caller verification W05 (#6354): the consume step for the two protected M365
+// tools. The gate, policy lookup and pinned-connection loader are mocked at the
+// module boundary (their own behaviour is covered in callerVerification/*);
+// these tests pin what release hands them and the exact failure shapes.
+vi.mock('../../db', async (orig) => {
+  const actual = await (orig as () => Promise<Record<string, unknown>>)();
+  return {
+    ...actual,
+    runOutsideDbContext: (fn: () => unknown) => fn(),
+    withSystemDbAccessContext: (fn: () => unknown) => fn(),
+  };
+});
+vi.mock('../callerVerification/gate', () => ({ requireCallerVerification: vi.fn(async () => undefined) }));
+vi.mock('../callerVerification/policy', () => ({
+  getEffectivePolicy: vi.fn(async () => ({ requiredTierResetPassword: 3, requiredTierDisableUser: 2 })),
+}));
+vi.mock('./callerTarget', async (orig) => {
+  const actual = await (orig as () => Promise<Record<string, unknown>>)();
+  return {
+    ...actual,
+    loadPinnedCallerBackend: vi.fn(async () => ({ backend: 'direct', connectionId: 'conn-1', tenantId: 'tenant-1', orgId: 'org-1' })),
+  };
+});
+
+// Wisp W04a: the delegation ceiling at release for a chat-originated intent.
+// Mocked at the module boundary; its own behaviour (enforceWispCeiling reuse,
+// typed codes, audit, fail-closed) is covered in wisp/releaseCeiling.test.ts.
+vi.mock('../wisp/releaseCeiling', () => ({
+  checkWispCeilingForRelease: vi.fn(async (_intent: unknown, auth: unknown) => ({ ok: true, auth })),
+}));
 
 import { revalidateApprovedIntentForRelease } from './revalidateRelease';
+import { checkWispCeilingForRelease } from '../wisp/releaseCeiling';
 import { checkToolPermission, checkPermissionRequirements } from '../aiGuardrails';
 import { loadTenantToolBindingState, loadTenantToolForExecution } from '../toolSources/resolver';
 import { getToolTier } from '../aiTools';
@@ -64,7 +110,11 @@ import { policyDecideEnabled } from '../../config/env';
 import { revalidateScriptReviewerEvidence } from './scriptReviewerAutonomy';
 import { checkSweepScheduleBrake } from '../aiAgents/sweepActMode';
 import { buildAuthContextForIntent } from './actorContext';
+import { rebuildMcpOriginAuthContext, checkMcpOriginReleaseAuthority } from '../mcpPrincipalAuth';
 import { SITE_CEILING_WRITE_DENIED_MESSAGE } from '../siteCeilingAccess';
+import { requireCallerVerification } from '../callerVerification/gate';
+import { loadPinnedCallerBackend } from './callerTarget';
+import { CallerVerificationRequiredError, CallerVerificationValidationError } from '../callerVerification/errors';
 
 /** Minimal ActionIntent shape the function actually reads. */
 function intentFixture(overrides: Record<string, unknown> = {}) {
@@ -680,6 +730,46 @@ describe('revalidateApprovedIntentForRelease external tool branch (tool catalog 
   });
 });
 
+describe('revalidateApprovedIntentForRelease invoked-flow branch (W5 PR C, #5220)', () => {
+  const FLOW_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const PUB_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const args = { inputs: { count: 3 }, orgId: null, idempotencyKey: null };
+  const digest = computeArgumentDigest(canonicalizeArguments(args));
+  const flowIntent = (overrides: Record<string, unknown> = {}) => intentFixture({
+    actionName: 'flow__disk_cleanup', arguments: args, argumentDigest: digest, riskTier: 3, approvalScope: 'supervised',
+    toolSourceToolId: null, invokedFlowId: FLOW_ID, toolRevision: `flowpub:${PUB_ID}`, ...overrides,
+  });
+
+  it('never consults the core registry; the requester must still hold automations.write', async () => {
+    const result = await revalidateApprovedIntentForRelease(flowIntent(), { boundArgumentDigest: digest });
+    expect(result.ok).toBe(true);
+    expect(getToolTier).not.toHaveBeenCalled();
+    expect(checkToolPermission).not.toHaveBeenCalled();
+    expect(checkPermissionRequirements).toHaveBeenCalledWith(
+      expect.objectContaining({ user: { id: 'user-1' } }),
+      [{ resource: 'automations', action: 'write' }],
+    );
+    expect(loadTenantToolBindingState).not.toHaveBeenCalled();
+  });
+
+  it('refuses rbac_denied when the requester lost automations.write', async () => {
+    vi.mocked(checkPermissionRequirements).mockResolvedValueOnce('Missing permission: automations:write');
+    expect(await revalidateApprovedIntentForRelease(flowIntent(), { boundArgumentDigest: digest }))
+      .toMatchObject({ ok: false, errorCode: 'rbac_denied' });
+  });
+
+  it('a binding without a flowpub revision is flow_tool_changed', async () => {
+    expect(await revalidateApprovedIntentForRelease(flowIntent({ toolRevision: 'rev-1' }), { boundArgumentDigest: digest }))
+      .toMatchObject({ ok: false, errorCode: 'flow_tool_changed' });
+  });
+
+  it('a flow tool name without the binding is flow_tool_changed (never tier_escalated through the registry)', async () => {
+    expect(await revalidateApprovedIntentForRelease(flowIntent({ invokedFlowId: null, toolRevision: null }), { boundArgumentDigest: digest }))
+      .toMatchObject({ ok: false, errorCode: 'flow_tool_changed' });
+    expect(getToolTier).not.toHaveBeenCalled();
+  });
+});
+
 describe('revalidateApprovedIntentForRelease org-wide governance site ceiling', () => {
   const args = { userPrincipalName: 'victim@contoso.test' };
   const digest = computeArgumentDigest(canonicalizeArguments(args));
@@ -687,6 +777,9 @@ describe('revalidateApprovedIntentForRelease org-wide governance site ceiling', 
     actionName: 'm365_disable_user',
     arguments: args,
     argumentDigest: digest,
+    targetEntraTenantId: '22222222-2222-4222-8222-222222222222',
+    targetEntraOid: '33333333-3333-4333-8333-333333333333',
+    targetConnectionRef: '44444444-4444-4444-8444-444444444444',
     ...overrides,
   });
 
@@ -757,5 +850,470 @@ describe('revalidateApprovedIntentForRelease org-wide governance site ceiling', 
       { boundArgumentDigest: plainDigest },
     );
     expect(result).toMatchObject({ ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Recipe Library E4 (#6169) — release of a plan-approved child effect.
+//
+// Modelled on the script lane: no approval_requests row by construction, and
+// admitted only because a stronger, row-backed proof — plan membership at the
+// task's LIVE revision — revalidates against CURRENT state here, inside
+// release. `decided_via = 'plan_approval'` alone authorizes nothing.
+// ---------------------------------------------------------------------------
+
+vi.mock('../aiOperator/planApproval', () => ({
+  checkPlanEffectMembershipSystem: vi.fn(),
+  loadTaskAgentToolAllowlists: vi.fn(async () => ({ snapshot: ['google_suspend_user'], live: ['google_suspend_user'] })),
+  checkToolCeiling: vi.fn(() => ({ ok: true })),
+}));
+import {
+  checkPlanEffectMembershipSystem,
+  checkToolCeiling,
+} from '../aiOperator/planApproval';
+
+describe('revalidateApprovedIntentForRelease: decided_via = plan_approval (E4)', () => {
+  const args = { userEmail: 'dana@customer.example', reason: 'offboarding' };
+  const digest = computeArgumentDigest(canonicalizeArguments(args));
+  const planChild = (overrides: Record<string, unknown> = {}) => intentFixture({
+    requestedByUserId: 'u-approver',
+    decidedByUserId: 'u-approver',
+    source: 'mcp_api',
+    actionName: 'google_suspend_user',
+    arguments: args,
+    argumentDigest: digest,
+    decidedVia: 'plan_approval',
+    taskId: 't1',
+    taskStepKey: 'offboard',
+    operationKey: 'offboard:google_suspend_user:c1:r2:n3',
+    ...overrides,
+  });
+  const member = { ok: true, approvalId: 'p1', approverUserId: 'u-approver', approvedAssuranceLevel: 3, planRevision: 2, idempotencyClass: 'idempotent' };
+  const refuse = (refusal: string) => ({ ok: false, refusal, detail: refusal });
+
+  it('ADMITS a child that is still a member of a still-approved plan, with NO approval row', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(member as never);
+    const res = await revalidateApprovedIntentForRelease(planChild(), null);
+    expect(res.ok).toBe(true);
+    expect(checkPlanEffectMembershipSystem).toHaveBeenCalledWith(expect.objectContaining({
+      orgId: 'org-1', taskId: 't1', ordinal: 3, toolName: 'google_suspend_user', argumentDigest: digest,
+      taskStepKey: 'offboard', operationKey: 'offboard:google_suspend_user:c1:r2:n3',
+    }));
+  });
+
+  it.each(['plan_superseded', 'revision_moved', 'plan_expired', 'argument_digest_mismatch',
+    'effect_set_digest_mismatch', 'operation_identity_mismatch', 'plan_approval_missing'])(
+    'REFUSES with plan_approval_revoked when membership says %s', async (refusal) => {
+      vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(refuse(refusal) as never);
+      expect(await revalidateApprovedIntentForRelease(planChild(), null))
+        .toMatchObject({ ok: false, errorCode: 'plan_approval_revoked', details: { refusal } });
+    },
+  );
+
+  it('requires membership EVEN WHEN an approval row exists — a row never substitutes for the plan', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(refuse('plan_superseded') as never);
+    expect(await revalidateApprovedIntentForRelease(planChild(), { boundArgumentDigest: digest }))
+      .toMatchObject({ ok: false, errorCode: 'plan_approval_revoked' });
+  });
+
+  it('REFUSES when the tool left the agent allowlist after approval (narrowed policy revokes)', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(member as never);
+    vi.mocked(checkToolCeiling).mockReturnValueOnce({ ok: false, detail: 'not in current allowlist' } as never);
+    expect(await revalidateApprovedIntentForRelease(planChild(), null))
+      .toMatchObject({ ok: false, errorCode: 'tool_not_in_agent_allowlist' });
+  });
+
+  it('REFUSES when the recorded approver is not the plan\'s approver', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue({ ...member, approverUserId: 'someone-else' } as never);
+    expect(await revalidateApprovedIntentForRelease(planChild(), null))
+      .toMatchObject({ ok: false, errorCode: 'plan_approval_revoked' });
+  });
+
+  it('REFUSES an agent-run-attributed row claiming plan_approval (children are human-shaped)', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(member as never);
+    expect(await revalidateApprovedIntentForRelease(planChild({ requestingAgentRunId: 'run-1', requestedByUserId: null }), null))
+      .toMatchObject({ ok: false, errorCode: 'plan_approval_revoked' });
+  });
+
+  it('REFUSES a task-less row claiming plan_approval', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(member as never);
+    expect(await revalidateApprovedIntentForRelease(planChild({ taskId: null, taskStepKey: null, operationKey: null }), null))
+      .toMatchObject({ ok: false, errorCode: 'plan_approval_revoked' });
+  });
+
+  it('still recomputes the argument digest from stored arguments (check a2)', async () => {
+    vi.mocked(checkPlanEffectMembershipSystem).mockResolvedValue(member as never);
+    const res = await revalidateApprovedIntentForRelease(
+      planChild({ arguments: { userEmail: 'someone-else@customer.example', reason: 'offboarding' } }), null,
+    );
+    expect(res).toMatchObject({ ok: false, errorCode: 'digest_mismatch' });
+  });
+
+  it('a human-decided intent without decided_via=plan_approval and no approval row still fails (a)', async () => {
+    const res = await revalidateApprovedIntentForRelease(planChild({ decidedVia: 'session_tap' }), null);
+    expect(res).toMatchObject({ ok: false, errorCode: 'digest_mismatch' });
+    expect(checkPlanEffectMembershipSystem).not.toHaveBeenCalled();
+  });
+
+  it('the PLAN intent itself takes the ordinary approval-row path', async () => {
+    const res = await revalidateApprovedIntentForRelease(
+      intentFixture({ actionName: 'operator_plan', arguments: {}, argumentDigest: computeArgumentDigest(canonicalizeArguments({})), decidedVia: 'session_tap' }),
+      null,
+    );
+    expect(res).toMatchObject({ ok: false, errorCode: 'digest_mismatch' });
+    expect(checkPlanEffectMembershipSystem).not.toHaveBeenCalled();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Caller verification W05 (#6354): consume step for m365_disable_user /
+// m365_reset_password, after every other release check passed.
+// ---------------------------------------------------------------------------
+describe('revalidateApprovedIntentForRelease caller verification consume (#6354 W05)', () => {
+  const args = { userIdentifier: 'victim@contoso.test', reason: 'r' };
+  const digest = computeArgumentDigest(canonicalizeArguments(args));
+  const TENANT = '22222222-2222-4222-8222-222222222222';
+  const OID = '33333333-3333-4333-8333-333333333333';
+  const protectedIntent = (overrides: Record<string, unknown> = {}) => intentFixture({
+    actionName: 'm365_disable_user',
+    arguments: args,
+    argumentDigest: digest,
+    targetEntraTenantId: TENANT,
+    targetEntraOid: OID,
+    targetConnectionRef: '44444444-4444-4444-8444-444444444444',
+    ...overrides,
+  });
+  const refusalPayload = (reason: string, extra: Record<string, unknown> = {}) => ({
+    orgId: 'org-1', contactId: null, action: 'disable_user' as const, requiredTier: 2,
+    reason: reason as never, latest: null, ...extra,
+  });
+
+  it.each([
+    ['m365_disable_user', 'disable_user', 2],
+    ['m365_reset_password', 'reset_password', 3],
+  ])('%s consumes through the gate with the pinned subject, intent id and the pinned connection tenant', async (actionName, action) => {
+    const result = await revalidateApprovedIntentForRelease(protectedIntent({ actionName }), { boundArgumentDigest: digest });
+    expect(result).toMatchObject({ ok: true });
+    expect(requireCallerVerification).toHaveBeenCalledTimes(1);
+    expect(requireCallerVerification).toHaveBeenCalledWith({
+      orgId: 'org-1', action,
+      target: { entraTenantId: TENANT, entraOid: OID },
+      backendTenantId: 'tenant-1',
+      technicianUserId: 'user-1',
+      intentId: 'intent-1',
+      mode: 'consume',
+    });
+    expect(loadPinnedCallerBackend).toHaveBeenCalledWith('org-1', '44444444-4444-4444-8444-444444444444');
+  });
+
+  it('a typed gate refusal returns the exact failure shape carrying the gate payload', async () => {
+    const payload = refusalPayload('no_fresh_verification');
+    vi.mocked(requireCallerVerification).mockRejectedValueOnce(new CallerVerificationRequiredError(payload));
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: digest });
+    expect(result).toEqual({
+      ok: false,
+      errorCode: 'caller_verification_required',
+      details: { requiresCallerVerification: payload },
+    });
+  });
+
+  it('RBAC denial returns rbac_denied and never reaches the gate', async () => {
+    vi.mocked(checkToolPermission).mockResolvedValueOnce('Missing permission' as never);
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: digest });
+    expect(result).toMatchObject({ ok: false, errorCode: 'rbac_denied' });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+    expect(loadPinnedCallerBackend).not.toHaveBeenCalled();
+  });
+
+  it('a digest mismatch never reaches the gate', async () => {
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: 'f'.repeat(64) });
+    expect(result).toMatchObject({ ok: false, errorCode: 'digest_mismatch' });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it('a site-ceiling refusal never reaches the gate', async () => {
+    vi.mocked(buildAuthContextForIntent).mockResolvedValueOnce({
+      scope: 'organization', orgId: 'org-1', accessibleOrgIds: ['org-1'],
+      user: { id: 'user-1' }, principal: { kind: 'user_session' }, allowedSiteIds: ['site-1'],
+    } as never);
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: digest });
+    expect(result).toMatchObject({ ok: false, errorCode: 'site_ceiling' });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it('an agent-originated intent refuses technician_mismatch without calling the gate', async () => {
+    const result = await revalidateApprovedIntentForRelease(
+      protectedIntent({
+        requestedByUserId: null, requestingAgentRunId: 'run-1', originPrincipalKind: 'ai_agent', source: 'ai_agent',
+      }),
+      { boundArgumentDigest: digest },
+    );
+    expect(result).toEqual({
+      ok: false,
+      errorCode: 'caller_verification_required',
+      details: { requiresCallerVerification: refusalPayload('technician_mismatch', { requiredTier: 2 }) },
+    });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it('a requester-less intent refuses technician_mismatch without calling the gate', async () => {
+    const result = await revalidateApprovedIntentForRelease(
+      protectedIntent({ requestedByUserId: null }),
+      { boundArgumentDigest: digest },
+    );
+    expect(result).toEqual({
+      ok: false,
+      errorCode: 'caller_verification_required',
+      details: { requiresCallerVerification: refusalPayload('technician_mismatch', { requiredTier: 2 }) },
+    });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no tenant', { targetEntraTenantId: null }],
+    ['no oid', { targetEntraOid: null }],
+    ['no connection ref', { targetConnectionRef: null }],
+  ])('an unpinned intent (%s) refuses subject_unmatched without calling the gate', async (_label, over) => {
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(over), { boundArgumentDigest: digest });
+    expect(result).toEqual({
+      ok: false,
+      errorCode: 'caller_verification_required',
+      details: { requiresCallerVerification: refusalPayload('subject_unmatched', { requiredTier: 2 }) },
+    });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it('a pinned connection that is gone is connection_unavailable and does not consume', async () => {
+    vi.mocked(loadPinnedCallerBackend).mockRejectedValueOnce(new CallerVerificationValidationError('connection_not_ready', 'gone'));
+    const result = await revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: digest });
+    expect(result).toEqual({ ok: false, errorCode: 'connection_unavailable', details: { reason: 'gone' } });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+  });
+
+  it('an unexpected gate error is rethrown, not folded into a refusal', async () => {
+    vi.mocked(requireCallerVerification).mockRejectedValueOnce(new Error('db down'));
+    await expect(revalidateApprovedIntentForRelease(protectedIntent(), { boundArgumentDigest: digest })).rejects.toThrow('db down');
+  });
+
+  it('non-protected tools never call the gate or load a pinned connection', async () => {
+    const plainArgs = { deviceId: 'dev-1', action: 'restart', serviceName: 'spooler' };
+    const plainDigest = computeArgumentDigest(canonicalizeArguments(plainArgs));
+    const result = await revalidateApprovedIntentForRelease(
+      intentFixture({ actionName: 'manage_services', arguments: plainArgs, argumentDigest: plainDigest }),
+      { boundArgumentDigest: plainDigest },
+    );
+    expect(result).toMatchObject({ ok: true });
+    const other = await revalidateApprovedIntentForRelease(
+      protectedIntent({ actionName: 'm365_revoke_sessions' }),
+      { boundArgumentDigest: digest },
+    );
+    expect(other).toMatchObject({ ok: true });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+    expect(loadPinnedCallerBackend).not.toHaveBeenCalled();
+  });
+});
+
+describe('revalidateApprovedIntentForRelease mcp_api origin branch (B-W04 #6158)', () => {
+  const args = { deviceId: 'dev-1', command: 'whoami' };
+  const digest = computeArgumentDigest(canonicalizeArguments(args));
+  const mcpIntent = (overrides: Record<string, unknown> = {}) => intentFixture({
+    source: 'mcp_api',
+    originPrincipalKind: 'api_key',
+    originPrincipalId: 'key-1',
+    actionName: 'execute_command',
+    arguments: args,
+    argumentDigest: digest,
+    ...overrides,
+  });
+
+  it('rebuilds from the origin credential, never the user-owned context, then runs RBAC on it', async () => {
+    const result = await revalidateApprovedIntentForRelease(mcpIntent(), { boundArgumentDigest: digest });
+    expect(result.ok).toBe(true);
+    expect(rebuildMcpOriginAuthContext).toHaveBeenCalledTimes(1);
+    expect(checkMcpOriginReleaseAuthority).toHaveBeenCalledTimes(1);
+    expect(buildAuthContextForIntent).not.toHaveBeenCalled();
+    const rbacAuth = vi.mocked(checkToolPermission).mock.calls[0]?.[2] as { token: unknown; principal: unknown };
+    expect(rbacAuth.token).toEqual({});
+    expect(rbacAuth.principal).toEqual({ kind: 'api_key', apiKeyId: 'key-1' });
+  });
+
+  it('a rebuild failure terminalises with its specific errorCode', async () => {
+    vi.mocked(rebuildMcpOriginAuthContext).mockResolvedValueOnce({ error: 'mcp_origin_revoked' });
+    const result = await revalidateApprovedIntentForRelease(mcpIntent(), { boundArgumentDigest: digest });
+    expect(result).toEqual({ ok: false, errorCode: 'mcp_origin_revoked' });
+    expect(checkToolPermission).not.toHaveBeenCalled();
+  });
+
+  it('an authority failure terminalises with its errorCode before RBAC', async () => {
+    vi.mocked(checkMcpOriginReleaseAuthority).mockReturnValueOnce({ ok: false, errorCode: 'mcp_intents_disabled' });
+    const result = await revalidateApprovedIntentForRelease(mcpIntent(), { boundArgumentDigest: digest });
+    expect(result).toEqual({ ok: false, errorCode: 'mcp_intents_disabled' });
+    expect(checkToolPermission).not.toHaveBeenCalled();
+  });
+
+  it('a user-session mcp_api intent (agent graduation / AI operator) keeps the user-owned rebuild', async () => {
+    await revalidateApprovedIntentForRelease(
+      mcpIntent({ originPrincipalKind: 'user_session', originPrincipalId: null }),
+      { boundArgumentDigest: digest },
+    );
+    expect(rebuildMcpOriginAuthContext).not.toHaveBeenCalled();
+    expect(buildAuthContextForIntent).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('revalidateApprovedIntentForRelease Wisp delegation ceiling (W04a)', () => {
+  const SESSION = '55555555-5555-4555-8555-555555555555';
+  const plainArgs = { deviceId: 'dev-1', action: 'restart', serviceName: 'spooler' };
+  const plainDigest = computeArgumentDigest(canonicalizeArguments(plainArgs));
+  const chatIntent = (overrides: Record<string, unknown> = {}) => intentFixture({
+    actionName: 'manage_services', arguments: plainArgs, argumentDigest: plainDigest,
+    aiOriginKind: 'ai_assistant', aiOriginSessionId: SESSION, ...overrides,
+  });
+
+  it('an intent with no chat-session origin never consults the Wisp ceiling', async () => {
+    const result = await revalidateApprovedIntentForRelease(
+      chatIntent({ aiOriginKind: null, aiOriginSessionId: null }),
+      { boundArgumentDigest: plainDigest },
+    );
+    expect(result).toMatchObject({ ok: true });
+    expect(checkWispCeilingForRelease).not.toHaveBeenCalled();
+  });
+
+  it('a chat-originated intent is checked with the rebuilt requester auth, and released under the auth the check returns', async () => {
+    const narrowed = { narrowed: true } as never;
+    vi.mocked(checkWispCeilingForRelease).mockResolvedValueOnce({ ok: true, auth: narrowed });
+    const intent = chatIntent();
+    const result = await revalidateApprovedIntentForRelease(intent, { boundArgumentDigest: plainDigest });
+    expect(checkWispCeilingForRelease).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(checkWispCeilingForRelease).mock.calls[0]![0]).toBe(intent);
+    expect(vi.mocked(checkWispCeilingForRelease).mock.calls[0]![1]).toMatchObject({ user: { id: 'user-1' }, orgId: 'org-1' });
+    expect(result).toEqual({ ok: true, auth: narrowed });
+  });
+
+  it('a Wisp refusal is returned as-is and stops the release', async () => {
+    vi.mocked(checkWispCeilingForRelease).mockResolvedValueOnce({
+      ok: false, errorCode: 'wisp_grant_inactive', details: { wispRefusal: 'inactive' },
+    });
+    const result = await revalidateApprovedIntentForRelease(chatIntent(), { boundArgumentDigest: plainDigest });
+    expect(result).toEqual({ ok: false, errorCode: 'wisp_grant_inactive', details: { wispRefusal: 'inactive' } });
+  });
+
+  it('runs only after every core check passed (an RBAC denial never reaches it)', async () => {
+    vi.mocked(checkToolPermission).mockResolvedValueOnce('Missing permission' as never);
+    const result = await revalidateApprovedIntentForRelease(chatIntent(), { boundArgumentDigest: plainDigest });
+    expect(result).toMatchObject({ ok: false, errorCode: 'rbac_denied' });
+    expect(checkWispCeilingForRelease).not.toHaveBeenCalled();
+  });
+
+  it('a Wisp refusal never spends a single-use caller verification', async () => {
+    const args = { userIdentifier: 'victim@contoso.test', reason: 'r' };
+    const digest = computeArgumentDigest(canonicalizeArguments(args));
+    vi.mocked(checkWispCeilingForRelease).mockResolvedValueOnce({
+      ok: false, errorCode: 'wisp_ceiling_refused', details: { wispRefusal: 'permission' },
+    });
+    const result = await revalidateApprovedIntentForRelease(
+      chatIntent({
+        actionName: 'm365_disable_user', arguments: args, argumentDigest: digest,
+        targetEntraTenantId: '22222222-2222-4222-8222-222222222222',
+        targetEntraOid: '33333333-3333-4333-8333-333333333333',
+        targetConnectionRef: '44444444-4444-4444-8444-444444444444',
+      }),
+      { boundArgumentDigest: digest },
+    );
+    expect(result).toMatchObject({ ok: false, errorCode: 'wisp_ceiling_refused' });
+    expect(requireCallerVerification).not.toHaveBeenCalled();
+    expect(loadPinnedCallerBackend).not.toHaveBeenCalled();
+  });
+});
+
+// Tool catalog W04 (#5219), plan Task A5: a flow-origin intent has no user
+// RBAC behind it. Branch (c) rebuilds the run's flow principal
+// (checkFlowReleaseAuthority) and branch (e) takes the STRUCTURAL flow branch:
+// checkToolPermission — which denies every machine principal — is never asked.
+const { checkFlowReleaseAuthorityMock } = vi.hoisted(() => ({ checkFlowReleaseAuthorityMock: vi.fn() }));
+vi.mock('../flows/releaseAuthority', () => ({ checkFlowReleaseAuthority: checkFlowReleaseAuthorityMock }));
+
+describe('revalidateApprovedIntentForRelease — flow-origin intents', () => {
+  const RUN_ID = '77777777-7777-4777-8777-777777777777';
+  const FLOW_ID = '66666666-6666-4666-8666-666666666666';
+  const args = { scriptId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', deviceIds: ['dev-1'] };
+  const digest = computeArgumentDigest(canonicalizeArguments(args));
+  const flowAuth = {
+    principal: { kind: 'flow', flowId: FLOW_ID, runId: RUN_ID },
+    aiOrigin: { kind: 'flow', flowRunId: RUN_ID },
+    user: { id: FLOW_ID },
+    token: null,
+    orgId: 'org-1',
+    accessibleOrgIds: ['org-1'],
+  };
+  function flowIntent(over: Record<string, unknown> = {}) {
+    return intentFixture({
+      requestedByUserId: null,
+      requestingFlowRunId: RUN_ID,
+      originPrincipalKind: 'flow',
+      originPrincipalId: FLOW_ID,
+      source: 'flow',
+      actionName: 'run_script',
+      arguments: args,
+      argumentDigest: digest,
+      approvalScope: 'supervised',
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    checkFlowReleaseAuthorityMock.mockReset();
+    checkFlowReleaseAuthorityMock.mockResolvedValue({ ok: true, auth: flowAuth });
+  });
+
+  it('a flow intent takes the flow-authority branch and never calls checkToolPermission', async () => {
+    const result = await revalidateApprovedIntentForRelease(flowIntent(), { boundArgumentDigest: digest });
+    expect(result).toEqual({ ok: true, auth: flowAuth });
+    expect(checkFlowReleaseAuthorityMock).toHaveBeenCalledTimes(1);
+    expect(checkToolPermission).not.toHaveBeenCalled();
+    expect(checkPermissionRequirements).not.toHaveBeenCalled();
+    expect(buildAuthContextForIntent).not.toHaveBeenCalled();
+    expect(checkAgentReleaseAuthority).not.toHaveBeenCalled();
+  });
+
+  it('a refused flow rebuild fails the release actor_invalid with the reason', async () => {
+    checkFlowReleaseAuthorityMock.mockResolvedValue({ ok: false, code: 'ownership_mismatch' });
+    const result = await revalidateApprovedIntentForRelease(flowIntent(), { boundArgumentDigest: digest });
+    expect(result).toMatchObject({ ok: false, errorCode: 'actor_invalid', details: { reason: 'ownership_mismatch' } });
+    expect(checkToolPermission).not.toHaveBeenCalled();
+  });
+
+  it('a flow intent still needs its human approval row (digest-bound)', async () => {
+    const result = await revalidateApprovedIntentForRelease(flowIntent(), null);
+    expect(result).toEqual({ ok: false, errorCode: 'digest_mismatch' });
+    expect(checkFlowReleaseAuthorityMock).not.toHaveBeenCalled();
+  });
+
+  it('a rebuild that is not this run\'s flow principal is refused (structural consistency)', async () => {
+    checkFlowReleaseAuthorityMock.mockResolvedValue({
+      ok: true, auth: { ...flowAuth, principal: { kind: 'flow', flowId: FLOW_ID, runId: '77777777-7777-4777-8777-000000000000' } },
+    });
+    const result = await revalidateApprovedIntentForRelease(flowIntent(), { boundArgumentDigest: digest });
+    expect(result).toMatchObject({ ok: false, errorCode: 'actor_invalid' });
+  });
+
+  it('an external-tool flow step reloads its descriptor under the flow principal, with no external_tools RBAC check', async () => {
+    const descriptor = { id: 'tool-1', qualifiedName: 'acme__restart' };
+    vi.mocked(loadTenantToolBindingState).mockResolvedValueOnce({
+      tool: { id: 'tool-1', enabled: true, removedAt: null, revision: 'rev-1', tier: 3 },
+      source: { id: 'src-1', status: 'active' },
+    } as never);
+    vi.mocked(loadTenantToolForExecution).mockResolvedValueOnce({ descriptor } as never);
+    const ext = { a: 1 };
+    const extDigest = computeArgumentDigest(canonicalizeArguments(ext));
+    const result = await revalidateApprovedIntentForRelease(
+      flowIntent({ actionName: 'acme__restart', arguments: ext, argumentDigest: extDigest, toolSourceToolId: 'tool-1', toolRevision: 'rev-1' }),
+      { boundArgumentDigest: extDigest },
+    );
+    expect(result).toEqual({ ok: true, auth: flowAuth, tenantTool: descriptor });
+    expect(loadTenantToolForExecution).toHaveBeenCalledWith('tool-1', flowAuth);
+    expect(checkPermissionRequirements).not.toHaveBeenCalled();
+    expect(checkToolPermission).not.toHaveBeenCalled();
   });
 });

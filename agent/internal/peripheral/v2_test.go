@@ -235,6 +235,46 @@ func TestApplyPeripheralPolicyV2RevisionRulesAndRestart(t *testing.T) {
 	}
 }
 
+// #8317 — after a move to another org or site the agent adopts its new
+// identity, and its last-known-good state still carries the old org/site. The
+// next revision for the same device must apply; a state that belongs to a
+// different device must still be refused.
+func TestApplyPeripheralPolicyV2AcceptsTheNextRevisionAfterADeviceMove(t *testing.T) {
+	store := newV2TestStore(t)
+	var detects atomic.Int32
+	enforcer := &v2TestEnforcer{}
+	first := testV2Envelope(t, 5, "enforce", nil)
+	if got := ApplyPeripheralPolicyV2(first, first.Identity, store, testV2Deps(&detects, enforcer)); got.Outcome != "applied" {
+		t.Fatalf("first apply = %+v", got)
+	}
+
+	envelopeFor := func(identity PeripheralPolicyIdentityV2, revision int) PeripheralPolicyEnvelopeV2 {
+		e := testV2Envelope(t, revision, "enforce", nil)
+		e.Identity = identity
+		digest, err := DigestPeripheralPolicyEnvelopeV2(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.Digest = digest
+		return e
+	}
+
+	moved := first.Identity
+	moved.OrgID, moved.SiteID = "org-2", "site-2"
+	if got := ApplyPeripheralPolicyV2(envelopeFor(moved, 6), moved, store, testV2Deps(&detects, enforcer)); got.Outcome != "applied" {
+		t.Fatalf("next revision after the move = %+v", got)
+	}
+	if got := ApplyPeripheralPolicyV2(envelopeFor(moved, 4), moved, store, testV2Deps(&detects, enforcer)); got.ReasonCode != "lower_revision" {
+		t.Fatalf("revision floor not kept across the move = %+v", got)
+	}
+
+	other := moved
+	other.DeviceID = "device-2"
+	if got := ApplyPeripheralPolicyV2(envelopeFor(other, 7), other, store, testV2Deps(&detects, enforcer)); got.ReasonCode != "invalid_payload" {
+		t.Fatalf("another device's last-known-good was accepted = %+v", got)
+	}
+}
+
 func TestApplyPeripheralPolicyV2CorruptStateFailsClosed(t *testing.T) {
 	store := newV2TestStore(t)
 	if err := os.WriteFile(store.v2Path, []byte("{"), 0600); err != nil {
@@ -460,5 +500,80 @@ func TestApplyPeripheralPolicyV2ClearPersistenceFailureRestoresLegacyEnforcement
 	persisted, err := store.Load()
 	if err != nil || len(persisted) != 1 || persisted[0].ID != legacy[0].ID {
 		t.Fatalf("legacy LKG = %+v, err=%v", persisted, err)
+	}
+}
+
+// v2RecordingEnforcer records which device instances were disabled, so a test
+// can see what the rollback put back and not only the class gates.
+type v2RecordingEnforcer struct {
+	v2TestEnforcer
+	mu       sync.Mutex
+	disabled []string
+}
+
+func (f *v2RecordingEnforcer) DisableDevice(id string) EnforceOutcome {
+	f.mu.Lock()
+	f.disabled = append(f.disabled, id)
+	f.mu.Unlock()
+	return f.outcome(true)
+}
+
+func (f *v2RecordingEnforcer) takeDisabled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	got := f.disabled
+	f.disabled = nil
+	return got
+}
+
+// #10442: the enforce branch used to shadow `detected`, so the rollback plan
+// was built from zero devices and per-device blocks from the last-known-good
+// policy were not put back.
+func TestApplyPeripheralPolicyV2RollbackRestoresPerDeviceBlocks(t *testing.T) {
+	cases := map[string]struct {
+		unverified bool
+		failSave   bool
+		reason     string
+	}{
+		"enforcement": {unverified: true, reason: "enforcement_failed"},
+		"save":        {failSave: true, reason: "persistence_failed"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newV2TestStore(t)
+			enforcer := &v2RecordingEnforcer{}
+			var detects atomic.Int32
+			deps := testV2Deps(&detects, enforcer)
+
+			first := testV2Envelope(t, 1, "enforce", []PeripheralPolicyV2{{
+				PolicyID: "old-block", Source: "organization", EffectiveClass: "storage", ConfiguredClass: "storage", Action: "block", Exceptions: []ExceptionRule{},
+			}})
+			if got := ApplyPeripheralPolicyV2(first, first.Identity, store, deps); got.Outcome != "applied" {
+				t.Fatalf("first apply = %+v", got)
+			}
+			if got := enforcer.takeDisabled(); len(got) != 1 || got[0] != "usb-1" {
+				t.Fatalf("first apply disabled %v, want [usb-1]", got)
+			}
+
+			// The new policy allows storage, so the new plan disables nothing:
+			// any DisableDevice call during this apply comes from the rollback.
+			enforcer.unverified = tc.unverified
+			if tc.failSave {
+				store.writeAtomic = func(string, []byte) error { return errors.New("disk full") }
+			}
+			next := testV2Envelope(t, 2, "enforce", []PeripheralPolicyV2{{
+				PolicyID: "new-allow", Source: "organization", EffectiveClass: "storage", ConfiguredClass: "storage", Action: "allow", Exceptions: []ExceptionRule{},
+			}})
+			got := ApplyPeripheralPolicyV2(next, next.Identity, store, deps)
+			if got.ReasonCode != tc.reason {
+				t.Fatalf("second apply = %+v, want %s", got, tc.reason)
+			}
+			if restored := enforcer.takeDisabled(); len(restored) != 1 || restored[0] != "usb-1" {
+				t.Fatalf("rollback disabled %v, want [usb-1]: the last-known-good per-device block was not restored", restored)
+			}
+			if !enforcer.gateApplied.Load() {
+				t.Fatal("rollback did not re-arm the last-known-good storage gate")
+			}
+		})
 	}
 }

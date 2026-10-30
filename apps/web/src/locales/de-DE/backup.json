@@ -219,6 +219,7 @@
     "created2": "Erstellt",
     "expires2": "Läuft ab",
     "protection2": "Schutz",
+    "integrity": "Integrität",
     "hold": "Aufbewahrungssperre",
     "standard": "Standard",
     "restorePointCount_one": "{{count}} Wiederherstellungspunkt",
@@ -487,6 +488,22 @@
     "selectASnapshot": "Wählen Sie einen Snapshot aus",
     "chooseTheRecoveryPointYouWantToRestore": "Wählen Sie den Wiederherstellungspunkt aus, von dem Sie wiederherstellen möchten.",
     "noSnapshotsAvailable": "Keine Snapshots verfügbar.",
+    "device": "Gerät",
+    "selectADevice": "Gerät auswählen",
+    "chooseTheDeviceToRestore": "Wählen Sie das Gerät, dessen Sicherung Sie wiederherstellen möchten.",
+    "deviceOption_one": "{{device}} ({{count}} Snapshot)",
+    "deviceOption_other": "{{device}} ({{count}} Snapshots)",
+    "unknownDevice": "Unbekanntes Gerät",
+    "reviewDevice": "Gerät: {{device}}",
+    "snapshotNeedsSecondFactor": "Zweiter Faktor erforderlich",
+    "secondFactorNote": "Dieser Wiederherstellungspunkt ist nicht verifiziert. Beim Start der Wiederherstellung müssen Sie mit Ihrem zweiten Faktor bestätigen.",
+    "secondFactorNoteNotEnrolled": "Dieser Wiederherstellungspunkt ist nicht verifiziert und Sie haben keinen zweiten Faktor eingerichtet. Für den Start der Wiederherstellung ist einer erforderlich.",
+    "secondFactorSetUp": "Zwei-Faktor-Authentifizierung einrichten",
+    "commandDetails": "Befehlsdetails",
+    "copyCommandId": "Befehls-ID kopieren",
+    "commandIdCopied": "Befehls-ID kopiert",
+    "commandIdCopyFailed": "Befehls-ID konnte nicht kopiert werden",
+    "carriedSnapshotUnavailable": "Der Snapshot, mit dem Sie den Assistenten geöffnet haben, ist nicht mehr verfügbar. Wählen Sie ein Gerät und einen seiner Snapshots.",
     "selectRestoreType": "Wählen Sie den Wiederherstellungstyp aus",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Vollständig stellt alles wieder her, selektiv stellt bestimmte Dateien wieder her.",
     "fullRestore": "Vollständige Wiederherstellung",
@@ -529,9 +546,18 @@
     "noRestoreHistoryYet": "Noch kein Wiederherstellungsverlauf.",
     "files2": "Dateien:",
     "size": "Größe:",
-    "filesSelected_one": "{{count}} Datei ausgewählt",
-    "filesSelected_other": "{{count}} Dateien ausgewählt",
-    "unknownDevice": "Unbekanntes Gerät",
+    "filesSelected_one": "{{formatted}} Datei ausgewählt",
+    "filesSelected_other": "{{formatted}} Dateien ausgewählt",
+    "folderFileCount_one": "{{formatted}} Datei",
+    "folderFileCount_other": "{{formatted}} Dateien",
+    "allFilesFromSnapshot": "Alle Dateien aus dem Snapshot",
+    "selectionFiles_one": "{{formatted}} Datei",
+    "selectionFiles_other": "{{formatted}} Dateien",
+    "selectionFolders_one": "{{formatted}} Ordner",
+    "selectionFolders_other": "{{formatted}} Ordner",
+    "largeFolderSelectionTitle": "Große Auswahl",
+    "selectFolder": "Ordner {{name}} auswählen",
+    "confirmLargeFolderSelection": "Diese Auswahl umfasst etwa {{formatted}} Dateien und die Wiederherstellung kann einige Zeit dauern. Fortfahren?",
     "kindVm": "Als VM wiederherstellen",
     "kindInstantBoot": "Sofortstart",
     "kindSelective": "Selektive Wiederherstellung",
@@ -629,6 +655,10 @@
     "path": "Pfad:",
     "useTheRestoreWorkflowToRecoverOrExport": "Verwenden Sie den Wiederherstellungsworkflow, um Dateien aus diesem Snapshot wiederherzustellen oder zu exportieren.",
     "select": "Auswählen",
+    "folderFileCount_one": "{{count}} Datei",
+    "folderFileCount_other": "{{count}} Dateien",
+    "selectFolder": "Ordner {{name}} auswählen",
+    "confirmLargeFolderSelection": "Diese Auswahl umfasst etwa {{count}} Dateien und die Wiederherstellung kann einige Zeit dauern. Fortfahren?",
     "name": "Name",
     "size2": "Größe",
     "modified": "Geändert"
@@ -720,7 +750,9 @@
     "vaultType": "Tresortyp",
     "retentionCount": "Aufbewahrungsanzahl",
     "numberOfSnapshotsToKeepInTheVault": "Anzahl der Snapshots, die im Tresor aufbewahrt werden sollen (1–100).",
-    "cancel": "Abbrechen"
+    "cancel": "Abbrechen",
+    "failedToSave": "Der Tresor konnte nicht gespeichert werden. Bitte erneut versuchen.",
+    "deviceConfigNotSent": "Tresor gespeichert, aber die Konfiguration konnte nicht an das Gerät gesendet werden: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Tresore werden geladen...",
@@ -742,7 +774,12 @@
     "actions": "Aktionen",
     "sync": "Synchronisieren",
     "edit": "Bearbeiten",
-    "deactivate": "Deaktivieren"
+    "deactivate": "Deaktivieren",
+    "inactive": "Inaktiv",
+    "syncStarted": "Tresor-Synchronisierung gestartet",
+    "failedToSync": "Die Tresor-Synchronisierung konnte nicht gestartet werden. Bitte erneut versuchen.",
+    "failedToDeactivate": "Der Tresor konnte nicht deaktiviert werden. Bitte erneut versuchen.",
+    "deviceConfigNotSent": "Tresor gespeichert, aber die Konfiguration konnte nicht an das Gerät gesendet werden: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Disaster Recovery wird geladen...",
@@ -993,6 +1030,8 @@
     "codeExpires": "Läuft ab um {{time}}",
     "overdueNotice": "Noch keine Rückmeldung — prüfen Sie die Wiederherstellungskonsole.",
     "fileIndexPreparing": "Dateiindex für snapshot-übergreifende Verweise wird vorbereitet…",
+    "snapshotsLoadFailed": "Snapshots konnten nicht geladen werden. Laden Sie die Seite neu, um es erneut zu versuchen.",
+    "noSnapshots": "Noch keine Snapshots, die sich per Bare-Metal wiederherstellen lassen. Erforderlich ist eine Komplettsicherung des Geräts, die als Bare-Metal-wiederherstellbar markiert ist.",
     "statusFailed": "Wiederherstellung fehlgeschlagen",
     "statusRefused": "Wiederherstellung abgelehnt",
     "status": {
@@ -1002,7 +1041,8 @@
       "restoring": "Wird wiederhergestellt",
       "validated": "Validiert",
       "rebooted": "Neu gestartet",
-      "checked_in": "Angemeldet"
+      "checked_in": "Angemeldet",
+      "completed": "Abgeschlossen"
     }
   },
   "backupHealth": {
@@ -1013,6 +1053,7 @@
     "statusTitle": "Status",
     "recencyTitle": "Letzte erfolgreiche Sicherung",
     "coverage": "{{covered}} von {{total}} Endgeräten haben eine aktuelle Sicherung",
+    "definition": "„Aktuell“ bedeutet eine erfolgreiche Sicherung in den letzten 48 Stunden. Der Zustand eines Geräts richtet sich nach seinem letzten Lauf – es kann also eine aktuelle Sicherung haben und trotzdem „Kritisch“ anzeigen, wenn dieser Lauf fehlgeschlagen ist.",
     "providerOnly": "{{value}} Endgeräte nur beim Anbieter",
     "m365Accounts": "{{value}} Microsoft 365 Konten",
     "status": {
@@ -1069,10 +1110,14 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare Metal",
+      "m365_mail": "Microsoft 365-E-Mail",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
       "m365_onedrive": "OneDrive",
       "m365_teams": "Teams",
+      "gws_mail": "Google Workspace-E-Mail",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Geteilte Google-Ablagen",
       "other": "Sonstige"
     },
     "noObservation": "Keine Beobachtung",
@@ -1091,7 +1136,12 @@
       "errorUnlink": "Verknüpfung des Anbietergeräts konnte nicht gelöst werden",
       "error": "Externer Sicherungsstatus konnte nicht geladen werden",
       "alsoCheck": "Prüfen Sie auch die Verbindungen zu externen Backup-Produkten unter \"Integrationen\"."
-    }
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} SaaS-Konten",
+    "workloadBackup": "{{workload}}-Backup",
+    "sourceProvider": "Backup-Anbieter"
   },
   "restoreResultNotices": {
     "systemStateRequiresRebuildTitle": "Der Systemstatus wird durch einen Bare-Metal-Neuaufbau angewendet",
@@ -1129,5 +1179,10 @@
     "checking": "Wird geprüft",
     "unverified": "Nicht verifiziert",
     "failed": "Integritätsprüfung fehlgeschlagen"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} Analysepunkt übersprungen: Junctions und Bereitstellungspunkte werden nicht verfolgt und nicht wiederhergestellt. Das ist erwartet, kein Fehler.",
+    "summary_other": "{{count}} Analysepunkte übersprungen: Junctions und Bereitstellungspunkte werden nicht verfolgt und nicht wiederhergestellt. Das ist erwartet, kein Fehler.",
+    "showDetails": "Übersprungene Pfade anzeigen"
   }
 }

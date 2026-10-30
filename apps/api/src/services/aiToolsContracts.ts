@@ -41,7 +41,17 @@ import {
 } from './contractService';
 import { ContractServiceError, type ContractActor, type ContractLineAudit } from './contractTypes';
 import { missingParamsJson, zodErrorToJson } from './aiToolValidation';
+import { stampedKeysErrorBody } from './contractHourBlockLocked';
+import { listContractHourPeriods } from './contractHourPeriodsRead';
 import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
+// Full-control W14 (#6784): read selectors on the existing reads (W14 plan fact 10 — no action multiplexer, so the
+// tools stay in TIER2_READONLY_TOOLS). Same services and permission as GET /contracts/:id/periods/:periodId/outcome
+// and GET /contracts/currency-mismatches (contracts:read).
+import { getPeriodOutcome } from './billingEvidence';
+import { listContractCurrencyMismatches } from './contractCurrencyReportService';
+import { bounded } from './aiToolsSoftwareShared';
+// Full-control W14 PR B (#6784): preview / generate the due invoice (POST /contracts/:id/generate).
+import { generateInvoiceAction, previewInvoiceAction } from './aiToolsContractInvoice';
 
 /**
  * Params each manage_contracts action requires, presence-checked BEFORE any
@@ -59,6 +69,9 @@ const MANAGE_CONTRACTS_REQUIRED: Record<string, readonly string[]> = {
   pause: ['contractId'],
   resume: ['contractId'],
   cancel: ['contractId'],
+  // Full-control W14 PR B (#6784). generate_invoice's assertions are validated in aiToolsContractInvoice.ts.
+  preview_invoice: ['contractId'],
+  generate_invoice: ['contractId', 'periodStart', 'expectedTotal', 'autoIssue', 'expectedRecipients'],
 };
 
 function actorFromAuth(auth: AuthContext): ContractActor {
@@ -171,7 +184,7 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
     definition: {
       name: 'list_contracts',
       description:
-        "List accessible recurring contracts newest first, filtered by org or status. Line prices, period totals and generated invoices use contract currencyCode; never sum across currencies; group by currencyCode for totals.",
+        "List accessible recurring contracts newest first, filtered by org or status; view currency_mismatches lists contracts whose currency differs from their org's. Prices use contract currencyCode; never sum across currencies; group by currencyCode for totals.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -181,7 +194,9 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
             enum: ['draft', 'active', 'paused', 'cancelled', 'expired'],
             description: 'Filter by contract status'
           },
-          limit: { type: 'number', description: 'Max results (default 25, max 100)' }
+          limit: { type: 'number', description: 'Max results (default 25, max 100)' },
+          view: { type: 'string', enum: ['contracts', 'currency_mismatches'], description: 'contracts (default) or currency_mismatches' },
+          cursor: { type: 'string', description: 'currency_mismatches: nextCursor from the previous page' }
         },
         required: []
       }
@@ -191,6 +206,18 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
       if (refusal) return refusal;
       const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
       try {
+        if (input.view === 'currency_mismatches') {
+          const currencyMismatches = await listContractCurrencyMismatches(
+            {
+              ...(input.orgId ? { orgId: String(input.orgId) } : {}),
+              ...(input.status ? { status: String(input.status) as 'draft' | 'active' | 'paused' | 'cancelled' | 'expired' } : {}),
+              limit,
+              ...(input.cursor ? { cursor: String(input.cursor) } : {}),
+            },
+            actorFromAuth(auth)
+          );
+          return bounded({ currencyMismatches });
+        }
         const rows = await listContracts(
           {
             orgId: input.orgId ? String(input.orgId) : undefined,
@@ -223,11 +250,12 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
     definition: {
       name: 'get_contract',
       description:
-        "Get a recurring contract header, lines and billing-period history. Line prices, period totals and generated invoices use contract currencyCode; never sum across currencies; group by currencyCode for totals.",
+        "Get a recurring contract header, lines, billing-period history and hour-block periods (last 24); with periodId, that period's outcome (devices billed, uncovered, flagged, overages). Prices use contract currencyCode; never sum across currencies; group by currencyCode for totals.",
       input_schema: {
         type: 'object' as const,
         properties: {
-          contractId: { type: 'string', description: 'Contract UUID' }
+          contractId: { type: 'string', description: 'Contract UUID' },
+          periodId: { type: 'string', description: 'Billing period UUID: return only that period\'s outcome' }
         },
         required: ['contractId']
       }
@@ -236,8 +264,17 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
       const refusal = partnerScopeRefusal(auth);
       if (refusal) return refusal;
       try {
-        const result = await getContract(String(input.contractId), actorFromAuth(auth));
-        return JSON.stringify(result);
+        const actor = actorFromAuth(auth);
+        const contractId = String(input.contractId);
+        if (input.periodId) {
+          const periodId = String(input.periodId);
+          const { recorded, outcome } = await getPeriodOutcome(contractId, periodId, actor);
+          return bounded({ contractId, periodId, recorded, outcome });
+        }
+        const result = await getContract(contractId, actor);
+        // #4547 W03: same reader as GET /contracts/:id/hour-periods (routes/contracts/hourPeriods.ts).
+        const { items: hourPeriods } = await listContractHourPeriods(contractId, { limit: 24 }, actor);
+        return JSON.stringify({ ...result, hourPeriods });
       } catch (err) {
         const json = serviceErrorToJson(err);
         if (json) return json;
@@ -250,11 +287,13 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
     tier: 2 as AiToolTier,
     deviceArgs: [],
     domain: 'billing',
-    searchHint: 'recurring contracts: create, edit drafts and lines, activate, pause, resume, cancel',
+    searchHint: 'recurring contracts: create, edit drafts and lines, activate, pause, resume, cancel, generate the due invoice',
+    // W14 PR B (#6784): generate_invoice renders a PDF and emails post-commit; it opens its own short contexts.
+    selfManagedDbContext: ['generate_invoice'],
     definition: {
       name: 'manage_contracts',
       description:
-        "Manage recurring contracts for accessible orgs; prices and totals use the contract currencyCode. Actions: create_draft, update, delete_draft, add_line, remove_line, update_line, activate, pause, resume, cancel. Lifecycle changes require approval.",
+        "Recurring contracts; amounts in the contract currencyCode. Actions: create_draft, update, delete_draft, add_line, remove_line, update_line, activate, pause, resume, cancel, preview_invoice, generate_invoice (pass preview_invoice's generateWith). Lifecycle and generate need approval.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -271,34 +310,46 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
               'pause',
               'resume',
               'cancel',
+              'preview_invoice',
+              'generate_invoice',
             ],
           },
           contractId: { type: 'string', description: 'Contract UUID' },
+          periodStart: { type: 'string', description: 'generate_invoice: generateWith.periodStart from preview_invoice' },
+          expectedTotal: { type: 'string', description: 'generate_invoice: generateWith.expectedTotal (with tax)' },
+          autoIssue: { type: 'boolean', description: 'generate_invoice: generateWith.autoIssue' },
+          expectedRecipients: { type: 'array', items: { type: 'string' }, description: 'generate_invoice: generateWith.expectedRecipients' },
           lineId: { type: 'string', description: 'Contract line UUID' },
           input: { type: 'object', description: 'Full create-contract payload including orgId, name, and schedule fields' },
           patch: {
             type: 'object',
             description:
-              "Header (update) or line (update_line) patch; lineType immutable. siteId:null widens to org. Future periods only; generated invoices unchanged.",
+              "Header (update) or line (update_line) patch; lineType immutable. siteId:null widens to org. Invoices unchanged; hour_block edits apply at open period close.",
             properties: {
               catalogItemId: { type: ['string', 'null'], description: 'Omit to keep link and price; different UUID re-resolves price/taxable (supplied values ignored); null unlinks and requires unitPrice + taxable.' },
               refreshCatalogPrice: { type: 'boolean', description: 'True re-prices an unchanged catalog link. Line edits affect future billing periods only; generated invoices are unchanged.' },
-              includedQuantity: { type: ['string', 'null'], description: 'Positive integer allowance: bills every period even when the live count is lower. For update_line, the rule applies to the merged line.' },
-              overageMode: { type: ['string', 'null'], enum: ['bill', 'flag', null], description: 'bill charges excess; flag reports it. Merged line requires includedQuantity and overageMode together; absent fields are unchanged; null clears.' },
+              includedQuantity: { type: ['string', 'null'], description: 'Allowance bills every period even if the live count is lower: a whole number, or hours (decimals ok) on hour_block. Rule applies to the merged line.' },
+              overageMode: { type: ['string', 'null'], enum: ['bill', 'flag', null], description: 'bill charges excess; flag reports it. Merged line needs includedQuantity and overageMode together; absent fields unchanged; null clears. hour_block stays bill.' },
               overageUnitPrice: { type: ['string', 'null'], description: 'Contract currency price, required only with bill. To remove allowance send includedQuantity, overageMode and overageUnitPrice all as null.' },
+              rolloverPolicy: { type: 'string', enum: ['none', 'carry_forward'], description: 'hour_block: none or carry_forward. A switch to none needs rolloverCapHours null in the same patch.' },
+              rolloverCapHours: { type: ['string', 'null'], description: 'hour_block carry_forward: most hours rolled over per period; null removes the limit.' },
+              hourBlockAlertPct: { type: ['integer', 'null'], description: 'hour_block: whole percent 1-100 that raises an alert; null removes it.' },
             },
           },
           line: {
             type: 'object',
             description:
-              "Line: flat|per_device|per_device_role|per_device_group|per_seat|manual. Contract currency prices; gaps fail, never converted. Allowances bill a minimum.",
+              "Line: flat|per_device|per_device_role|per_device_group|per_seat|manual|hour_block (fields below). Contract currency prices; gaps fail, never converted.",
             properties: {
               deviceGroupId: { type: 'string', description: "per_device_group: UUID in contract org; dynamic groups evaluated live; a filter condition on groupId still reads that other group's cached membership." },
               deviceRoles: { type: 'array', items: { type: 'string', enum: [...BILLABLE_DEVICE_ROLES] }, description: 'per_device_role: non-empty billable roles, never unknown; unclassified devices are uncovered. Optional siteId for per_device/per_device_role.' },
               catalogItemId: { type: 'string', description: 'UUID; resolves contract-currency price/taxable, ignoring supplied values. Missing price: NO_PRICE_FOR_CURRENCY. Without a catalog link, unitPrice required.' },
-              includedQuantity: { type: 'string', description: 'Positive integer allowance: bills every period even when the live count is lower. For add_line, includedQuantity and overageMode must be supplied together.' },
-              overageMode: { type: 'string', enum: ['bill', 'flag'], description: 'bill adds a sibling invoice line for excess units; flag reports excess without billing. Applies to device/role/group/seat lines.' },
-              overageUnitPrice: { type: 'string', description: 'Contract-currency price required only for overageMode bill; allowance bills includedQuantity times unitPrice each period.' },
+              includedQuantity: { type: 'string', description: 'Allowance: whole number for device/seat lines; hours per period (decimals ok) for hour_block. Bills a minimum. Supply with overageMode.' },
+              overageMode: { type: 'string', enum: ['bill', 'flag'], description: 'bill adds a sibling invoice line for excess units; flag reports excess without billing. hour_block must use bill.' },
+              overageUnitPrice: { type: 'string', description: 'Contract-currency price per excess unit (per extra hour on hour_block); required for overageMode bill. Allowance bills includedQuantity x unitPrice.' },
+              rolloverPolicy: { type: 'string', enum: ['none', 'carry_forward'], description: 'hour_block only, required: none (unused hours expire) or carry_forward (unused hours roll into the next period).' },
+              rolloverCapHours: { type: 'string', description: 'hour_block with carry_forward only: most hours that may roll over each period. Omit for no limit.' },
+              hourBlockAlertPct: { type: 'integer', description: 'hour_block only: whole percent 1-100 of the block used that raises an alert. Optional.' },
             },
           },
         },
@@ -351,7 +402,7 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
           case 'remove_line': {
             const audit = await removeContractLine(String(input.contractId), String(input.lineId), actor);
             auditContractLineToolEvent(auth, 'contract.line.removed', audit);
-            return JSON.stringify({ ok: true });
+            return JSON.stringify({ ok: true, retired: audit.retired === true });
           }
           case 'update_line': {
             const { line, audit } = await updateContractLine(
@@ -369,10 +420,16 @@ export function registerContractTools(aiTools: Map<string, AiTool>): void {
             return JSON.stringify(await resumeContract(String(input.contractId), actor));
           case 'cancel':
             return JSON.stringify(await cancelContract(String(input.contractId), actor));
+          case 'preview_invoice':
+            return await previewInvoiceAction(String(input.contractId), actor);
+          case 'generate_invoice':
+            return await generateInvoiceAction(String(input.contractId), input, auth, actor);
           default:
             return JSON.stringify({ error: `Unknown action: ${action}`, code: 'VALIDATION_ERROR' });
         }
       } catch (err) {
+        const stamped = stampedKeysErrorBody(err);
+        if (stamped) return JSON.stringify(stamped);
         const json = serviceErrorToJson(err) ?? zodErrorToJson(err);
         if (json) return json;
         throw err;

@@ -19,8 +19,15 @@ import {
   devices,
   organizations,
 } from '../db/schema';
-import { getRedis } from './redis';
+import { devicePolicyCacheOrg, readDevicePolicyCache, writeDevicePolicyCache } from './devicePolicyCache';
 import { policyOwnershipCondition } from './configPolicyOwnership';
+import {
+  brandingScopeId,
+  buildBrandingDecision,
+  resolvePartnerOrgBranding,
+  type BrandingCandidate,
+  type BrandingDecision,
+} from './helperBranding';
 
 const LEVEL_PRIORITY: Record<string, number> = {
   device: 5,
@@ -60,6 +67,18 @@ export interface HelperSettings {
    * the helper settings (120s) — mode changes land within TTL + heartbeat.
    */
   lifecycleMode?: 'auto' | 'always-on' | 'on-demand';
+  /**
+   * Endpoint messaging rollout flag (#8741), resolved per device. Absent on
+   * entries cached before this field existed; consumers treat absent as off.
+   *
+   * `allowUserReply` (#8743 W03): whether the person at the device may answer
+   * in a technician-opened live chat. Default ON when the policy is silent
+   * (owner decision); a present non-boolean reads as off (fail closed).
+   * Snapshotted on each conversation at open.
+   */
+  endpointMessaging?: { enabled: boolean; allowUserReply: boolean };
+  /** Partner/organization runtime branding decision (Phase 2). Absent = no decision; the Agent keeps its last-known snapshot. */
+  branding?: BrandingDecision;
 }
 
 const HELPER_DEFAULTS: HelperSettings = {
@@ -67,7 +86,15 @@ const HELPER_DEFAULTS: HelperSettings = {
   showOpenPortal: true,
   showDeviceInfo: true,
   showRequestSupport: true,
+  endpointMessaging: { enabled: false, allowUserReply: true },
 };
+
+/** Absent => true (default on); boolean => itself; anything else => false. */
+function allowUserReplyFrom(raw: unknown): boolean {
+  const v = (raw as { allowUserReply?: unknown } | null | undefined)?.allowUserReply;
+  if (v === undefined) return true;
+  return v === true;
+}
 
 /** #8142: helper's own rules, as the policy set must apply them (raw partner, no role/OS filter). */
 const HELPER_APPLICABILITY: ApplicabilityRule = { ownership: 'orgOrPartner', partnerTarget: 'partner', roleOs: 'none' };
@@ -99,6 +126,27 @@ export function helperSettingsFromRows(rows: readonly HelperRankRow[]): HelperSe
     lifecycleMode: s.lifecycleMode === 'auto' || s.lifecycleMode === 'always-on' || s.lifecycleMode === 'on-demand'
       ? s.lifecycleMode
       : undefined,
+    endpointMessaging: {
+      enabled: (s.endpointMessaging as { enabled?: unknown } | null | undefined)?.enabled === true,
+      allowUserReply: allowUserReplyFrom(s.endpointMessaging),
+    },
+  };
+}
+
+/**
+ * Attaches the partner/organization branding decision. Without an org id there
+ * is no scope, so no decision is attached and the key stays absent.
+ */
+function attachHelperBranding(
+  settings: HelperSettings | null,
+  candidates: BrandingCandidate[],
+  partnerId: string | null,
+  orgId: string | null,
+): HelperSettings | null {
+  if (!settings || !orgId) return settings;
+  return {
+    ...settings,
+    branding: buildBrandingDecision(resolvePartnerOrgBranding(candidates), brandingScopeId(partnerId ?? '', orgId)),
   };
 }
 
@@ -114,11 +162,17 @@ export async function resolveDeviceHelperSettings(deviceId: string, opts?: Devic
   // #8142: the heartbeat passes the beat's one-statement policy set.
   const set = policySetFor(deviceId, opts);
   if (set) {
-    return helperSettingsFromRows(candidatesWithLink(set, 'helper', HELPER_APPLICABILITY).map(({ candidate, link }) => ({
-      level: candidate.level,
-      assignmentPriority: candidate.priority,
-      inlineSettings: link.inlineSettings,
-    })));
+    const linked = candidatesWithLink(set, 'helper', HELPER_APPLICABILITY);
+    return attachHelperBranding(
+      helperSettingsFromRows(linked.map(({ candidate, link }) => ({
+        level: candidate.level,
+        assignmentPriority: candidate.priority,
+        inlineSettings: link.inlineSettings,
+      }))),
+      linked.map(({ candidate, link }) => ({ level: candidate.level, priority: candidate.priority, inlineSettings: link.inlineSettings })),
+      passed?.org?.partnerId ?? null,
+      passed?.orgId ?? null,
+    );
   }
 
   // 1. Load device
@@ -186,7 +240,12 @@ export async function resolveDeviceHelperSettings(deviceId: string, opts?: Devic
     ))
     .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
 
-  return helperSettingsFromRows(rows);
+  return attachHelperBranding(
+    helperSettingsFromRows(rows),
+    rows.map((r) => ({ level: r.level, priority: r.assignmentPriority, inlineSettings: r.inlineSettings })),
+    org?.partnerId ?? null,
+    device.orgId,
+  );
 }
 
 const HELPER_CACHE_TTL_SECONDS = 120;
@@ -203,23 +262,20 @@ export interface HelperConfigUpdateOptions extends DevicePolicySetOpts {
   skipCacheRead?: boolean;
   /** Source of the legacy organizations.settings.helper flag; defaults to getOrgHelperSettings. */
   loadOrgHelperSettings?: (orgId: string) => Promise<{ enabled: boolean }>;
+  /**
+   * #8616: resolve without writing the per-device Redis entry (the heartbeat
+   * sets it when its own hierarchy load failed; see PamConfigUpdateOptions).
+   */
+  skipCacheWrite?: boolean;
 }
 
-function helperCacheKey(deviceId: string): string {
-  return `helper:settings:device:${deviceId}`;
-}
-
-/** The device's cached helper settings, or null on a miss or a Redis error. */
-export async function readCachedHelperSettings(deviceId: string): Promise<HelperSettings | null> {
-  const redis = getRedis();
-  if (!redis) return null;
-  try {
-    const cached = await redis.get(helperCacheKey(deviceId));
-    return cached ? JSON.parse(cached) as HelperSettings : null;
-  } catch (cacheErr) {
-    console.warn(`[helper] Redis cache read failed for device ${deviceId}:`, cacheErr);
-    return null;
-  }
+/**
+ * The device's cached helper settings for `orgId`, or null on a miss, an
+ * entry cached while the device belonged to another org (#8257), or a Redis
+ * error.
+ */
+export async function readCachedHelperSettings(deviceId: string, orgId: string): Promise<HelperSettings | null> {
+  return readDevicePolicyCache<HelperSettings>('helper', deviceId, orgId);
 }
 
 export async function buildHelperConfigUpdate(
@@ -230,11 +286,11 @@ export async function buildHelperConfigUpdate(
   // Validate up front so a foreign hierarchy is a bug even on a cache hit here. The heartbeat
   // does its own Redis read first (readCachedHelperSettings) and never reaches this guard on a
   // hit; this covers direct callers of buildHelperConfigUpdate.
-  hierarchyFor(deviceId, opts);
-  // Validate before any cache short-circuit: a foreign set is a bug even on a hit.
-  policySetFor(deviceId, opts);
+  // Validate before any cache short-circuit: a foreign set is a bug even on a hit,
+  // and so is a hierarchy for another org than `orgId` (#8257).
+  const cacheOrgId = devicePolicyCacheOrg(deviceId, { ...opts, orgId });
   if (!opts?.skipCacheRead) {
-    const cached = await readCachedHelperSettings(deviceId);
+    const cached = await readDevicePolicyCache<HelperSettings>('helper', deviceId, cacheOrgId);
     if (cached) return cached;
   }
 
@@ -256,13 +312,8 @@ export async function buildHelperConfigUpdate(
     settings = { ...HELPER_DEFAULTS, enabled: orgEnabled };
   }
 
-  const redis = getRedis();
-  if (redis) {
-    try {
-      await redis.set(helperCacheKey(deviceId), JSON.stringify(settings), 'EX', HELPER_CACHE_TTL_SECONDS);
-    } catch (cacheErr) {
-      console.warn(`[helper] Redis cache write failed for device ${deviceId}:`, cacheErr);
-    }
+  if (!opts?.skipCacheWrite) {
+    await writeDevicePolicyCache('helper', deviceId, cacheOrgId, settings, HELPER_CACHE_TTL_SECONDS);
   }
 
   return settings;

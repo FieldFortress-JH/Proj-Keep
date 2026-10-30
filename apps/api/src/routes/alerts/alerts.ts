@@ -19,22 +19,25 @@ import {
   ticketAlertLinks,
 } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
+import { isAutomationPrincipal, isFlowPrincipal } from '../../middleware/principalKind';
 import { setCooldown } from '../../services/alertCooldown';
 import {
   ALERT_ACKNOWLEDGE_CAS_LOST_MESSAGE,
   ALERT_CAS_LOST_MESSAGE,
   ALERT_DISMISS_CAS_LOST_MESSAGE,
   ALERT_SUPPRESS_CAS_LOST_MESSAGE,
-  buildAcknowledgeAlertCas,
+  ALERT_UNSUPPRESS_CAS_LOST_MESSAGE,
   buildDismissAlertCas,
   buildResolveAlertCas,
   buildSuppressAlertCas,
+  buildUnsuppressAlertCas,
 } from '../../services/alertService';
+import { acknowledgeAlert } from '../../services/alertActions';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { publishEvent } from '../../services/eventBus';
 import { emitAlertStateFeedback } from '../../services/mlFeedbackEmitters';
 import { latestVerdictsForAlerts, projectAlertAiVerdictSummary } from '../../services/aiAgents/alertVerdicts';
-import { listAlertsSchema, resolveAlertSchema, suppressAlertSchema, bulkAlertActionSchema, type AlertStatusValue } from './schemas';
+import { listAlertsSchema, resolveAlertSchema, suppressAlertSchema, unsuppressAlertSchema, bulkAlertActionSchema, type AlertStatusValue } from './schemas';
 import { getPagination, ensureOrgAccess, getAlertWithOrgCheck, alertSiteScopeCondition } from './helpers';
 import { fillStoredAlertCopy } from './alertCopy';
 import { withAlertActorNames } from './actorNames';
@@ -622,10 +625,10 @@ alertsRoutes.post(
 
     // ONE route-level permission lookup, after the body. Reproduces what
     // `requirePermission` middleware would have done on this route and would
-    // otherwise be lost: the ai_agent rejection, and `c.set('permissions')`,
+    // otherwise be lost: the automation-principal rejection, and `c.set('permissions')`,
     // which the list handler's comment notes is set ONLY by requirePermission.
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: isFlowPrincipal(auth) ? 'Flows cannot call HTTP routes' : 'AI agents cannot call HTTP routes' });
     }
     //
     const bulkPerms = await getUserPermissions(auth.user.id, {
@@ -790,6 +793,7 @@ alertsRoutes.post(
               status: 'resolved',
               resolvedAt: now,
               resolvedBy: auth.user.id,
+              resolutionReason: 'manual',
             })
             .where(and(eq(alerts.id, alert.id), eq(alerts.status, alert.status)))
             .returning({ id: alerts.id });
@@ -942,57 +946,12 @@ alertsRoutes.post(
       return c.json({ error: `Cannot acknowledge alert with status: ${alert.status}` }, 400);
     }
 
-    const acknowledgedAt = new Date();
-    // Winner-takes-all (#4101). Updating by id alone let a stale client acknowledge
-    // an alert another tech had just resolved — stamping `status='acknowledged'`
-    // over the resolution, leaving `resolvedAt`/`resolvedBy` populated on a
-    // "reopened" alert whose escalation was already cancelled — and still publish
-    // `alert.acknowledged` for a transition that never legitimately happened.
-    const [updated] = await db
-      .update(alerts)
-      .set({
-        status: 'acknowledged',
-        acknowledgedAt,
-        acknowledgedBy: auth.user.id
-      })
-      .where(buildAcknowledgeAlertCas(alertId))
-      .returning();
-    if (!updated) {
-      // The CAS matched nothing between the read above and this write: the alert
-      // left `active` first. Everything below (event, ML feedback, audit) belongs
-      // to whoever performed that transition, not to this caller.
+    const result = await acknowledgeAlert(alertId, { kind: 'user', userId: auth.user.id });
+    if (!result.changed) {
+      // Another transition won the CAS; it owns the event, feedback and audit.
       return c.json({ error: ALERT_ACKNOWLEDGE_CAS_LOST_MESSAGE }, 409);
     }
-
-    try {
-      await publishEvent(
-        'alert.acknowledged',
-        alert.orgId,
-        {
-          alertId: updated.id,
-          ruleId: alert.ruleId,
-          deviceId: alert.deviceId,
-          acknowledgedBy: auth.user.id
-        },
-        'alerts-route',
-        { userId: auth.user.id }
-      );
-    } catch (error) {
-      console.error('[AlertsRoute] Failed to publish alert.acknowledged event:', error);
-    }
-
-    await emitAlertStateFeedback({
-      orgId: alert.orgId,
-      alertId: updated.id,
-      eventType: 'alert.acknowledged',
-      outcome: 'acknowledged',
-      actorUserId: auth.user.id,
-      occurredAt: acknowledgedAt,
-      metadata: {
-        source: 'alerts.route',
-        previousStatus: alert.status,
-      },
-    });
+    const updated = result.alert;
 
     writeRouteAudit(c, {
       orgId: alert.orgId,
@@ -1049,6 +1008,7 @@ alertsRoutes.post(
         status: 'resolved',
         resolvedAt,
         resolvedBy: auth.user.id,
+        resolutionReason: 'manual',
         resolutionNote: data.note
       })
       .where(buildResolveAlertCas(alertId))
@@ -1205,6 +1165,65 @@ alertsRoutes.post(
         nextStatus: updated.status,
         suppressedUntil: suppressedUntil ? suppressedUntil.toISOString() : null,
       },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// POST /alerts/:id/unsuppress - Lift a mute (server half of the Mute toast "Undo", #8966)
+//
+// Restores the caller-supplied pre-mute status, falling back to 'acknowledged' when
+// acknowledgedAt is set, else 'active'. Compare-and-swap on
+// status = 'suppressed' so a stale undo can never reopen a resolved/dismissed alert.
+alertsRoutes.post(
+  '/:id/unsuppress',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  zValidator('param', alertIdParamSchema),
+  zValidator('json', unsuppressAlertSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id: alertId } = c.req.valid('param');
+    const { restoreStatus: requestedStatus } = c.req.valid('json');
+
+    const alert = await getAlertWithOrgCheck(alertId, auth);
+    if (!alert) {
+      return c.json({ error: 'Alert not found' }, 404);
+    }
+    if (alert.status !== 'suppressed') {
+      return c.json({ error: ALERT_UNSUPPRESS_CAS_LOST_MESSAGE }, 409);
+    }
+
+    // The caller knows the pre-mute status; acknowledgedAt alone is only a fallback
+    // (the expiry reaper returns muted alerts to 'active' without clearing it).
+    const restoredStatus = requestedStatus ?? (alert.acknowledgedAt ? 'acknowledged' : 'active');
+    const [updated] = await db
+      .update(alerts)
+      .set({ status: restoredStatus, suppressedUntil: null })
+      .where(buildUnsuppressAlertCas(alertId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: ALERT_UNSUPPRESS_CAS_LOST_MESSAGE }, 409);
+    }
+
+    await emitAlertStateFeedback({
+      orgId: alert.orgId,
+      alertId: updated.id,
+      eventType: 'alert.reopened',
+      outcome: 'reopened',
+      actorUserId: auth.user.id,
+      occurredAt: new Date(),
+      metadata: { source: 'alerts.route', restoredStatus },
+    });
+
+    writeRouteAudit(c, {
+      orgId: alert.orgId,
+      action: 'alert.unsuppress',
+      resourceType: 'alert',
+      resourceId: updated.id,
+      resourceName: updated.title,
+      details: { previousStatus: alert.status, nextStatus: updated.status },
     });
 
     return c.json(updated);

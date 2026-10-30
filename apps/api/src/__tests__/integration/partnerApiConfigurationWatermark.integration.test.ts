@@ -25,6 +25,7 @@ import {
 import { partnerConfigurationRoutes } from '../../routes/partnerApi/configuration';
 import { createOrganization, createPartner, createSite } from './db-utils';
 import { getTestDb } from './setup';
+import { replayMigration } from './replayMigration';
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
 vi.mock('../../config/env', async (importOriginal) => {
@@ -34,10 +35,10 @@ vi.mock('../../config/env', async (importOriginal) => {
     PARTNER_API_CURSOR_SIGNING_KEY: Buffer.from('0123456789abcdef0123456789abcdef', 'utf8'),
   };
 });
-const MIGRATION_FILE = join(
-  __dirname,
-  '../../../migrations/2026-07-24-partner-export-configuration-material-state.sql',
-);
+// Replayed through replayMigration: 2027-01-12-200200 redefines
+// breeze_partner_export_assignment_orgs, which this file also defines, so a bare
+// sql.raw replay would revert it to the 07-24 body for the rest of the shard.
+const MIGRATION_FILE = '2026-07-24-partner-export-configuration-material-state.sql';
 const TENANT_INTEGRITY_MIGRATION_FILE = join(
   __dirname,
   '../../../migrations/2026-07-26-a-normalized-policy-tenant-integrity.sql',
@@ -101,10 +102,9 @@ async function restoreConfigPolicyReferenceSerialization(): Promise<void> {
 
 describe('partner desired-configuration material watermarks', () => {
   runDb('migration is idempotent and creates forced org-axis RLS', async () => {
-    const migration = readFileSync(MIGRATION_FILE, 'utf8');
     const db = getTestDb();
-    await expect(db.execute(sql.raw(migration))).resolves.toBeDefined();
-    await expect(db.execute(sql.raw(migration))).resolves.toBeDefined();
+    await expect(replayMigration(MIGRATION_FILE)).resolves.toBeUndefined();
+    await expect(replayMigration(MIGRATION_FILE)).resolves.toBeUndefined();
     const [state] = await db.execute<{ enabled: boolean; forced: boolean }>(sql`
       SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced
       FROM pg_catalog.pg_class
@@ -513,10 +513,11 @@ describe('partner desired-configuration material watermarks', () => {
     expect(settings).not.toHaveProperty('alert_rule');
     expect(settings.automation).toEqual({ items: [] });
     expect(settings.compliance).toEqual({ items: [] });
+    // #8188 (W04): the retired policy-level approval keys (autoApprove,
+    // autoApproveSeverities, autoApproveDeferralDays, apps) are absent, not
+    // empty, even though this link's mirror still carries two of them.
     expect(settings.patch).toEqual({
-      sources: ['os'], autoApprove: false, autoApproveSeverities: [],
-      autoApproveDeferralDays: 7,
-      apps: [{ source: 'third_party', packageId: 'Example.App', action: 'block' }],
+      sources: ['os'],
       scheduleFrequency: 'weekly', scheduleTime: '02:00', scheduleDayOfWeek: 'sun',
       scheduleDayOfMonth: 1, offlineBehavior: 'queue',
       rebootPolicy: 'if_required', rebootDelayMinutes: 15,
@@ -524,6 +525,8 @@ describe('partner desired-configuration material watermarks', () => {
       // canonical export is a hand-enumerated jsonb_build_object, so it is the
       // only structural coverage the export has.
       rebootAllowDeferral: false, rebootMaxDeferrals: 3, rebootDeferralMinutes: 60,
+      // #8030: unset restart-prompt text exports as null.
+      rebootPromptTitle: null, rebootPromptBody: null, rebootPromptButton: null,
       exclusiveWindowsUpdate: false,
     });
     expect(settings.maintenance).toEqual({
@@ -536,6 +539,20 @@ describe('partner desired-configuration material watermarks', () => {
       retentionDays: 30, maxEventsPerCycle: 100,
       collectCategories: ['security', 'hardware', 'application', 'system'],
       minimumLevel: 'info', collectionIntervalMinutes: 15, rateLimitPerHour: 12000,
+      applicationProviders: [],
+    });
+    await db.execute(sql`UPDATE public.config_policy_event_log_settings
+      SET application_providers = ARRAY['UPS', 'MSSQL$SQLEXPRESS']
+      WHERE feature_link_id = ${linkId('event_log')}::uuid`);
+    const providersResponse = await configurationExportApp(partner.id, org.id).request('/configuration-policies');
+    expect(providersResponse.status, await providersResponse.clone().text()).toBe(200);
+    const providersBody = await providersResponse.json() as {
+      data: Array<{ features: Array<{ type: string; settings: unknown }> }>;
+    };
+    expect(providersBody.data, JSON.stringify(providersBody)).toHaveLength(1);
+    expect(providersBody.data[0]!.features.find((feature) => feature.type === 'event_log')?.settings).toEqual({
+      ...settings.event_log as Record<string, unknown>,
+      applicationProviders: ['UPS', 'MSSQL$SQLEXPRESS'],
     });
     expect(settings.sensitive_data).toEqual({
       detectionClasses: ['credential'], includePaths: [], excludePaths: [], fileTypes: [],
@@ -551,6 +568,8 @@ describe('partner desired-configuration material watermarks', () => {
       sessionPromptMode: 'notify', consentUnavailableBehavior: 'proceed',
       notifyOnSessionEnd: true, showActiveIndicator: true,
       technicianIdentityLevel: 'name_email',
+      // #10190 W06: from the normalized column (default ON), not the mirror.
+      allowUserEndSession: true,
     });
     expect(settings.onedrive_helper).toEqual({
       silentAccountConfig: true, filesOnDemand: true, kfmSilentOptIn: false,
@@ -573,8 +592,9 @@ describe('partner desired-configuration material watermarks', () => {
     };
     const malformedPatch = malformedBody.data[0]!.features
       .find((feature) => feature.type === 'patch')!.settings;
-    expect(malformedPatch.autoApproveDeferralDays).toBe(0);
-    expect(malformedPatch.apps).toEqual([]);
+    for (const key of ['apps', 'autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays']) {
+      expect(malformedPatch).not.toHaveProperty(key);
+    }
     expect(JSON.stringify(malformedBody)).not.toContain('drop-me');
   });
 

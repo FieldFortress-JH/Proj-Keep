@@ -46,6 +46,14 @@ it('does not label partial bulk failure as success and shows both requested coun
   const call = vi.mocked(fetchWithAuth).mock.calls.find(([, init]) => init?.method === 'POST')!;
   expect(JSON.parse(call[1]!.body as string)).toEqual({ orgIds: [id, requestedId] });
 });
+it('links the client name to the org record billing tab (ui-flow W03)', async () => {
+  render(<AutopayListPage />);
+  const row = await screen.findByTestId(`autopay-row-${id}`);
+  const link = within(row).getByTestId('org-record-link');
+  expect(link).toHaveAttribute('href', `/organizations/${id}#billing`);
+  expect(link).toHaveTextContent('Example client');
+  expect(within(row).getByTestId(`autopay-client-${id}`)).toBeInTheDocument();
+});
 it('shows failed email delivery on the list and allows resending',async()=>{
  vi.mocked(fetchWithAuth).mockImplementation(async()=>Response.json({data:[{orgId:id,orgName:'Example',status:'requested',enrollment:{status:'requested'},method:null,requestNoticeStatus:'failed'}]}));
  render(<AutopayListPage/>);
@@ -116,4 +124,21 @@ it('names why a client needs attention, and a returned last charge as returned',
   expect(row).toHaveTextContent("The saved payment method can't be charged.");
   expect(row).toHaveTextContent('Returned');
   expect(row).not.toHaveTextContent('Payment received');
+});
+
+it('shows an explicit not-enabled empty state (no error, no retry, no toast) when autopay is off for the partner', async () => {
+  vi.mocked(fetchWithAuth).mockImplementation(async () => Response.json(
+    { error: 'Automatic payments are not enabled', code: 'autopay_not_enabled' }, { status: 404 }));
+  render(<AutopayListPage />);
+  const empty = await screen.findByTestId('autopay-not-enabled');
+  expect(empty).toHaveTextContent("Automatic payments aren't enabled for your account");
+  expect(screen.queryByTestId('autopay-list-error')).toBeNull();
+  expect(screen.queryByRole('button')).toBeNull();
+  expect(showToast).not.toHaveBeenCalled();
+});
+
+it('still shows the generic error for other failures', async () => {
+  vi.mocked(fetchWithAuth).mockImplementation(async () => Response.json({ error: 'boom' }, { status: 500 }));
+  render(<AutopayListPage />);
+  expect(await screen.findByTestId('autopay-list-error')).toBeInTheDocument();
 });

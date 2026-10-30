@@ -56,6 +56,24 @@ function mockInitialLoad(displayName: string | null) {
   });
 }
 
+describe('DeviceInfoTab — headings and role copy (#9030)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('starts at h2 (no h1 → h3 skip) and says an unassessed role is not assessed yet', async () => {
+    mockInitialLoad(null);
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    const headings = screen.getAllByRole('heading');
+    expect(headings.length).toBeGreaterThan(0);
+    expect(headings[0]!.tagName).toBe('H2');
+    expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
+    expect(screen.getByText('Role not assessed yet')).toBeInTheDocument();
+    expect(screen.queryByText(/^Unknown$/)).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — OS version display', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -87,6 +105,28 @@ describe('DeviceInfoTab — OS version display', () => {
     expect(screen.getByText('macOS')).toBeInTheDocument();
     expect(screen.getByText('26.5.1')).toBeInTheDocument();
     expect(screen.queryByText('macOS 26.5.1')).toBeNull();
+  });
+
+  it('derives the OS Build row from a bare NT osVersion like the header does (#9610)', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          osVersion: '10.0.22631.4317',
+          osBuild: '',
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText('Operating System');
+    const label = screen.getByText('OS Build');
+    expect(label.parentElement).toHaveTextContent('22631');
   });
 
   it('capitalizes Linux distro names in the OS Version row', async () => {
@@ -240,7 +280,7 @@ describe('DeviceInfoTab — stuck agent update (#4073)', () => {
   });
 });
 
-describe('DeviceInfoTab — logs silent (#7067)', () => {
+describe('DeviceInfoTab — no logs-silent notice (#7067)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -257,37 +297,17 @@ describe('DeviceInfoTab — logs silent (#7067)', () => {
     });
   }
 
-  it('shows the logs-silent notice for an online device quiet past the threshold', async () => {
+  // Agents ship warn+ by default, so log quiet is normal — no notice from
+  // last_log_at recency alone, whether stale or never set.
+  it('shows no notice for an online device log-quiet past six hours', async () => {
     load({ lastLogAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
-    render(<DeviceInfoTab deviceId={deviceId} />);
-    expect(await screen.findByTestId('logs-silent')).toBeInTheDocument();
-  });
-
-  it('formats the logs-silent date without seconds, like the stuck-update notice', async () => {
-    const d = new Date(Date.now() - 7 * 60 * 60_000);
-    d.setSeconds(37, 0);
-    load({ lastLogAt: d.toISOString() });
-    render(<DeviceInfoTab deviceId={deviceId} />);
-    const notice = await screen.findByTestId('logs-silent');
-    expect(notice.textContent).not.toMatch(/\d:\d\d:37/);
-    expect(notice.textContent).toMatch(/\d:\d\d/);
-  });
-
-  it('shows the never-shipped variant when the device has no last_log_at but has been enrolled long enough', async () => {
-    load({ lastLogAt: null, enrolledAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
-    render(<DeviceInfoTab deviceId={deviceId} />);
-    expect(await screen.findByTestId('logs-silent')).toBeInTheDocument();
-  });
-
-  it('shows no notice for an online device with recent logs', async () => {
-    load({ lastLogAt: new Date(Date.now() - 60_000).toISOString() });
     render(<DeviceInfoTab deviceId={deviceId} />);
     await screen.findByText('Operating System');
     expect(screen.queryByTestId('logs-silent')).toBeNull();
   });
 
-  it('shows no notice for an offline device with a stale last_log_at', async () => {
-    load({ status: 'offline', lastLogAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
+  it('shows no notice for a long-enrolled device that has never shipped a log', async () => {
+    load({ lastLogAt: null, enrolledAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
     render(<DeviceInfoTab deviceId={deviceId} />);
     await screen.findByText('Operating System');
     expect(screen.queryByTestId('logs-silent')).toBeNull();
@@ -697,5 +717,306 @@ describe('DeviceInfoTab — Breeze Assist install issue (#6925)', () => {
     render(<DeviceInfoTab deviceId={deviceId} />);
     await screen.findByText('Operating System');
     expect(screen.queryByTestId('helper-install-issue')).toBeNull();
+  });
+
+  // #10183, #10185 (#10190 W01): Assist installed but not run by the agent.
+  it.each([
+    ['webview2_outdated', /WebView2 Runtime is older than Breeze Assist needs/, 'Unavailable: WebView2 Runtime too old'],
+    ['crash_loop', /kept closing right after it started.*6 hours/, 'Unavailable: keeps closing'],
+    ['unmanaged_install', /not installed by Breeze.*Deploy is off/, 'Unavailable: not installed by Breeze'],
+  ])('explains %s and shows Assist unavailable', async (issue, notice, status) => {
+    load({ helperVersion: '0.125.0', helperInstallIssue: issue, helperInstallIssueSince: '2026-10-01T00:00:00.000Z' });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    expect((await screen.findByTestId('helper-install-issue')).textContent).toMatch(notice);
+    expect(screen.getByTestId('assist-status').textContent).toContain(status);
+  });
+
+  it.each([
+    [{ helperVersion: '0.125.0', helperInstallIssue: null }, 'Installed'],
+    [{ helperVersion: null, helperInstallIssue: null }, 'Not deployed'],
+    [{ helperVersion: null, helperInstallIssue: 'awaiting_server_offer' }, 'Unavailable: not installed yet'],
+  ])('derives the Breeze Assist row from %j', async (extra, status) => {
+    load(extra);
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    expect((await screen.findByTestId('assist-status')).textContent).toBe(`Breeze Assist${status}`);
+  });
+});
+
+// #8620 — terminal watchdog-install failure banner. Read-only: the API only
+// sends a `watchdogInstall` view for terminal states, and the banner never
+// renders the raw error-class token.
+describe('DeviceInfoTab — watchdog install banner (#8620)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  const SINCE = '2026-12-20T00:00:00.000Z';
+
+  it('explains a gave_up install with a localized reason, the since-date and the remedy', async () => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass: 'signature', since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).toMatch(/could not be installed automatically/i);
+    expect(notice.textContent).toMatch(/signature/i);
+    expect(notice.textContent).toContain('service install --watchdog');
+    expect(notice.textContent).toContain(new Date(SINCE).toLocaleDateString());
+    // The raw class token is never rendered.
+    expect(notice.textContent).not.toContain('install_cmd');
+  });
+
+  it('renders the retry command as inline code, not literal backticks (#8667)', async () => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass: 'signature', since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).not.toContain('`');
+    const code = notice.querySelector('code');
+    expect(code).not.toBeNull();
+    expect(code?.textContent).toBe('breeze-agent service install --watchdog');
+    expect(notice.textContent).toMatch(/on the host to retry\.$/);
+  });
+
+  it('maps an error class through the fixed phrase table, never the raw token', async () => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass: 'install_cmd', since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).not.toContain('install_cmd');
+    expect(notice.textContent).toMatch(/install command/i);
+  });
+
+  it.each([
+    'network', 'server', 'policy', 'signature', 'checksum',
+    'dev_build', 'unsupported_os', 'install_cmd', 'locked', 'unknown',
+  ])('class %s resolves to a real localized phrase (no raw key, no raw token)', async (errorClass) => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass, since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).not.toContain('deviceInfoTab.');
+    // Only snake_case tokens are distinguishable from the English phrases.
+    if (errorClass.includes('_')) expect(notice.textContent).not.toContain(errorClass);
+    expect(notice.textContent).toMatch(/\(since .+\): [a-z]/i);
+  });
+
+  it('renders a dash, not Invalid Date, when since is null', async () => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass: 'network', since: null } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).toContain('—');
+    expect(notice.textContent).not.toMatch(/invalid date/i);
+  });
+
+  it('falls back to the generic reason for an unknown class', async () => {
+    load({ watchdogInstall: { state: 'gave_up', errorClass: 'brand_new_class', since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).not.toContain('brand_new_class');
+    expect(notice.textContent).toMatch(/could not be installed automatically/i);
+  });
+
+  it('shows a neutral notice for an unsupported host', async () => {
+    load({ watchdogInstall: { state: 'unsupported', errorClass: 'unsupported_os', since: SINCE } });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('watchdog-install-issue');
+    expect(notice.textContent).toMatch(/not supported/i);
+    expect(notice.textContent).not.toContain('unsupported_os');
+  });
+
+  it.each([
+    ['null', null],
+    ['an in-progress state', { state: 'retrying', errorClass: 'network', since: SINCE }],
+    ['a deliberate opt-out', { state: 'opted_out', errorClass: null, since: SINCE }],
+  ])('renders nothing for %s', async (_label, watchdogInstall) => {
+    load({ watchdogInstall });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('watchdog-install-issue')).toBeNull();
+  });
+
+  it('renders nothing when the payload has no watchdogInstall key (older API)', async () => {
+    load({});
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('watchdog-install-issue')).toBeNull();
+  });
+});
+
+describe('DeviceInfoTab — log shipping health line (#8609)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  async function renderLoaded() {
+    const result = render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    return result;
+  }
+
+  it.each([
+    ['absent', {}],
+    ['null', { logShipping: null }],
+    ['unknown', { logShipping: { state: 'unknown', failingSince: null, lastError: null } }],
+  ])('renders nothing when logShipping is %s (dormant until agents report)', async (_n, extra) => {
+    load(extra);
+    await renderLoaded();
+    expect(screen.queryByTestId('log-shipping-health')).toBeNull();
+    expect(screen.queryByText('Log shipping')).toBeNull();
+  });
+
+  it('shows a healthy chip', async () => {
+    load({ logShipping: { state: 'healthy', failingSince: null, lastError: null } });
+    await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.textContent).toBe('Healthy');
+    expect(chip.getAttribute('data-state')).toBe('healthy');
+  });
+
+  it('shows a quiet chip', async () => {
+    load({ logShipping: { state: 'quiet', failingSince: null, lastError: null } });
+    await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.textContent).toBe('Quiet');
+    expect(chip.getAttribute('title')).toMatch(/no recent upload attempts/i);
+  });
+
+  it('shows failing with since-date and the localized reason in the tooltip', async () => {
+    load({
+      logShipping: { state: 'failing', failingSince: '2026-10-01T00:00:00.000Z', lastError: 'connection refused' },
+    });
+    await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.textContent).toBe('Failing');
+    const title = chip.getAttribute('title') ?? '';
+    expect(title).toContain(new Date('2026-10-01T00:00:00.000Z').toLocaleDateString());
+    expect(title).toMatch(/connection was refused/i);
+    expect(title).not.toContain('connection refused');
+  });
+
+  it('renders the status code for an http reason', async () => {
+    load({ logShipping: { state: 'failing', failingSince: '2026-10-01T00:00:00.000Z', lastError: 'http 503' } });
+    await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.getAttribute('title')).toContain('HTTP 503');
+    expect(chip.getAttribute('title')).not.toContain('http 503');
+  });
+
+  it('never renders raw text for an unrecognized lastError', async () => {
+    load({
+      logShipping: {
+        state: 'failing',
+        failingSince: '2026-10-01T00:00:00.000Z',
+        lastError: 'dial tcp 10.1.2.3:443: <script>boom</script>',
+      },
+    });
+    const { container } = await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.getAttribute('title')).toMatch(/unspecified/i);
+    expect(container.innerHTML).not.toContain('10.1.2.3');
+    expect(container.innerHTML).not.toContain('boom');
+  });
+
+  it.each([
+    ['timeout', /request timed out/i],
+    ['dns', /could not be resolved/i],
+    ['connection refused', /connection was refused/i],
+    ['tls', /secure connection failed/i],
+    ['auth rejected', /rejected the agent credentials/i],
+    ['url unresolved', /address could not be determined/i],
+    ['other', /another upload error/i],
+  ])('maps lastError %s to its own localized reason', async (raw, expected) => {
+    load({ logShipping: { state: 'failing', failingSince: '2026-10-01T00:00:00.000Z', lastError: raw } });
+    await renderLoaded();
+    const title = (await screen.findByTestId('log-shipping-health')).getAttribute('title') ?? '';
+    expect(title).toMatch(expected);
+    expect(title).not.toMatch(new RegExp(`Reason: ${raw}`, 'i'));
+    expect(title).not.toMatch(/unspecified/i);
+  });
+
+  it.each(['http 5xx', 'http 99999', 'http 50', 'http 503 ', 'HTTP 503', 'http 503\nx'])(
+    'falls back to unspecified for malformed http reason %j',
+    async (raw) => {
+      load({ logShipping: { state: 'failing', failingSince: '2026-10-01T00:00:00.000Z', lastError: raw } });
+      await renderLoaded();
+      const title = (await screen.findByTestId('log-shipping-health')).getAttribute('title') ?? '';
+      expect(title).toMatch(/unspecified/i);
+    },
+  );
+
+  it('shows a dash instead of "Invalid Date" for a malformed failingSince', async () => {
+    load({ logShipping: { state: 'failing', failingSince: 'garbage', lastError: 'timeout' } });
+    await renderLoaded();
+    const title = (await screen.findByTestId('log-shipping-health')).getAttribute('title') ?? '';
+    expect(title).not.toContain('Invalid Date');
+    expect(title).toContain('since —');
+  });
+
+  it('falls back to unspecified when failing with no lastError', async () => {
+    load({ logShipping: { state: 'failing', failingSince: null, lastError: null } });
+    await renderLoaded();
+    const chip = await screen.findByTestId('log-shipping-health');
+    expect(chip.getAttribute('title')).toMatch(/unspecified/i);
+  });
+});
+
+describe('DeviceInfoTab — logs not arriving after a level raise (#8612)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it.each([
+    ['absent', {}],
+    ['null', { logsNotArriving: null }],
+  ])('renders nothing when logsNotArriving is %s', async (_n, extra) => {
+    load({ logShipping: { state: 'healthy', failingSince: null, lastError: null }, ...extra });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('logs-not-arriving')).toBeNull();
+  });
+
+  it('shows a neutral observational line with the raise time', async () => {
+    const since = '2026-10-13T11:50:00.000Z';
+    load({
+      logShipping: { state: 'healthy', failingSince: null, lastError: null },
+      logsNotArriving: { since },
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const line = await screen.findByTestId('logs-not-arriving');
+    expect(line.textContent).toMatch(/No logs received since the log level was raised/);
+    expect(line.textContent).not.toMatch(/fail|error|broken/i);
+    expect(line.textContent).toContain('2026');
   });
 });

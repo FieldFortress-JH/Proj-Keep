@@ -10,6 +10,20 @@ import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import ConnectDesktopButton from './ConnectDesktopButton';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
+
+/**
+ * The copied link is pasted into email/chat, so it must be absolute. An API
+ * without a configured public base returns a bare `/quick?code=…` path (#10508);
+ * resolve it against this page's origin, which serves `/quick`.
+ */
+function toAbsoluteUrl(url: string): string {
+  try {
+    return new URL(url, window.location.origin).toString();
+  } catch {
+    return url;
+  }
+}
 
 export type SupportSessionStatus =
   | 'pending'
@@ -127,7 +141,7 @@ export default function QuickSupportPage() {
     setSelectedId(null);
     // Strip the fragment without leaving a bare "#" (and without a hashchange
     // round-trip — the state is already cleared above).
-    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    replaceUrl(`${window.location.pathname}${window.location.search}`);
   }, [setSelectedId]);
 
   // Poll the selected session until it reaches a terminal state. The first pass
@@ -482,7 +496,7 @@ export default function QuickSupportPage() {
                 <button
                   type="button"
                   data-testid="quick-support-copy-link"
-                  onClick={() => copy(createdCode.landingUrl, t('quickSupport.code.copiedLink'))}
+                  onClick={() => copy(toAbsoluteUrl(createdCode.landingUrl), t('quickSupport.code.copiedLink'))}
                   className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm transition hover:bg-muted"
                 >
                   <Link2 className="h-4 w-4" />

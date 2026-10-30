@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { isIP } from 'node:net';
-import { softwareInventoryReportSchema } from '@breeze/shared';
+import { softwareInventoryReportSchema, type RestorePointOutcome } from '@breeze/shared';
+import { promptHostTelemetrySchema } from '@breeze/shared/promptHost';
+import { redactSecretsFromOutput } from '../../services/secretRedaction';
+import { MAX_AGENT_WARRANTY_ENTITLEMENTS } from '../../services/warrantyDataSources';
+import { PG_UUID_REGEX } from '../../utils/uuid';
 
 // ============================================
 // Enrollment
@@ -63,7 +67,15 @@ export const enrollSchema = z.object({
     mac: z.string().optional(),
     ip: z.string().optional(),
     isPrimary: z.boolean().optional()
-  })).max(100).optional()
+  })).max(100).optional(),
+  // #8318 wave 1b — the capabilities a new install declares at enrollment.
+  // Only the rebind protocol so far: enroll records it, because a freshly
+  // enrolled install is exactly the device a reattach makes the SOURCE (§6.2).
+  // Same tolerant contract as the heartbeat's securityCapabilities: a
+  // malformed value drops this field alone and never fails the enrollment.
+  securityCapabilities: z.object({
+    rebindProtocolVersion: z.number().int().optional().catch(undefined),
+  }).optional().catch(undefined),
 });
 
 // ============================================
@@ -147,10 +159,40 @@ const agentHealthObservationWireV1Schema = z.object({
   observedAt: z.string().datetime({ offset: true }),
 }).strict();
 
+// #8382 — the closed set of reasons an agent refuses a signed identity
+// assertion (agent/internal/heartbeat/identity_sync.go):
+// - env_override: it gave up, and BREEZE_ORG_ID / BREEZE_SITE_ID are set in
+//   its environment, which override agent.yaml on every start.
+// - gave_up: restarting did not apply the identity, so it stopped trying for
+//   the life of the process.
+// - unpinned_key: the assertion is signed by a key it never pinned.
+// - invalid: the assertion did not verify for any other lasting reason.
+// Agents before #8623 also sent gave_up (or env_override, with those variables
+// set) when they could not write their restart marker; newer agents retry that
+// write and report nothing, since a local write failure is not a refusal.
+export const IDENTITY_ASSERTION_REJECTION_CODES = ['env_override', 'gave_up', 'unpinned_key', 'invalid'] as const;
+
+export const identityAssertionRejectionSchema = z.object({
+  code: z.enum(IDENTITY_ASSERTION_REJECTION_CODES),
+  orgId: z.string().uuid(),
+  siteId: z.string().uuid(),
+}).strict();
+
+export type IdentityAssertionRejection = z.infer<typeof identityAssertionRejectionSchema>;
+
 export const heartbeatSchema = z.object({
   // Version/shape failures are report-local and must not reject the heartbeat.
   networkContextV1: z.unknown().optional(),
   networkContextReset: z.unknown().optional(),
+  // #8608 — log-shipping health. z.unknown() so a malformed object can never
+  // reject the beat; services/logShippingHealth.parseLogShipping strict-parses
+  // it separately (a bad value is `invalid`, never coerced to a healthy zero).
+  logShipping: z.unknown().optional(),
+  // #8620 — watchdog install health. OPTIONAL (old agents omit it) and
+  // z.unknown() so a malformed object can never reject the beat;
+  // services/watchdogInstallHealth.parseWatchdogInstall strict-parses it
+  // separately (a bad value is `invalid`: no state change, never coerced).
+  watchdogInstall: z.unknown().optional(),
   metrics: z.object({
     cpuPercent: z.number(),
     ramPercent: z.number(),
@@ -190,6 +232,23 @@ export const heartbeatSchema = z.object({
   status: z.enum(['ok', 'warning', 'error']),
   agentVersion: z.string(),
   helperVersion: z.string().max(20).optional().catch(undefined),
+  // Caller verification readiness (#6354 W02): console logins whose Assist
+  // helper can render the card right now. Telemetry, not authorization; a
+  // malformed report degrades to "absent" (readiness cleared), never a 400.
+  helperCapabilities: z.object({
+    callerVerify: z.boolean(),
+    usernames: z.array(z.string().min(1).max(255)).max(32),
+    // #10190 W02 — what the console session's renderer advertised at its live
+    // IPC auth (`kinds` may be [], a W02 renderer advertises none). The
+    // shared contract schema (non-strict, so a newer agent's additive key is
+    // stripped, not fatal). Telemetry only: a malformed block drops to
+    // absent on its own, never the readiness beside it or the beat.
+    promptHost: promptHostTelemetrySchema.optional().catch(undefined),
+  }).optional().catch(undefined),
+  // #8869 — Encrypted Client Hello telemetry. Both are informational counters
+  // only (no DB column): a malformed value drops to absent, never a 400.
+  echActive: z.boolean().optional().catch(undefined),
+  filterSignatureSeenAt: z.string().datetime({ offset: true }).optional().catch(undefined),
   // #6925 — Breeze Assist install problem the agent is stuck on (e.g.
   // 'awaiting_server_offer'). Omitted when there is none, and the route reads
   // absence as "healthy, clear it". A present but malformed value therefore
@@ -265,6 +324,17 @@ export const heartbeatSchema = z.object({
     // change, not a migration.
     deferralsUsed: z.number().int().min(0).max(10).optional().catch(undefined),
     maxDeferrals: z.number().int().min(0).max(10).optional().catch(undefined),
+    // #10190 W05 — the most recent decision the person at the keyboard made
+    // on the restart prompt. The agent re-sends it on every beat while the
+    // restart stays scheduled, so it is an audit INPUT (deduped per
+    // atUnixMs in services/rebootUserActionAudit.ts), never a stored column.
+    // A malformed value degrades to undefined on its own: it must never fail
+    // the heartbeat or drop the schedule it rides on.
+    lastUserAction: z.object({
+      action: z.enum(['postponed', 'restart_now']),
+      atUnixMs: z.number().int().nonnegative(),
+      renderer: z.enum(['assist', 'native', 'headless']),
+    }).optional().catch(undefined),
   }).nullish().catch(undefined),
   lastUser: z.string().max(255).optional().catch(undefined),
   uptime: z.number().int().min(0).optional().catch(undefined),
@@ -362,6 +432,9 @@ export const heartbeatSchema = z.object({
     peripheralPolicyProtocolVersion: z.number().int().optional().catch(undefined),
     rollbackProtocolVersion: z.number().int().optional().catch(undefined),
     pamLifetimeProtocolVersion: z.number().int().optional().catch(undefined),
+    pamReconciliationResetProtocolVersion: z.number().int().optional().catch(undefined),
+    // #8928: PAM outcome notices (pam_request_notify). Same tolerant contract.
+    pamUserNotifyProtocolVersion: z.number().int().optional().catch(undefined),
     // Revocation lease (fail-closed desktop session revalidation). Same
     // tolerant contract: a malformed value drops this field alone, since the
     // route treats anything other than exactly 1 as "not capable".
@@ -378,6 +451,25 @@ export const heartbeatSchema = z.object({
     // #3834 workload inventory capability. Same tolerant contract: a malformed
     // value drops this field alone rather than rejecting the beat.
     workloadInventoryProtocolVersion: z.number().int().optional().catch(undefined),
+    // #8317 — the agent verifies a signed identity assertion and adopts the
+    // row's org/site. Same tolerant contract. 1 = v1 assertions; 2 or later =
+    // v2, which adds the ownership epoch (#8206); anything else means no
+    // assertion is sent.
+    identitySyncProtocolVersion: z.number().int().optional().catch(undefined),
+    // #8616 — the agent honours the response's `retainState` list. Parse-only
+    // (never persisted): the beat being answered is the only source of truth.
+    // Same tolerant contract; anything but exactly 1 gets the legacy payload.
+    retainStateProtocolVersion: z.number().int().optional().catch(undefined),
+    // #10190 W03 — the agent caches the response's `promptIdentity` block (the
+    // MSP name, colour and logo metadata drawn on every device prompt) and
+    // fetches the logo from GET /:id/prompt-identity/logo. Parse-only, never
+    // persisted; anything but exactly 1 gets no block.
+    promptIdentityProtocolVersion: z.number().int().optional().catch(undefined),
+    // #8318 wave 1b — the bounded rebind (reinstall reattach, §6.2). Recorded
+    // non-sticky on every main and parked beat; 1 makes the device eligible to
+    // be the source of a reattach and to receive the signed `rebind`
+    // directive. Same tolerant contract as its siblings.
+    rebindProtocolVersion: z.number().int().optional().catch(undefined),
     pamReconciliation: z.object({
       unresolvedCount: z.number().int().nonnegative(),
       quarantinedCount: z.number().int().nonnegative(),
@@ -394,6 +486,25 @@ export const heartbeatSchema = z.object({
       ]).refine((value) => value.length <= 64).optional(),
     }).optional().catch(undefined),
   }).optional().catch(undefined),
+  // #8317 — the identity the agent holds in agent.yaml, and a per-beat nonce
+  // the signed identity assertion must echo. Compared with the row so a moved
+  // device can be sent one. Informational: a malformed value drops the field
+  // and the beat proceeds without an assertion.
+  reportedIdentity: z.object({
+    deviceId: z.string().uuid(),
+    orgId: z.string().uuid(),
+    siteId: z.string().uuid(),
+    nonce: z.string().regex(/^[0-9a-f]{32}$/),
+    // #8206 — the PAM ownership epoch whose identity the agent loaded (v2
+    // agents; absent until it has received one). Its own catch: a malformed
+    // epoch drops this field alone, never the identity sync above.
+    ownershipEpoch: z.number().int().positive().max(2_147_483_647).optional().catch(undefined),
+  }).optional().catch(undefined),
+  // #8382 — why the agent refused the last identity assertion, and the
+  // org/site that assertion named. The server stops signing for that target
+  // for a while instead of signing one every beat. Same tolerant contract: a
+  // malformed value drops this field alone and the server signs as before.
+  identityAssertionRejection: identityAssertionRejectionSchema.optional().catch(undefined),
   // Signed rollback progress is informational and restart-resend safe. A
   // malformed optional observation must never take the ordinary heartbeat
   // offline; the server simply withholds an acknowledgement for that value.
@@ -516,6 +627,146 @@ export function commandResultResultByteLength(val: unknown): number | null {
   }
 }
 
+/**
+ * Typed refusal codes an agent may set on a failed command result's
+ * `errorCode` (#4026), so the API classifies a failure by meaning instead of by
+ * matching the agent's English `error` prose (classifyCommandFailure).
+ *
+ * MIRRORS agent/internal/wire/errorcodes.go `AllCommandErrorCodes`. Pinned in
+ * both directions — schemas.commandResult.test.ts here and
+ * TestCommandErrorCodesMatchServerSchema in Go — so a one-sided edit fails CI.
+ * Keep one plain string literal per line: the Go test parses this array.
+ */
+export const AGENT_COMMAND_ERROR_CODES = [
+  'path_not_found',
+  'path_exists',
+  'file_too_large',
+  'payload_too_large',
+  'path_is_directory',
+  'sensitive_path_denied',
+  'system_path_denied',
+  'top_level_delete_denied',
+  'contents_unverifiable',
+  'directory_too_large',
+  'copy_into_self',
+  'trash_metadata_too_large',
+  'unsupported_encoding',
+  'invalid_argument',
+  'scan_in_progress',
+] as const;
+
+export type AgentCommandErrorCode = (typeof AGENT_COMMAND_ERROR_CODES)[number];
+
+const AGENT_COMMAND_ERROR_CODE_SET: ReadonlySet<string> = new Set(AGENT_COMMAND_ERROR_CODES);
+
+export function isAgentCommandErrorCode(value: unknown): value is AgentCommandErrorCode {
+  return typeof value === 'string' && AGENT_COMMAND_ERROR_CODE_SET.has(value);
+}
+
+/**
+ * The ten statuses an agent can report for a System Restore checkpoint
+ * attempt (#4609, W06 #4757). Mirrors `Status` in
+ * agent/internal/systemrestore/types.go. 'requested' is deliberately absent:
+ * it is server-only, written at command-creation time, and an agent claiming
+ * it is malformed. Pinned against the shared union and the ledger statuses in
+ * restorePointResultSchema.test.ts.
+ */
+export const RESTORE_POINT_OUTCOME_STATUSES = [
+  'created',
+  'existing_accepted',
+  'skipped_disabled',
+  'skipped_definition_only',
+  'skipped_no_mutation',
+  'unsupported',
+  'busy',
+  'insufficient_privileges',
+  'verification_failed',
+  'failed',
+] as const satisfies ReadonlyArray<RestorePointOutcome['status']>;
+
+const RESTORE_POINT_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+/** The ledger's duration/age/frequency columns are Postgres `integer`. */
+const PG_INT4_MAX = 2_147_483_647;
+
+/**
+ * The agent's checkpoint outcome, carried under the top-level `restorePoint`
+ * key of a command result. Validated INSIDE the ingest step, never at the
+ * transport (see `commandResultSchema.restorePoint`). Unknown keys are stripped.
+ */
+export const restorePointOutcomeSchema = z.object({
+  status: z.enum(RESTORE_POINT_OUTCOME_STATUSES),
+  // Echo of the server-stamped request id; the ledger column is uuid, so a
+  // non-uuid value is rejected here rather than raising 22P02 in the UPDATE.
+  requestId: z.string().max(64).regex(RESTORE_POINT_UUID_REGEX),
+  // STRING, never a number: Windows sequence numbers are INT64 and exceed the
+  // JS safe-integer range, so a numeric field would silently round large values.
+  sequenceNumber: z
+    .string()
+    .regex(/^-?[0-9]{1,20}$/)
+    // Zod runs this even after the regex fails, so re-check the shape before
+    // BigInt() (which throws on non-decimal input).
+    .refine((v) => {
+      if (!/^-?[0-9]{1,20}$/.test(v)) return false;
+      const n = BigInt(v);
+      return n >= INT64_MIN && n <= INT64_MAX;
+    }, 'sequenceNumber is outside the int64 range')
+    .optional(),
+  description: z.string().max(512).optional(),
+  message: z.string().max(10_000).optional(),
+  // Agent clock; parsed defensively at ingest (the Go agent may send '').
+  attemptedAt: z.string().max(64),
+  durationMs: z.number().int().min(0).max(PG_INT4_MAX),
+  existingPointAgeMinutes: z.number().int().min(0).max(PG_INT4_MAX).optional(),
+  frequencyMinutes: z.number().int().min(0).max(PG_INT4_MAX).optional(),
+});
+
+// Compile-time: the parsed shape is assignable to the shared wire type.
+const _restorePointOutcomeMatchesShared = (o: z.infer<typeof restorePointOutcomeSchema>): RestorePointOutcome => o;
+void _restorePointOutcomeMatchesShared;
+
+export type RestorePointOutcomeClassification =
+  | { ok: true; outcome: RestorePointOutcome }
+  | { ok: false; reason: 'unknown_status' | 'malformed' };
+
+/**
+ * Validate a raw agent-supplied `restorePoint` value. Never throws.
+ * `unknown_status` is an otherwise-recognisable outcome whose status is not one
+ * of the ten (a future agent value, or the server-only 'requested');
+ * everything else that fails is `malformed`.
+ */
+export function classifyRestorePointOutcome(raw: unknown): RestorePointOutcomeClassification {
+  const parsed = restorePointOutcomeSchema.safeParse(raw);
+  if (parsed.success) {
+    // #2434: `message` / `description` are agent-authored free text (a VSS or
+    // PowerShell error can embed a path or token). Redacted HERE, at the one
+    // parse point, so both consumers -- the stored device_commands result and
+    // the ledger row (exported as `included`) -- only ever see redacted text.
+    const outcome = parsed.data;
+    return {
+      ok: true,
+      outcome: {
+        ...outcome,
+        ...(outcome.message !== undefined ? { message: redactSecretsFromOutput(outcome.message) } : {}),
+        ...(outcome.description !== undefined ? { description: redactSecretsFromOutput(outcome.description) } : {}),
+      },
+    };
+  }
+  const statusIsUnknownString =
+    raw !== null &&
+    typeof raw === 'object' &&
+    typeof (raw as { status?: unknown }).status === 'string' &&
+    parsed.error.issues.some((issue) => issue.path.length === 1 && issue.path[0] === 'status');
+  return { ok: false, reason: statusIsUnknownString ? 'unknown_status' : 'malformed' };
+}
+
+/** The validated outcome, or null when absent/invalid. Never throws. */
+export function parseRestorePointOutcome(raw: unknown): RestorePointOutcome | null {
+  const classified = classifyRestorePointOutcome(raw);
+  return classified.ok ? classified.outcome : null;
+}
+
 export const commandResultSchema = z.object({
   status: z.enum(['completed', 'failed', 'timeout']),
   exitCode: z.number().int().optional(),
@@ -527,6 +778,31 @@ export const commandResultSchema = z.object({
   // which the server falls back to reconstructing from durationMs.
   startedAt: z.string().datetime().optional(),
   error: z.string().max(10_000).optional(),
+  // #4026 typed refusal code. Deliberately a lenient string, NOT
+  // z.enum(AGENT_COMMAND_ERROR_CODES): a newer agent may emit a code this API
+  // has not learned yet, and rejecting the whole command_result over it would
+  // lose the outcome. Unknown codes pass through and the classifier treats
+  // them as absent (prose fallback); a malformed value is dropped via
+  // `.catch` rather than failing the parse.
+  errorCode: z.string().max(64).optional().catch(undefined),
+  // #4609 W06: the System Restore checkpoint outcome. Deliberately LENIENT at
+  // the transport (same reasoning as errorCode): a newer agent may add a status
+  // this API has not learned, and a 400 here would strand a completed patch /
+  // script / install. Validated by classifyRestorePointOutcome inside the
+  // ingest step, after the terminal compare-and-set.
+  restorePoint: z.unknown().optional(),
+  // #3525 cancellation marker, mirrored from the agent's CommandResult
+  // (`agent/internal/websocket/client.go`, `agent/internal/remote/tools/types.go`).
+  // It is the proof `handleScriptResult` needs to close a `cancelling`
+  // execution as `cancelled`/`confirmed` when the script's own result beats the
+  // cancel ack. Before #10377 neither key was declared, so `z.object` stripped
+  // them on both transports and every such race ended `failed`/`unconfirmed`.
+  // Lenient like errorCode: a malformed marker is dropped (the result lands on
+  // the honest unproven path) rather than failing the parse and losing the
+  // outcome. PG_UUID_REGEX because the id is compared against the uuid-typed
+  // `cancel_command_id`, where a non-uuid string would raise 22P02.
+  cancelled: z.boolean().optional().catch(undefined),
+  cancelledByCommandId: z.string().regex(PG_UUID_REGEX).optional().catch(undefined),
   result: z.any().optional().refine(
     (val) => {
       const size = commandResultResultByteLength(val);
@@ -557,7 +833,9 @@ export const securityProviderValues = [
   'emsisoft',
   'webroot',
   'withsecure',
-  'other'
+  'cylance',
+  'other',
+  'unknown'
 ] as const;
 
 export type SecurityProviderValue = (typeof securityProviderValues)[number];
@@ -697,12 +975,33 @@ const warrantyDateSchema = z.string().max(50).optional()
     return d.toISOString().slice(0, 10);
   });
 
+/**
+ * One entitlement from an agent collector (#5511 W01, D10). HP CMSL reports N
+ * of these per device out of `HP_Entitlements`; the macOS plist collector
+ * reports none and keeps using the flat `coverageType` fields below.
+ *
+ * `provider` is deliberately NOT part of the wire shape. The server derives it
+ * from `source` (`warrantyEntitlementProviderForSource`): an agent that could
+ * name the vendor could label HP coverage as Apple. `z.object` strips it
+ * silently, and the schema test pins that.
+ *
+ * Dates run through the same `warrantyDateSchema` as the flat fields, so HP's
+ * own per-entitlement dates are preserved as reported, as ISO `YYYY-MM-DD`.
+ */
+const agentWarrantyEntitlementSchema = z.object({
+  serviceLevelDescription: z.string().max(200).optional(),
+  entitlementType: z.string().max(200).optional(),
+  startDate: warrantyDateSchema,
+  endDate: warrantyDateSchema,
+});
+
 export const agentWarrantyInfoSchema = z.object({
   source: z.string().min(1).max(50),
   manufacturer: z.string().min(1).max(100),
   coverageEndDate: warrantyDateSchema,
   coverageStartDate: warrantyDateSchema,
   coverageType: z.string().max(200).optional(),
+  entitlements: z.array(agentWarrantyEntitlementSchema).max(MAX_AGENT_WARRANTY_ENTITLEMENTS).optional(),
   // Coverage kind derived from the macOS NDO label verb: 'subscription'
   // ("Renews ...") vs 'fixed' ("Expires ..."). Empty/absent when unknown.
   // Accept '' for back-compat: older agents (and timestamp-only/labelless/
@@ -899,6 +1198,12 @@ const pendingPatchSchema = z.object({
   externalId: z.string().optional(),
   category: z.string().optional(),
   severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
+  // Provenance of `severity` (#9387): 'vendor' or 'derived'. Deliberately a
+  // free string, narrowed at ingest: an unrecognised value from a newer agent
+  // is dropped (stored as NULL) rather than rejecting the whole scan — and so
+  // is a malformed one (`.catch`), since a bad provenance label must never
+  // cost the device its whole patch inventory.
+  severitySource: z.string().max(32).optional().catch(undefined),
   size: z.number().int().optional(),
   requiresRestart: z.boolean().optional(),
   releaseDate: z.string().optional(),
@@ -998,27 +1303,36 @@ export const agentLogIngestSchema = z.object({
 // Event Logs
 // ============================================
 
+export const EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER = '(no message text)';
+
+export const eventLogRowSchema = z.object({
+  timestamp: z.string().min(1),
+  level: z.enum(['info', 'warning', 'error', 'critical']),
+  category: z.enum(['security', 'hardware', 'application', 'system']),
+  source: z.string().min(1),
+  eventId: z.string().optional(),
+  // The agent truncates every event message to 500 chars on all collector
+  // paths (eventlogs_{windows,darwin,linux}.go), but that cap is agent-side
+  // only — a compromised or older agent could POST arbitrarily large messages
+  // into device_event_logs, which carries a GIN trigram index (search) that
+  // bloats super-linearly in value size. Re-bound it server-side. 2000 (4x the
+  // agent truncation) leaves headroom for the one un-truncated darwin path
+  // (crash-report synthesized messages, eventlogs_darwin.go) and future
+  // collectors while still hard-bounding the abuse vector. (#2642)
+  message: z.preprocess(
+    (value) => typeof value === 'string' && value.trim() === ''
+      ? EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER
+      : value,
+    z.string().min(1).max(2000),
+  ),
+  details: z.record(z.string(), z.unknown()).optional().refine(
+    (val) => !val || JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  )
+});
+
 export const submitEventLogsSchema = z.object({
-  events: z.array(z.object({
-    timestamp: z.string().min(1),
-    level: z.enum(['info', 'warning', 'error', 'critical']),
-    category: z.enum(['security', 'hardware', 'application', 'system']),
-    source: z.string().min(1),
-    eventId: z.string().optional(),
-    // The agent truncates every event message to 500 chars on all collector
-    // paths (eventlogs_{windows,darwin,linux}.go), but that cap is agent-side
-    // only — a compromised or older agent could POST arbitrarily large messages
-    // into device_event_logs, which carries a GIN trigram index (search) that
-    // bloats super-linearly in value size. Re-bound it server-side. 2000 (4x the
-    // agent truncation) leaves headroom for the one un-truncated darwin path
-    // (crash-report synthesized messages, eventlogs_darwin.go) and future
-    // collectors while still hard-bounding the abuse vector. (#2642)
-    message: z.string().min(1).max(2000),
-    details: z.record(z.string(), z.any()).optional().refine(
-      (val) => !val || JSON.stringify(val).length <= 65536,
-      { message: 'Object too large (max 64KB)' }
-    )
-  })).max(5000)
+  events: z.array(z.unknown()).max(5000),
 });
 
 // ============================================

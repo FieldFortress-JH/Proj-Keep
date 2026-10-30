@@ -38,6 +38,7 @@ vi.mock('../db/schema', () => ({
     installRemediationAttempts: 'softwareComplianceStatus.install_remediation_attempts',
   },
   softwarePolicies: { id: 'id', orgId: 'orgId', partnerId: 'partnerId', mode: 'mode', name: 'name', isActive: 'isActive', updatedAt: 'updatedAt' },
+  configPolicyFeatureLinks: { id: 'configPolicyFeatureLinks.id', configPolicyId: 'configPolicyFeatureLinks.configPolicyId' },
 }));
 
 vi.mock('../middleware/auth', () => ({
@@ -62,14 +63,11 @@ vi.mock('../services/softwarePolicyService', () => ({
     allowUnknown: r.allowUnknown,
   }),
   recordSoftwarePolicyAudit: vi.fn(async () => undefined),
+  cleanupSoftwarePolicyElevations: vi.fn(async () => 0),
 }));
 
 vi.mock('../services/auditEvents', () => ({
   writeRouteAudit: vi.fn(),
-}));
-
-vi.mock('../services/pamActuationLifecycle', () => ({
-  requestPamCleanup: vi.fn(),
 }));
 
 vi.mock('../services/sentry', () => ({
@@ -90,40 +88,15 @@ vi.mock('../services/permissions', () => ({
 
 import {
   executableRuleSchema,
-  cleanupSoftwarePolicyElevations,
   resolveOrgIdForWrite,
   softwarePoliciesRoutes,
   softwareRulesSchema,
 } from './softwarePolicies';
-import { normalizeSoftwarePolicyRules } from '../services/softwarePolicyService';
+import { cleanupSoftwarePolicyElevations, normalizeSoftwarePolicyRules } from '../services/softwarePolicyService';
 import { db } from '../db';
 import { authMiddleware } from '../middleware/auth';
 import { scheduleSoftwareComplianceCheck } from '../jobs/softwareComplianceWorker';
 import { scheduleSoftwareRemediation } from '../jobs/softwareRemediationWorker';
-import { requestPamCleanup } from '../services/pamActuationLifecycle';
-
-describe('cleanupSoftwarePolicyElevations', () => {
-  it('creates cleanup generations for only the active requests transitioned by the policy removal', async () => {
-    const execute = vi.fn().mockResolvedValue({ rows: [{ id: 'elevation-1' }, { id: 'elevation-2' }] });
-    const tx = { execute } as any;
-
-    await cleanupSoftwarePolicyElevations(tx, 'policy-1');
-
-    expect(requestPamCleanup).toHaveBeenCalledTimes(2);
-    expect(requestPamCleanup).toHaveBeenNthCalledWith(1, tx, {
-      elevationRequestId: 'elevation-1', cause: 'policy_removed',
-    });
-    expect(requestPamCleanup).toHaveBeenNthCalledWith(2, tx, {
-      elevationRequestId: 'elevation-2', cause: 'policy_removed',
-    });
-  });
-
-  it('propagates cleanup failure so the caller transaction rolls back', async () => {
-    const tx = { execute: vi.fn().mockResolvedValue({ rows: [{ id: 'elevation-1' }] }) } as any;
-    vi.mocked(requestPamCleanup).mockRejectedValueOnce(new Error('cleanup failed'));
-    await expect(cleanupSoftwarePolicyElevations(tx, 'policy-1')).rejects.toThrow('cleanup failed');
-  });
-});
 
 function makeOrgAuth(orgId: string): AuthContext {
   return {
@@ -977,5 +950,112 @@ describe('partner-wide software policies (#2126)', () => {
 
     expect(res.status).toBe(200);
     expect(tx.update).toHaveBeenCalled();
+  });
+
+  // W04-D15 (#6758) moved cleanupSoftwarePolicyElevations into
+  // softwarePolicyService; pin that DELETE still calls it inside its tx.
+  it('DELETE revokes the elevations the policy minted, inside the delete transaction', async () => {
+    setPartnerAuth('all');
+    mockPartnerPolicyLookup();
+    const whereResolved = { where: vi.fn().mockResolvedValue([]) };
+    const tx = {
+      update: vi.fn().mockReturnValue({ set: vi.fn().mockReturnValue(whereResolved) }),
+      delete: vi.fn().mockReturnValue(whereResolved),
+    };
+    vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(tx));
+
+    const res = await app.request(`/${POLICY_ID}`, { method: 'DELETE' });
+
+    expect(res.status).toBe(200);
+    expect(cleanupSoftwarePolicyElevations).toHaveBeenCalledWith(tx, POLICY_ID);
+  });
+});
+
+// ───────────── managed (security_agents) policies are read-only (#6960) ─────────────
+describe('software policies generated from a security_agents link are read-only (#6960)', () => {
+  const ORG_ID = '11111111-1111-1111-1111-111111111111';
+  const POLICY_ID = '22222222-2222-2222-2222-222222222222';
+  const LINK_ID = '44444444-4444-4444-4444-444444444444';
+  const CONFIG_POLICY_ID = '66666666-6666-6666-6666-666666666666';
+
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        scope: 'organization',
+        orgId: ORG_ID,
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID,
+        orgCondition: () => undefined,
+        user: { id: 'user-123', email: 'test@example.com' },
+      });
+      c.set('permissions', { permissions: [{ resource: '*', action: '*' }] });
+      return next();
+    });
+    app = new Hono();
+    app.route('/software-policies', softwarePoliciesRoutes);
+  });
+
+  function mockManagedPolicyThenLink() {
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: POLICY_ID, orgId: ORG_ID, partnerId: null, mode: 'allowlist', name: 'Security agents',
+              enforceMode: true, remediationOptions: { autoInstall: true, autoUninstall: false },
+              rules: { software: [], allowUnknown: true }, isActive: true, managedByLinkId: LINK_ID,
+            }]),
+          }),
+        }),
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ configPolicyId: CONFIG_POLICY_ID }]),
+          }),
+        }),
+      } as any);
+  }
+
+  const cases: Array<[string, string, string, unknown]> = [
+    ['PATCH', 'PATCH', `/software-policies/${POLICY_ID}`, { name: 'Renamed' }],
+    ['DELETE', 'DELETE', `/software-policies/${POLICY_ID}`, undefined],
+    ['manual remediation', 'POST', `/software-policies/${POLICY_ID}/remediate`, {}],
+  ];
+
+  it.each(cases)('%s → 409 pointing at the owning config policy, nothing written or queued', async (_n, method, path, body) => {
+    mockManagedPolicyThenLink();
+    const res = await app.request(path, {
+      method,
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      code: 'managed_software_policy_read_only',
+      configPolicyId: CONFIG_POLICY_ID,
+    });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(scheduleSoftwareRemediation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['POST', '/software-policies', { name: 'X', mode: 'allowlist', rules: { software: [{ name: 'A' }] }, managedByLinkId: LINK_ID }],
+    ['PATCH', `/software-policies/${POLICY_ID}`, { name: 'X', managedByLinkId: LINK_ID }],
+  ])('%s with a caller-supplied managedByLinkId → 400 before any lookup', async (method, path, body) => {
+    const res = await app.request(path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toMatch(/managedByLinkId/);
+    expect(db.select).not.toHaveBeenCalled();
+    expect(db.insert).not.toHaveBeenCalled();
   });
 });

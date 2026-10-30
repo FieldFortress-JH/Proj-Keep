@@ -11,6 +11,7 @@ import {
   ContractDocumentServiceError,
 } from '../../services/contractDocumentService';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
+import { buildSignedAgreementDownload, signedAgreementCopyQuery } from '../../services/signedAgreementDownload';
 
 // Executed contract-document surfaces (Task 18): list per-contract or
 // unattached, stream the raw PDF, and link a document to a contract after
@@ -66,34 +67,49 @@ contractDocumentRoutes.get('/', scopes, readPerm, zValidator('query', listQuery)
   }
 });
 
-// GET /:id/pdf — streams the executed document's raw PDF bytes.
-contractDocumentRoutes.get('/:id/pdf', scopes, readPerm, zValidator('param', idParam), async (c) => {
-  try {
-    const { id } = c.req.valid('param');
-    const doc = await getContractDocumentPdf(authFrom(c), id);
-    const response = new Response(new Uint8Array(doc.pdfData), {
-      status: 200,
-      headers: {
-        'Content-Type': doc.mime,
-        'Content-Length': String(doc.byteSize),
-        'Content-Disposition': `attachment; filename="contract-document-${id}.pdf"`,
-        'Cache-Control': 'private, max-age=300',
-      },
-    });
-    auditSensitiveRead(c, {
-      action: 'contract.document.download',
-      orgId: doc.orgId,
-      resourceType: 'contract_document',
-      resourceId: id,
-      format: 'pdf',
-      rowCount: 1,
-      byteCount: doc.byteSize,
-    });
-    return response;
-  } catch (err) {
-    return handleDocumentError(c, err);
-  }
-});
+// GET /:id/pdf — a signed agreement's bytes, always a download, never rendered
+// inline in the app origin (acceptanceEvidence.ts precedent).
+//   ?copy=certified (default) — the frozen original plus a derived signature
+//     certificate page (renderCertifiedAgreementPdf); always a PDF.
+//   ?copy=original — the stored bytes byte-for-byte under the stored MIME (a
+//     PDF, or an externally signed PNG/JPEG scan), for hash verification.
+// Access is decided by getContractDocumentPdf under the caller's RLS context;
+// the shared download builder (services/signedAgreementDownload.ts — also the
+// portal's) runs only after it succeeded.
+contractDocumentRoutes.get(
+  '/:id/pdf',
+  scopes,
+  readPerm,
+  zValidator('param', idParam),
+  zValidator('query', signedAgreementCopyQuery),
+  async (c) => {
+    try {
+      const { id } = c.req.valid('param');
+      const { copy } = c.req.valid('query');
+      const doc = await getContractDocumentPdf(authFrom(c), id);
+
+      const download = await buildSignedAgreementDownload(c, {
+        documentId: id, storedBytes: doc.pdfData, storedMime: doc.mime, copy, area: 'staff',
+      });
+      if (!download) {
+        // Readable a moment ago, gone now: same answer as never there.
+        throw new ContractDocumentServiceError('Contract document not found', 404, 'DOCUMENT_NOT_FOUND');
+      }
+      auditSensitiveRead(c, {
+        action: 'contract.document.download',
+        orgId: doc.orgId,
+        resourceType: 'contract_document',
+        resourceId: id,
+        format: download.served === 'certified' ? 'pdf-certified' : 'original',
+        rowCount: 1,
+        byteCount: download.byteLength,
+      });
+      return download.response;
+    } catch (err) {
+      return handleDocumentError(c, err);
+    }
+  },
+);
 
 // PATCH /:id — link-later: attach an unattached document to a contract.
 contractDocumentRoutes.patch(

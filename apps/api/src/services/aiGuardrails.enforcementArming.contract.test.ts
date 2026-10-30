@@ -210,12 +210,24 @@ describe('enforcement-arming tools require approval (#3552)', () => {
     expect(fields).toContain('autoUninstall');
   });
 
+  it('manage_patches no longer carries autoApprove (approval rules moved to Update Rings, #8184)', () => {
+    const fields = armingFieldsOf('manage_patches').map((f) => f.field);
+    expect(fields).not.toContain('autoApprove');
+  });
+
   it('action narrowing uses only real enum members', () => {
-    // manage_patches' autoApprove is documented "(for setup_auto_approval)" —
-    // it must narrow to that action and not fan out over approve/decline/defer.
-    const autoApprove = armingFieldsOf('manage_patches').find((f) => f.field === 'autoApprove');
-    expect(autoApprove, 'manage_patches must still be detected as arming-capable').toBeDefined();
-    expect([...(autoApprove!.actions ?? [])]).toEqual(['setup_auto_approval']);
+    // A "(for <action>)" applicability clause must narrow a field to that
+    // real action only. Sweep every arming tool: any narrowed field's actions
+    // must all be members of the tool's action enum. (No tool currently
+    // narrows a field this way since manage_patches dropped autoApprove, so
+    // this is an invariant for future annotations, not a coverage claim.)
+    for (const { tool, fields } of armingTools()) {
+      const enumActions = new Set(realActionEnum(tool) ?? []);
+      for (const f of fields) {
+        if (f.actions === null) continue;
+        for (const action of f.actions) expect(enumActions.has(action), `${tool}.${f.field}: ${action}`).toBe(true);
+      }
+    }
   });
 
   it('no arming-capable mutation is auto-executable — every one resolves to Tier 3', () => {
@@ -317,13 +329,24 @@ describe('policy-prerequisite mutators are Tier 3 supervised (#3552)', () => {
   });
 
   it('backup prereq tools are deliberately left at Tier 2 — change this consciously', () => {
-    // Documented judgment call in TIER3_ACTIONS: backup config/profile writes
-    // are protective scheduling, not enforcement. Pinned so a later decision to
+    // Documented judgment call in TIER3_ACTIONS: backup config writes are
+    // protective scheduling, not enforcement. Pinned so a later decision to
     // escalate them is an explicit edit here, not a silent drift.
-    for (const tool of ['manage_backup_configs', 'manage_backup_profiles']) {
-      const check = checkGuardrails(tool, { action: 'update' });
-      expect(check.tier, tool).toBe(2);
-      expect(check.requiresApproval, tool).toBe(false);
+    const check = checkGuardrails('manage_backup_configs', { action: 'update' });
+    expect(check.tier).toBe(2);
+    expect(check.requiresApproval).toBe(false);
+  });
+
+  it('manage_backup_profiles was escalated consciously in W03 (#6757, W03-D1)', () => {
+    // A profile's partner-wide ownership is DB state, so update/delete are
+    // statically supervised; an org-owned create stays Tier 2 and a
+    // partner-wide create (ownerScope 'partner') is supervised.
+    for (const action of ['update', 'delete']) {
+      const check = checkGuardrails('manage_backup_profiles', { action });
+      expect(check.tier, action).toBe(3);
+      expect(check.tier === 3 ? check.approvalScope : undefined, action).toBe('supervised');
     }
+    expect(checkGuardrails('manage_backup_profiles', { action: 'create' }).tier).toBe(2);
+    expect(checkGuardrails('manage_backup_profiles', { action: 'create', ownerScope: 'partner' }).tier).toBe(3);
   });
 });

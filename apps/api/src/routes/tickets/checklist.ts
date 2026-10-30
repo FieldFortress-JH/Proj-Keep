@@ -8,9 +8,13 @@ import {
   checklistItemPatchSchema,
   checklistReorderSchema,
   applyChecklistTemplateSchema,
+  saveChecklistAsTemplateSchema,
   ERROR_CODES,
 } from '@breeze/shared';
-import { applyChecklistTemplateToTicket } from '../../services/ticketChecklistTemplateService';
+import {
+  applyChecklistTemplateToTicket,
+  createChecklistTemplateFromTicket,
+} from '../../services/ticketChecklistTemplateService';
 import { HumanWorkStepWaitingError } from '../../services/aiOperator/humanWorkService';
 import {
   templateActorFrom,
@@ -26,6 +30,7 @@ import {
   ChecklistServiceError,
 } from '../../services/ticketChecklistService';
 import { getScopedTicketOr404 } from './tickets';
+import { ticketMergedResponse } from '../../services/ticketMerge/errors';
 
 const idParam = z.object({ id: z.string().guid() });
 const itemIdParam = z.object({ itemId: z.string().guid() });
@@ -42,6 +47,9 @@ const readPerm = requirePermission(PERMISSIONS.TICKETS_READ.resource, PERMISSION
 const writePerm = requirePermission(PERMISSIONS.TICKETS_WRITE.resource, PERMISSIONS.TICKETS_WRITE.action);
 
 function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  // #8972 W1: a write reached a merged tombstone → 409 with the survivor id.
+  const merged = ticketMergedResponse(c, err);
+  if (merged) return merged;
   if (err instanceof ChecklistServiceError) {
     return c.json(
       { error: err.message, code: err.code, ...(err.details ? { details: err.details } : {}) },
@@ -184,6 +192,32 @@ ticketChecklistRoutes.post(
       // The templates handler, not handleServiceError: apply can also raise
       // PartnerWideWriteDeniedError-shaped errors from the template service,
       // and its match is structural so it covers ChecklistServiceError too.
+      return handleChecklistTemplateError(c, err);
+    }
+  },
+);
+
+// Save the ticket's CURRENT steps as a new template (#9180). Needs tickets:write
+// (this router's writePerm); a partner-wide template additionally needs
+// canManagePartnerWidePolicies, enforced in the service (403). The steps are
+// read server-side from the ticket, never taken from the body.
+ticketChecklistRoutes.post(
+  '/:id/checklist/save-as-template',
+  scopes,
+  writePerm,
+  zValidator('param', idParam),
+  zValidator('json', saveChecklistAsTemplateSchema),
+  async (c) => {
+    const ticket = await getScopedTicketOr404(c.get('auth'), c.req.valid('param').id);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    try {
+      const result = await createChecklistTemplateFromTicket(
+        { id: ticket.id, orgId: ticket.orgId },
+        c.req.valid('json'),
+        templateActorFrom(c),
+      );
+      return c.json({ data: result }, 201);
+    } catch (err) {
       return handleChecklistTemplateError(c, err);
     }
   },

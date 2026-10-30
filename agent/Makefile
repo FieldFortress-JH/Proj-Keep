@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-desktop-helper build-backup build-all build-all-agent build-all-desktop-helper build-all-backup build-windows-user-helper build-winres build-windows-msi clean test install install-service uninstall-service dev-push dev-push-helper build-watchdog build-watchdog-linux build-watchdog-darwin build-watchdog-windows dev-push-watchdog dev-push-both
+.PHONY: build build-agent build-yarac build-desktop-helper build-backup build-all build-all-agent build-all-desktop-helper build-all-backup build-windows-user-helper build-winres build-windows-msi clean test install install-service uninstall-service dev-push dev-push-helper build-watchdog build-watchdog-linux build-watchdog-darwin build-watchdog-windows dev-push-watchdog dev-push-both
 
 VERSION ?= 0.5.0
 # Local-dev targets intentionally keep plain LDFLAGS (self-host by
@@ -18,6 +18,11 @@ build-desktop-helper:
 
 build-backup:
 	go build $(LDFLAGS) -o bin/breeze-backup ./cmd/breeze-backup
+
+# breeze-yarac: YARA compile-policy CLI (validate/compile/scan/version) — the
+# W03 server pre-check and the lab benchmark harness. Not shipped to agents.
+build-yarac:
+	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/breeze-yarac ./cmd/breeze-yarac
 
 # Build for all platforms
 build-all: build-all-agent build-all-desktop-helper build-all-backup
@@ -61,7 +66,13 @@ build-windows: build-windows-user-helper
 # sessionbroker spawns it into the logged-in user's non-elevated session, where
 # a requireAdministrator manifest makes CreateProcessAsUser fail with
 # ERROR_ELEVATION_REQUIRED (#949 regression).
+#
+# The embedded manifest (rsrc_windows_amd64.syso from build-winres) also
+# activates comctl32 v6, which the native prompt renderer's TaskDialogIndirect
+# needs (#10190); without it every native prompt degrades to a message box.
+# Refuse to build a helper without it.
 build-windows-user-helper:
+	@test -f cmd/breeze-user-helper/rsrc_windows_amd64.syso || { echo "cmd/breeze-user-helper/rsrc_windows_amd64.syso is missing: run 'make build-winres' first (the manifest selects comctl32 v6 for TaskDialogIndirect and asInvoker for #949)"; exit 1; }
 	GOOS=windows GOARCH=amd64 go build -ldflags "-X main.version=$(VERSION) -H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
 
 build-winres:

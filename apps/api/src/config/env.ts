@@ -176,16 +176,28 @@ export function preAssignmentEnrollmentEnabled(): boolean {
   return envFlag('PRE_ASSIGNMENT_ENROLLMENT_ENABLED', false);
 }
 
-// Caller verification (anti-vishing, #6354). W01 ships the backend dark:
-// every caller-verification route returns 404 `feature_disabled` to an
-// AUTHENTICATED caller (auth runs first, so an anonymous request still gets
-// 401 — routerAuthGate.contract.test.ts requires that of every mounted route)
-// and the release gate refuses with `feature_disabled` while this is off. The
-// cross-wave contract is deliberately stricter than envFlag(): ONLY the exact
-// string 'true' enables it — '1' / 'yes' / 'on' / 'TRUE' stay off. Read at
-// CALL time so a test can flip it per-case without vi.resetModules().
+// Caller verification (anti-vishing, #6354). Default ON as of W05: enforcement
+// ships with the link tier (SMS/email links, callback attestation,
+// administrative). Any explicit value other than the exact string 'true'
+// disables it: every caller-verification route returns 404 `feature_disabled`
+// to an AUTHENTICATED caller (auth runs first, so an anonymous request still
+// gets 401 — routerAuthGate.contract.test.ts requires that of every mounted
+// route), the web surface hides, and the release gate refuses protected
+// execution with `feature_disabled`. The cross-wave contract is deliberately
+// stricter than envFlag(): '' / '1' / 'yes' / 'on' / 'TRUE' all mean OFF; only
+// unset or exactly 'true' means ON. Read at CALL time so a test can flip it
+// per-case without vi.resetModules().
 export function callerVerificationEnabled(): boolean {
-  return process.env.CALLER_VERIFICATION_ENABLED === 'true';
+  return (process.env.CALLER_VERIFICATION_ENABLED ?? 'true') === 'true';
+}
+
+// Caller verification workstation tier (bound-workstation prompt through the
+// agent / Breeze Assist). Code is shipped but DARK: default OFF, exact string
+// 'true' only. While off, the workstation method is reported unavailable
+// (`method_disabled`), start() refuses it, and tier 3 is not policy-selectable
+// (max achievable tier is 2). Read at CALL time.
+export function callerVerificationWorkstationEnabled(): boolean {
+  return process.env.CALLER_VERIFICATION_WORKSTATION_ENABLED === 'true';
 }
 
 // #4442 W04 (AI sweeps act mode). A SUB-flag of
@@ -207,6 +219,15 @@ export function callerVerificationEnabled(): boolean {
 // test can flip it per-case without vi.resetModules().
 export function toolSourcesEnabled(): boolean {
   return envFlag('TOOL_SOURCES_ENABLED', false);
+}
+
+// Tool Catalog W3 (#5218). Platform kill switch for Flows (flow documents,
+// flow AI tools, /api/v1/flows). Default ON since W06 R1 (#5221, plan
+// Decision 11): unset or empty is on; `FLOWS_ENABLED=false` keeps Flows off
+// and standalone Jobs writable. Read at CALL time so a test can flip it
+// per-case without vi.resetModules().
+export function flowsEnabled(): boolean {
+  return envFlag('FLOWS_ENABLED', true);
 }
 
 // Topology rollout deployment kill switch. Partner and organization flags are
@@ -259,6 +280,16 @@ export function aiScriptAuthoringEnabled(): boolean {
   return envFlag('BREEZE_AI_SCRIPT_AUTHORING_ENABLED', true);
 }
 
+/**
+ * Trust Center CIS v8 framework view (spec §18.13, plan amendment 25). A deployment switch, default OFF:
+ * while off, CIS is neither selectable in the publisher's picker nor rendered, and the default framework
+ * is NIST CSF 2.0. It does not replace the written CIS confirmation; the operator sets it afterwards.
+ * Read at call time so tests (and operators) can flip it without a module reload.
+ */
+export function trustCisFrameworkViewEnabled(): boolean {
+  return envFlag('BREEZE_TRUST_CIS_FRAMEWORK_VIEW', false);
+}
+
 // AI Operator durable tasks (#5205 W06, spec §11.2 "Feature controls").
 //
 // Two INDEPENDENT flags, both default OFF, both read at CALL time so a test
@@ -286,6 +317,26 @@ export function aiOperatorServiceRecoveryEnabled(): boolean {
 }
 
 /**
+ * Recipe-level gate for `identity_offboarding` (Recipe Library W06; spec §9's
+ * `deterministic` class ships behind its own flag). Nests under
+ * AI_OPERATOR_TASKS_ENABLED, exactly as the service-recovery flag does. Stays
+ * OFF until the R1c lab run passes; nothing in the repo enables it.
+ */
+export function aiOperatorIdentityOffboardingEnabled(): boolean {
+  return envFlag('AI_OPERATOR_RECIPE_IDENTITY_OFFBOARDING_ENABLED', false);
+}
+
+/**
+ * Recipe-level gate for `identity_onboarding` (Recipe Library W07 R2). Nests
+ * under AI_OPERATOR_TASKS_ENABLED exactly as the offboarding flag does, and is
+ * read at call time. Stays OFF until the R2c lab run passes; nothing in the
+ * repo enables it.
+ */
+export function aiOperatorIdentityOnboardingEnabled(): boolean {
+  return envFlag('AI_OPERATOR_RECIPE_IDENTITY_ONBOARDING_ENABLED', false);
+}
+
+/**
  * AI execution-plane workspaces (spec §8 "Hosted only", §2.2 D-I).
  *
  * THREE conditions, all read at CALL time so a test can flip one without
@@ -305,6 +356,40 @@ export function aiWorkspaceEnabled(): boolean {
     && envFlag('BREEZE_AI_AGENTS_ENABLED', false)
     && envFlag('BREEZE_AI_WORKSPACE_ENABLED', false)
   );
+}
+
+/**
+ * Wisp, the always-on delegated agent (Wisp design §10).
+ *
+ * This is the DEPLOYMENT switch; the `wisp` entitlement (W01) is the commercial
+ * switch, and both must be on before anything Wisp-shaped runs. Same three-term
+ * conjunction as aiWorkspaceEnabled(), all read at CALL time: hosted, the AI
+ * agents platform switch, and BREEZE_WISP_ENABLED. Default OFF. With it off the
+ * /api/v1/wisp routes answer 404, the grant hooks are not installed and the
+ * reconciler skips every tick. config/validate.ts refuses the flag in production
+ * without IS_HOSTED=true.
+ */
+export function wispEnabled(): boolean {
+  return (
+    isHosted()
+    && envFlag('BREEZE_AI_AGENTS_ENABLED', false)
+    && envFlag('BREEZE_WISP_ENABLED', false)
+  );
+}
+
+/**
+ * EDR response actions (#8167 W03) — the SERVER-WIDE kill switch. Default ON:
+ * the per-connection `edr_connections.actions_enabled` opt-in (default OFF,
+ * partner admin + MFA) is the real gate, and an env default of OFF would make
+ * every self-hoster set a variable AND flip the switch for no added safety.
+ * Read at CALL time, so `BREEZE_EDR_ACTIONS_ENABLED=false` + restart stops new
+ * actions without a deploy. Empty = unset = ON; a recognized false value =
+ * OFF; an UNRECOGNIZED value fails closed (whoever set it meant to change it).
+ */
+export function edrActionsEnabled(): boolean {
+  const raw = (process.env.BREEZE_EDR_ACTIONS_ENABLED ?? '').trim().toLowerCase();
+  if (!raw) return true;
+  return RECOGNIZED_TRUE_FLAG_VALUES.has(raw);
 }
 
 /**
@@ -362,6 +447,60 @@ export function positiveIntEnv(name: string, fallback: number, min: number, max:
   const parsed = Number.parseInt(raw.trim(), 10);
   if (!Number.isFinite(parsed) || parsed < 1) return fallback;
   return Math.min(Math.max(parsed, min), max);
+}
+
+/**
+ * Tool catalog W04 (#5219): how long a parked Tier-3 flow step's action intent
+ * waits for a human (both approval scopes). Default 24 h, clamped 1..168.
+ */
+export function flowApprovalTtlHours(): number {
+  return positiveIntEnv('FLOW_APPROVAL_TTL_HOURS', 24, 1, 168);
+}
+
+/**
+ * Tool catalog W04 (#5219), plan Task A8 / Decision 8: how many runs of one
+ * flow owner (an org, or a partner for its partner-wide flows) may be
+ * `running` at once, across every API replica. Parked runs do not count.
+ * Default 20, clamped 1..500.
+ */
+export function flowMaxRunningPerOwner(): number {
+  return positiveIntEnv('FLOW_MAX_RUNNING_PER_OWNER', 20, 1, 500);
+}
+
+/**
+ * Tool catalog W04 (#5219), plan Task A8 / Decision 9: days after a run
+ * finishes before its bodies (trigger payload, inputs, step inputs/outputs)
+ * are pruned. Rows are never deleted. Default 90, clamped 7..3650.
+ */
+export function flowRunRetentionDays(): number {
+  return positiveIntEnv('FLOW_RUN_RETENTION_DAYS', 90, 7, 3650);
+}
+
+/**
+ * Tool catalog W05 (#5220): inbound webhook deliveries accepted per minute for
+ * one flow (Redis limiter; over it the intake answers 429). Default 120,
+ * clamped 1..6000.
+ */
+export function flowWebhookRatePerMinute(): number {
+  return positiveIntEnv('FLOW_WEBHOOK_RATE_PER_MINUTE', 120, 1, 6000);
+}
+
+/**
+ * Tool catalog W05 (#5220): days a non-accepted flow webhook delivery row
+ * (refused / org_unresolved / invalid_body) is kept; accepted rows live as
+ * long as their run. Default 30, clamped 1..365.
+ */
+export function flowWebhookDeliveryRetentionDays(): number {
+  return positiveIntEnv('FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS', 30, 1, 365);
+}
+
+/**
+ * Tool catalog W05 (#5220): the most for-each items one flow step runs at
+ * once; the step's own `forEach.concurrency` is capped by this. Default 5,
+ * clamped 1..10.
+ */
+export function flowForEachMaxParallel(): number {
+  return positiveIntEnv('FLOW_FOREACH_MAX_PARALLEL', 5, 1, 10);
 }
 
 /** Per-API-instance `sync-domain` concurrency (spec §5.3). */
@@ -646,6 +785,15 @@ export const BILLING_URL = process.env.BILLING_URL ?? '';
 export const OAUTH_DCR_ENABLED = envFlag('OAUTH_DCR_ENABLED', false);
 export const OAUTH_DCR_REQUIRE_IAT = envFlag('OAUTH_DCR_REQUIRE_IAT', false);
 export const OAUTH_DCR_ALLOW_ANONYMOUS = envFlag('OAUTH_DCR_ALLOW_ANONYMOUS', false);
+
+// B-W03 (#6157): OAuth Client ID Metadata Documents — an https URL as
+// client_id, alongside DCR. Default off. Boot-time switch for the provider
+// feature + AS metadata; oauth/cimdPolicy.ts also checks it (and the host
+// allowlist) on every use, so the in-process document cache can never bypass
+// them. A change takes effect on restart. OAUTH_CIMD_ALLOWED_HOSTS
+// (CSV of hostnames / `.suffix`) restricts which hosts may serve documents;
+// unset = any public https host.
+export const OAUTH_CIMD_ENABLED = envFlag('OAUTH_CIMD_ENABLED', false);
 export const OAUTH_ISSUER = process.env.OAUTH_ISSUER ?? '';
 export const OAUTH_RESOURCE_URL = process.env.OAUTH_RESOURCE_URL ?? '';
 

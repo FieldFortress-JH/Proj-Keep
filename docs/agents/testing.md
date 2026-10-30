@@ -19,11 +19,11 @@ Moved verbatim from `CLAUDE.md` (2026-10-07). Read before running a scoped test,
 For test-writing conventions (Drizzle mock patterns, table-driven Go tests, validator coverage, and the required coverage checklist), use the **`breeze-testing`** skill.
 
 ## CI Integration
-- All tests run automatically in CI (`.github/workflows/ci.yml`)
+- Test suites run in CI (`.github/workflows/ci.yml`), each in its own job: `test-api`, `test-web`, `test-portal`, `test-viewer`, `test-shared` (`packages/shared` vitest, #8373), `test-agent`, the add-in/M365 suites and `integration-test`. Anything without a job there is not run in CI — check before assuming a suite is covered
 - `test-api`, `test-web`, `test-agent` are **required** jobs on PRs
 - New test files are auto-discovered — no CI config changes needed
 - Go coverage is uploaded as artifact; no threshold enforced yet
-- Integration tests run in the **`integration-test`** job (8 shards), which **blocks PRs**: it carries no `continue-on-error`, and `ci-success` hard-fails on `needs.integration-test.result`. Do not hand-dispatch CI to get an integration run on a PR that targets `main` — it already ran. The `continue-on-error: ${{ github.event_name == 'pull_request' }}` in `ci.yml` belongs to the separate **`smoke-test`** job (Docker image build + stack boot + endpoint smoke), which is non-blocking on PRs and required on main. A green PR can still redden main, but through a stale base or a stacked branch (see `docs/agents/tenancy-rls.md`, last paragraph of the cascade section), not through a skipped integration run
+- Integration tests run in the **`integration-test`** job (16 shards), which **blocks PRs**: it carries no `continue-on-error`, and `ci-success` hard-fails on `needs.integration-test.result`. Do not hand-dispatch CI to get an integration run on a PR that targets `main` — it already ran. The `continue-on-error: ${{ github.event_name == 'pull_request' }}` in `ci.yml` belongs to the separate **`smoke-test`** job (Docker image build + stack boot + endpoint smoke), which is non-blocking on PRs and required on main. A green PR can still redden main, but through a stale base or a stacked branch (see `docs/agents/tenancy-rls.md`, last paragraph of the cascade section), not through a skipped integration run
 
 ## Running Tests Locally
 ```bash
@@ -61,6 +61,8 @@ cd agent && go test -race ./internal/discovery/...
 # E2E
 cd e2e-tests && pnpm test
 ```
+
+API unit runs (`vitest.config.ts`) never read the root `.env`: under vitest, `db/index.ts` skips its dotenv load (#9344), so values kept in your local `.env` (such as `DATABASE_URL`, `REDIS_URL` or `IS_HOSTED`) no longer reach unit tests. Variables you export in the shell still apply. The integration and RLS-coverage configs load `.env.test` themselves.
 
 **Two traps when scoping a run to one file.** The `--` trap below reproduces on every workspace package regardless of its script shape — confirmed against both `apps/api` (`"test": "vitest"`, bare/watch-mode) and `apps/portal` (`"test": "vitest run"`, already run-once): both ran their FULL suite (1,470 and 26 files respectively) instead of the one targeted file. The only difference is that the bare-`"vitest"` packages (`apps/api`, `apps/web`, `packages/shared`, most others) then sit in watch mode afterward and never exit, while the `"vitest run"` packages (`apps/portal`, `apps/helper`, `apps/mobile`, `packages/extension-sdk`, `packages/extension-web-sdk`, `packages/extension-testkit`) at least exit once the full run finishes — either way, the file you asked for is not what got scoped.
 

@@ -14,16 +14,30 @@ import {
 } from '../db/schema';
 import { resolveEdrInstaller, type ResolvedInstaller } from './edrInstallerResolver';
 import { resolveInstallerVariables, type InstallerVariableContext } from './installerVariables';
+import { buildInstallScriptPayload, type InstallScriptPayload } from './installScriptPayload';
+import {
+  agentSupportsInstallScripts,
+  agentUpdateRequiredInstallMessage,
+  stripUnsupportedDetectionClauses,
+  versionNeedsInstallScriptSupport,
+} from './softwareInstallAgentSupport';
 import { loadTenantVariableScope, resolveForOrg } from './tenantVariableResolution';
 import { getPresignedUrl, isS3Configured, isS3NotFound } from './s3Storage';
 import { deliveryTtlMs } from './commandOfflinePolicy';
 import { dispatchDeviceCommand } from './dispatchDeviceCommand';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  linkRestorePointCommand,
+  restorePointPayloadField,
+} from './restorePointRequest';
 import {
   evaluateManagedSoftwareDispatch,
   type ManagedSoftwareDispatchDenialReason,
   getManagedSoftwarePolicyMode,
 } from './managedSoftwareDispatchPolicy';
 import { getEffectiveSoftwareDownloadPolicy } from './softwareDownloadPolicy';
+import { captureException } from './sentry';
 import { sendCommandToAgent, type AgentCommand } from '../routes/agentWs';
 import {
   fingerprintSoftwareInstallMethodDependency,
@@ -156,6 +170,19 @@ export interface SoftwareInstallDispatchOutcome {
  * The caller (routes/software.ts retry endpoint) MUST bump retryCount in the DB
  * before calling this, and pass that same post-bump value here.
  */
+/**
+ * Thrown by {@link dispatchSoftwareInstallToDevice} when the install was NOT
+ * handed to the agent: the seam refused it (no command row) or the push claim
+ * cancelled it. Distinguishes "nothing was sent" from a failure after the
+ * command row already exists (e.g. the deployment-result link write).
+ */
+export class SoftwareInstallDispatchRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SoftwareInstallDispatchRefusedError';
+  }
+}
+
 export async function dispatchSoftwareInstallToDevice(
   deploymentId: string,
   device: { id: string; agentId: string },
@@ -176,13 +203,13 @@ export async function dispatchSoftwareInstallToDevice(
   });
 
   if (!res.ok) {
-    throw new Error(`software_install dispatch refused for device ${device.id}: ${res.error}`);
+    throw new SoftwareInstallDispatchRefusedError(`software_install dispatch refused for device ${device.id}: ${res.error}`);
   }
   // The push's claim-time eligibility cancelled the row before the result row
   // below is linked to it, so nothing else will terminalise that result: refuse
   // like the seam's own refusals, and the caller fails it with this reason.
   if (res.delivery === 'cancelled') {
-    throw new Error(
+    throw new SoftwareInstallDispatchRefusedError(
       `software_install dispatch refused for device ${device.id}: ${cancelledCommandError(res.cancelReason)}`,
     );
   }
@@ -214,6 +241,54 @@ export async function dispatchSoftwareInstallToDevice(
   };
 }
 
+/**
+ * #4609 W05: stamp the System Restore checkpoint decision onto one device's
+ * install payload, then dispatch it. The ONE place both fan-out builders (the
+ * package-manager path and the download-URL path) resolve it, so neither can
+ * drift. Runs inside each builder's per-device try, so a resolution failure
+ * fails that device visibly through the builder's existing catch.
+ *
+ * Every business attempt (first dispatch, or a retry that bumped retryCount
+ * and so gets a new command id) re-enters here and re-resolves with a fresh
+ * requestId; transport redelivery of the same command id never does.
+ */
+async function dispatchSoftwareInstallWithRestorePoint(
+  deploymentId: string,
+  orgId: string,
+  device: { id: string; agentId: string; osType: string | null },
+  payload: AgentCommand['payload'] & { softwareName?: unknown },
+  createdBy: string | null | undefined,
+  retryCount: number,
+  options: { deferDelivery?: boolean },
+): Promise<SoftwareInstallDispatchOutcome> {
+  const restorePoint = await buildRestorePointRequest({
+    deviceId: device.id,
+    orgId,
+    osType: device.osType,
+    trigger: 'software_install',
+    label: `install ${typeof payload.softwareName === 'string' ? payload.softwareName : 'software'}`,
+    softwareDeploymentId: deploymentId,
+  });
+  let dispatch: SoftwareInstallDispatchOutcome;
+  try {
+    dispatch = await dispatchSoftwareInstallToDevice(
+      deploymentId,
+      device,
+      { ...payload, ...restorePointPayloadField(restorePoint) },
+      createdBy,
+      retryCount,
+      options,
+    );
+  } catch (err) {
+    // Only a refusal means nothing was sent. Any other throw can come after the
+    // command row exists (it still carries the block), so the row is kept.
+    if (err instanceof SoftwareInstallDispatchRefusedError) await discardRestorePointRequest(restorePoint);
+    throw err;
+  }
+  await linkRestorePointCommand(restorePoint, dispatch.deviceCommandId);
+  return dispatch;
+}
+
 /** Structural subset of a software_versions row the install fan-out needs. */
 export interface SoftwareInstallFanoutVersionRecord {
   downloadUrl: string | null;
@@ -225,6 +300,16 @@ export interface SoftwareInstallFanoutVersionRecord {
   version: string;
   detectionRules?: unknown;
   successExitCodes?: number[] | null;
+  /**
+   * #6958 pre/post-install scripts. Sent ONLY when installScriptsEnabled is
+   * true; scripts stored before that column existed stay dormant. Optional so
+   * callers that build a record by hand keep today's payload.
+   */
+  installScriptsEnabled?: boolean;
+  preInstallScript?: string | null;
+  postInstallScript?: string | null;
+  /** jsonb; a script-enabled version declares exactly one OS. */
+  supportedOs?: unknown;
 }
 
 /** Structural subset of a software_catalog row the install fan-out needs. */
@@ -538,7 +623,7 @@ async function dispatchManagerInstalls(
     // silent-death bug this feature exists to remove.
     let dispatch: SoftwareInstallDispatchOutcome;
     try {
-      dispatch = await dispatchSoftwareInstallToDevice(deploymentId, device, payload, createdBy, retryCount, {
+      dispatch = await dispatchSoftwareInstallWithRestorePoint(deploymentId, orgId, device, payload, createdBy, retryCount, {
         deferDelivery: input.deferDelivery,
       });
     } catch (err) {
@@ -708,6 +793,10 @@ export async function buildAndDispatchSoftwareInstalls(
       siteId: devices.siteId,
       hostname: devices.hostname,
       customFields: devices.customFields,
+      osType: devices.osType,
+      // #6958: install scripts, zip archives and the service_running detection
+      // clause are gated on the agent version (softwareInstallAgentSupport.ts).
+      agentVersion: devices.agentVersion,
       // Wave 6 Task 5: the agent's outbound-network-policy capability, written
       // from the heartbeat handshake. 0 = pre-Wave-6 agent with no dial-time
       // destination policy.
@@ -727,17 +816,47 @@ export async function buildAndDispatchSoftwareInstalls(
     targetDevices,
   );
 
+  // #6958 pre/post-install scripts: sent only when the version enables them
+  // (dormant otherwise), and blank text counts as no script.
+  const scriptsEnabled = versionRecord.installScriptsEnabled === true;
+  const enabledScript = (s: string | null | undefined): string | null =>
+    scriptsEnabled && typeof s === 'string' && s.trim().length > 0 ? s : null;
+  const preInstallScript = enabledScript(versionRecord.preInstallScript);
+  const postInstallScript = enabledScript(versionRecord.postInstallScript);
+  const hasScripts = preInstallScript !== null || postInstallScript !== null;
+  // Scripts or a zip archive need an agent that runs install scripts. An older
+  // agent ignores unknown payload keys, so it would install WITHOUT the script.
+  const needsScriptAgent = versionNeedsInstallScriptSupport({
+    fileType: versionRecord.fileType,
+    installScriptsEnabled: scriptsEnabled,
+    preInstallScript,
+    postInstallScript,
+  });
+  // A script's language is bound to one OS, so a script-enabled version
+  // declares exactly one (enforced on create). Defensive: null if it does not.
+  // Lowercased to compare with devices.os_type: the chunked-upload UI stores
+  // capitalized names ("Windows").
+  const scriptOs =
+    Array.isArray(versionRecord.supportedOs) &&
+    versionRecord.supportedOs.length === 1 &&
+    typeof versionRecord.supportedOs[0] === 'string'
+      ? versionRecord.supportedOs[0].trim().toLowerCase()
+      : null;
+
   // When a template references variables, load the org name + ALL of the org's
   // site names once here (gated below) rather than per-device inside the loop —
-  // avoids an N+1 across the dispatch fan-out.
+  // avoids an N+1 across the dispatch fan-out. Script text counts as a
+  // template: a `{{...}}` there must be substituted (and secret-checked) too.
   const templatesUseVariables =
     (finalDownloadUrl?.includes('{{') ?? false) ||
-    (finalSilentInstallArgs?.includes('{{') ?? false);
+    (finalSilentInstallArgs?.includes('{{') ?? false) ||
+    (preInstallScript?.includes('{{') ?? false) ||
+    (postInstallScript?.includes('{{') ?? false);
 
   let orgName = '';
   const siteNames = new Map<string, string>();
   // Tenant variables (#3409 PR2): flattened KEY -> non-secret VALUE map for
-  // the `var.<key>` arm of installerVariables.ts's resolveKey. Secret
+  // the `var.<key>` arm of installerVariables.ts's resolveInstallerVariableKey. Secret
   // variables never enter this map — a deploy template is substituted into a
   // download URL / install args that ride the command payload in the clear.
   //
@@ -768,6 +887,8 @@ export async function buildAndDispatchSoftwareInstalls(
     const referencedTemplateKeys = new Set([
       ...findVariableTokens(finalDownloadUrl ?? ''),
       ...findVariableTokens(finalSilentInstallArgs ?? ''),
+      ...findVariableTokens(preInstallScript ?? ''),
+      ...findVariableTokens(postInstallScript ?? ''),
     ]);
     const variableScope = await loadTenantVariableScope([orgId]);
     for (const [key, variable] of resolveForOrg(variableScope, orgId)) {
@@ -784,9 +905,8 @@ export async function buildAndDispatchSoftwareInstalls(
   // install command so the agent can skip-if-already-present and verify the
   // real end state. forceReinstall is a per-deployment option (default off);
   // when set the agent installs even if the package is already detected.
-  const detectionRules = Array.isArray(versionRecord.detectionRules)
-    ? versionRecord.detectionRules
-    : undefined;
+  // The rules are narrowed per device below (#6958: an agent that predates
+  // service_running would treat the whole rule set as unsupported).
   const forceReinstall = options?.forceReinstall === true;
   // #7038: vendor-documented success exit codes. Only sent when declared, so a
   // version without any produces the same payload an older agent always saw.
@@ -835,11 +955,72 @@ export async function buildAndDispatchSoftwareInstalls(
     }
   }
   let variableFailureCount = 0;
+  // Distinct per-device variable-failure messages (token names only, never
+  // values). When there is exactly one, the batch message repeats it (#10307).
+  const variableFailureReasons = new Set<string>();
+  // Devices whose dispatch threw: they keep the batch message from naming a
+  // variable reason as if it were every device's (#10307).
+  let dispatchFailureCount = 0;
+  const countVariableFailure = (reason: string) => {
+    variableFailureCount++;
+    variableFailureReasons.add(reason);
+  };
+  // #6958 gates, counted apart so the batch message names the real cause.
+  let agentVersionFailureCount = 0;
+  let scriptOsFailureCount = 0;
   let policyDenialCount = 0;
   // Bounded reasons only (see managedSoftwareDispatchPolicy) — safe to
   // interpolate into the aggregate message, unlike a URL or host.
   const policyDenialReasons = new Set<ManagedSoftwareDispatchDenialReason>();
+  // One per-device failure write + result, shared by the #6958 gates below.
+  // Isolated per device: a failed write here must not abort the fan-out and
+  // strand every later device's row as `pending` (the silent-death shape the
+  // dispatch try/catch below guards against). Nothing was enqueued for this
+  // device either way.
+  const failDevice = async (deviceId: string, errorMessage: string) => {
+    try {
+      await db
+        .update(deploymentResults)
+        .set({ status: 'failed', errorMessage, completedAt: new Date() })
+        .where(
+          and(
+            eq(deploymentResults.deploymentId, deploymentId),
+            eq(deploymentResults.deviceId, deviceId),
+          ),
+        );
+    } catch (err) {
+      console.error(
+        `[software-deploy] could not record a gate failure for device ${deviceId} in deployment ${deploymentId}:`,
+        err,
+      );
+      captureException(err instanceof Error ? err : new Error(String(err)));
+    }
+    const result = fanoutDeviceResult(input, deviceId, 'failed', null, errorMessage);
+    if (result) deviceResults.push(result);
+  };
   for (const device of targetDevices) {
+    // #6958 agent gate at ENQUEUE: a version with enabled scripts, or a zip,
+    // fails an agent too old to run them, and NO command is created. (The
+    // same check repeats at claim, commandDelivery.ts, because the reported
+    // version is not sticky across a downgrade.)
+    if (needsScriptAgent && !agentSupportsInstallScripts(device.agentVersion)) {
+      await failDevice(device.id, agentUpdateRequiredInstallMessage());
+      agentVersionFailureCount++;
+      continue;
+    }
+    // A script runs in the language of the version's one OS; a device on any
+    // other OS would get the wrong interpreter, so it is failed, not sent.
+    if (hasScripts && (scriptOs === null || device.osType !== scriptOs)) {
+      await failDevice(
+        device.id,
+        scriptOs === null
+          ? 'Install scripts require a version with exactly one supported OS'
+          : `Install scripts on this version target ${scriptOs}; this device runs ${device.osType ?? 'an unknown OS'}`,
+      );
+      scriptOsFailureCount++;
+      continue;
+    }
+
     // Resolve `{{...}}` variables against this device's org/site/device context.
     // Skipped entirely unless `templatesUseVariables` (computed once above); the
     // resolver also fast-paths internally. An unresolvable token fails THIS
@@ -852,13 +1033,14 @@ export async function buildAndDispatchSoftwareInstalls(
       // deployment_results write + counter as an unresolvable token, so the
       // batch-level outcome below is unchanged. Keys only in the message.
       if (secretTemplateKeys.length > 0) {
+        const secretMessage =
+          'Software deployment templates cannot use secret variable(s) ' +
+          secretTemplateKeys.map(variableToken).join(', ');
         await db
           .update(deploymentResults)
           .set({
             status: 'failed',
-            errorMessage:
-              'Software deployment templates cannot use secret variable(s) ' +
-              secretTemplateKeys.map(variableToken).join(', '),
+            errorMessage: secretMessage,
             completedAt: new Date(),
           })
           .where(
@@ -867,14 +1049,8 @@ export async function buildAndDispatchSoftwareInstalls(
               eq(deploymentResults.deviceId, device.id),
             ),
           );
-        variableFailureCount++;
-        const result = fanoutDeviceResult(
-          input,
-          device.id,
-          'failed',
-          null,
-          `Software deployment templates cannot use secret variable(s) ${secretTemplateKeys.map(variableToken).join(', ')}`,
-        );
+        countVariableFailure(secretMessage);
+        const result = fanoutDeviceResult(input, device.id, 'failed', null, secretMessage);
         if (result) deviceResults.push(result);
         continue;
       }
@@ -889,11 +1065,12 @@ export async function buildAndDispatchSoftwareInstalls(
       };
       const resolved = resolveInstallerVariables(finalDownloadUrl, finalSilentInstallArgs, ctx);
       if (resolved.unresolved.length > 0) {
+        const unresolvedMessage = `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`;
         await db
           .update(deploymentResults)
           .set({
             status: 'failed',
-            errorMessage: `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`,
+            errorMessage: unresolvedMessage,
             completedAt: new Date(),
           })
           .where(
@@ -902,14 +1079,8 @@ export async function buildAndDispatchSoftwareInstalls(
               eq(deploymentResults.deviceId, device.id),
             ),
           );
-        variableFailureCount++;
-        const result = fanoutDeviceResult(
-          input,
-          device.id,
-          'failed',
-          null,
-          `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`,
-        );
+        countVariableFailure(unresolvedMessage);
+        const result = fanoutDeviceResult(input, device.id, 'failed', null, unresolvedMessage);
         if (result) deviceResults.push(result);
         continue;
       }
@@ -917,6 +1088,46 @@ export async function buildAndDispatchSoftwareInstalls(
       // the type as string (finalDownloadUrl is non-null past the guard above).
       deviceDownloadUrl = resolved.downloadUrl ?? finalDownloadUrl;
       deviceSilentInstallArgs = resolved.silentInstallArgs;
+    }
+
+    // #6958 pre/post-install scripts. Built for EVERY device whenever a script
+    // is enabled — not only inside the `templatesUseVariables` branch above —
+    // so a token-free script is still sent. Values ride in `parameters` (the
+    // agent turns them into BREEZE_PARAM_* env references); an unresolved
+    // token fails this device with the same message as an installer template.
+    let preScriptPayload: InstallScriptPayload | null = null;
+    let postScriptPayload: InstallScriptPayload | null = null;
+    if (hasScripts) {
+      const scriptCtx: InstallerVariableContext = {
+        org: { id: orgId, name: orgName },
+        site: { id: device.siteId, name: siteNames.get(device.siteId) ?? '' },
+        device: {
+          hostname: device.hostname,
+          customFields: (device.customFields as Record<string, unknown> | null) ?? {},
+        },
+        vars: tenantVars,
+      };
+      const pre = preInstallScript === null ? null : buildInstallScriptPayload(preInstallScript, device.osType ?? '', scriptCtx);
+      const post = postInstallScript === null ? null : buildInstallScriptPayload(postInstallScript, device.osType ?? '', scriptCtx);
+      if ((pre && !pre.ok && pre.unsupportedOs) || (post && !post.ok && post.unsupportedOs)) {
+        // Unreachable past the OS check above; kept so a future OS value can
+        // never fall through to a script with no interpreter.
+        await failDevice(device.id, `Install scripts cannot run on ${device.osType ?? 'an unknown OS'}`);
+        scriptOsFailureCount++;
+        continue;
+      }
+      const unresolved = [
+        ...(pre && !pre.ok ? pre.unresolved : []),
+        ...(post && !post.ok ? post.unresolved : []),
+      ];
+      if (unresolved.length > 0) {
+        const unresolvedMessage = `Could not resolve installer variable(s): ${[...new Set(unresolved)].join(', ')}`;
+        await failDevice(device.id, unresolvedMessage);
+        countVariableFailure(unresolvedMessage);
+        continue;
+      }
+      preScriptPayload = pre && pre.ok ? pre.payload : null;
+      postScriptPayload = post && post.ok ? post.payload : null;
     }
 
     // Destination gate — BEFORE dispatchSoftwareInstallToDevice. A denied
@@ -972,6 +1183,7 @@ export async function buildAndDispatchSoftwareInstalls(
     const effectiveFileType = isSoftwareFileType(versionRecord.fileType)
       ? versionRecord.fileType
       : 'exe';
+    const detectionRules = stripUnsupportedDetectionClauses(versionRecord.detectionRules, device.agentVersion);
     const payload: AgentCommand['payload'] = {
       deploymentId,
       retryCount,
@@ -1002,6 +1214,10 @@ export async function buildAndDispatchSoftwareInstalls(
       ...(detectionRules ? { detectionRules } : {}),
       ...(successExitCodes ? { successExitCodes } : {}),
       forceReinstall,
+      // #6958: present only for a script-enabled version, so every other
+      // payload is byte-identical to before.
+      ...(preScriptPayload ? { preInstallScript: preScriptPayload } : {}),
+      ...(postScriptPayload ? { postInstallScript: postScriptPayload } : {}),
     };
     // #5128: the seam refuses (and this throws) for a device that is
     // decommissioned or trust-denied — checks that did NOT exist on this path
@@ -1011,7 +1227,7 @@ export async function buildAndDispatchSoftwareInstalls(
     // silent-death bug this feature exists to remove.
     let dispatch: SoftwareInstallDispatchOutcome;
     try {
-      dispatch = await dispatchSoftwareInstallToDevice(deploymentId, device, payload, createdBy, retryCount, {
+      dispatch = await dispatchSoftwareInstallWithRestorePoint(deploymentId, orgId, device, payload, createdBy, retryCount, {
         deferDelivery: input.deferDelivery,
       });
     } catch (err) {
@@ -1028,6 +1244,7 @@ export async function buildAndDispatchSoftwareInstalls(
         );
       const failedResult = fanoutDeviceResult(input, device.id, 'failed', null, errorMessage);
       if (failedResult) deviceResults.push(failedResult);
+      dispatchFailureCount++;
       continue;
     }
     dispatchedDeviceIds.push(device.id);
@@ -1047,13 +1264,25 @@ export async function buildAndDispatchSoftwareInstalls(
   // the caller.
   if (
     dispatchedDeviceIds.length === 0 &&
-    (variableFailureCount > 0 || policyDenialCount > 0 || missingDeviceCount > 0)
+    (variableFailureCount > 0 || agentVersionFailureCount > 0 || scriptOsFailureCount > 0 ||
+      policyDenialCount > 0 || missingDeviceCount > 0)
   ) {
     return {
       status: 'failed',
       message:
         variableFailureCount > 0
-          ? 'All target devices failed installer variable resolution'
+          ? 'All target devices failed installer variable resolution' +
+            (variableFailureReasons.size === 1 &&
+            agentVersionFailureCount + scriptOsFailureCount + policyDenialCount + missingDeviceCount +
+              dispatchFailureCount === 0
+              ? `: ${[...variableFailureReasons][0]}`
+              : '')
+          : agentVersionFailureCount > 0 && scriptOsFailureCount === 0
+            ? `No target device runs a new enough agent: ${agentUpdateRequiredInstallMessage()}`
+          : scriptOsFailureCount > 0 && agentVersionFailureCount === 0
+            ? `No target device runs this version's supported OS (${scriptOs ?? 'none declared'})`
+          : agentVersionFailureCount > 0
+            ? `No target device can run this version's install scripts (agent too old or wrong OS; see each device)`
           : policyDenialCount > 0
             ? 'All target devices denied by the managed software network policy: ' +
               [...policyDenialReasons].sort().join(', ')

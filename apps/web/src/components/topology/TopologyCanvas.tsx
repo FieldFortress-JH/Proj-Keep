@@ -7,7 +7,7 @@ import type { RenderNode, TopologyRender } from './renderProjection';
 import { glyphTileUri } from './topologyGlyphs';
 import { cardSummaries, sectionHeaders } from './cardSections';
 import { routeEdgesToCards } from './edgeRouting';
-import { canvasFillHeight, chipModes, edgeEnd, fitFocus, nextFit, nextZoomTier, screenRectToModel, summaryAnchorId, summaryDensity, summaryScale, summarySlot, type Bounds, type FitState, type ZoomTier } from './semanticZoom';
+import { canvasFillHeight, wheelScrollsPage, chipModes, edgeEnd, fitFocus, nextFit, nextZoomTier, screenRectToModel, summaryAnchorId, summaryDensity, summaryScale, summarySlot, type Bounds, type FitState, type ZoomTier } from './semanticZoom';
 import CardSummaryOverlay, { type SummaryCard } from './CardSummaryOverlay';
 import NodeChipOverlay, { overviewChips, type NodeChip } from './NodeChipOverlay';
 
@@ -106,6 +106,10 @@ function stylesheet(c: ReturnType<typeof palette>): cytoscape.StylesheetJson {
       'min-zoomed-font-size': 6, events: 'no' } },
     { selector: 'node[presence="offline"]', style: { opacity: 0.6 } },
     { selector: 'node[?stale]', style: { 'border-style': 'dashed' } },
+    // A visitor (assigned to another site): neutral, dashed, never a health colour (site location W2).
+    { selector: 'node[?visiting]', style: { 'border-style': 'dashed', 'border-color': c.muted, 'background-color': c.mutedBg } },
+    // A visitor with a wrong-site suggestion (site location W3): solid primary border, still never a health colour.
+    { selector: 'node[?suggested]', style: { 'border-style': 'solid', 'border-color': c.primary, 'border-width': 1.5 } },
     { selector: 'node[?unverified]', style: { 'border-style': 'dashed', 'background-color': c.mutedBg } },
     // Neighbour-cache placement (#7816): distinct from an address match, still neutral — never a health colour.
     { selector: 'node[?corroborated]', style: { 'border-style': 'dotted', 'border-width': 1.5 } },
@@ -149,7 +153,7 @@ function stylesheet(c: ReturnType<typeof palette>): cytoscape.StylesheetJson {
   ];
 }
 
-export default function TopologyCanvas({ render, positions, boxes, selection, editable, onSelect, onMove, fitRef, fitKey, fitInsetTop = 0 }: {
+export default function TopologyCanvas({ render, positions, boxes, selection, editable, onSelect, onMove, fitRef, fitKey, fitInsetTop = 0, placement = 'page', onHeight }: {
   render: TopologyRender; positions: LayoutPosition[]; boxes: LayoutBox[]; selection?: TopologySelection; editable: boolean;
   onSelect: (selection: TopologySelection) => void;
   /** One call per drop: a dragged card reports all its members at once, so the explorer re-arranges once. */
@@ -158,9 +162,13 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
   fitKey: string;
   /** Pixels at the top that floating controls cover; Fit map frames the content below them. */
   fitInsetTop?: number;
+  /** Where the map sits: the page, or the expanded view (TopologyEntry). A change re-fits the map once its new size lands. */
+  placement?: 'page' | 'expanded';
+  /** The canvas height once measured, so the inspector beside it can stop at the same line (TopologyExplorer). */
+  onHeight?: (height: number) => void;
 }) {
   const { t } = useTranslation('topology');
-  const container = useRef<HTMLDivElement>(null), overlay = useRef<HTMLDivElement>(null), chipLayer = useRef<HTMLDivElement>(null), cy = useRef<Core | null>(null);
+  const wrapper = useRef<HTMLDivElement>(null), container = useRef<HTMLDivElement>(null), overlay = useRef<HTMLDivElement>(null), chipLayer = useRef<HTMLDivElement>(null), cy = useRef<Core | null>(null);
   const callbacks = useRef({ onSelect, onMove }); callbacks.current = { onSelect, onMove };
   const insetRef = useRef(fitInsetTop); insetRef.current = fitInsetTop;
   const fitState = useRef<FitState>({});
@@ -172,20 +180,38 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
   const frame = useRef(0), schedule = useRef<() => void>(() => {});
   /** Canvas height (canvasFillHeight): fills the window below the canvas, recomputed on resize and when content above it changes. */
   const [fillHeight, setFillHeight] = useState<number>();
+  const fittedPlacement = useRef(placement);
+  const onHeightRef = useRef(onHeight); onHeightRef.current = onHeight;
+  useEffect(() => { if (fillHeight) onHeightRef.current?.(fillHeight); }, [fillHeight]);
   useEffect(() => {
-    const element = container.current;
-    if (!element) return;
-    // The app scrolls inside <main>; measure as if it were scrolled to the top.
-    let scroller: HTMLElement | null = element.parentElement;
-    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+    const renderer = cy.current;
+    if (!renderer || fittedPlacement.current === placement) return;
+    fittedPlacement.current = placement;
+    renderer.resize(); fitRef.current?.();
+  }, [fillHeight]);
+  useEffect(() => {
+    const element = container.current, host = wrapper.current;
+    if (!element || !host) return;
+    /**
+     * The scroller the map sits in: <main> on a page, the entry itself in the expanded view (TopologyEntry).
+     * Looked up per use, since expanding the map changes it without remounting the canvas.
+     */
+    const findScroller = () => {
+      let scroller: HTMLElement | null = element.parentElement;
+      while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+      return scroller;
+    };
     let pending = 0;
     const measure = () => {
       pending = 0;
-      const rect = element.getBoundingClientRect();
+      const rect = element.getBoundingClientRect(), scroller = findScroller();
       if (scroller) {
         const box = scroller.getBoundingClientRect();
+        // The frame's bottom border (the map region's) sits under the canvas too: count it, or the page overflows by it.
+        let borders = 0;
+        for (let node = element.parentElement; node && node !== scroller; node = node.parentElement) borders += parseFloat(getComputedStyle(node).borderBottomWidth) || 0;
         setFillHeight(canvasFillHeight({ viewportHeight: scroller.clientHeight, canvasTop: rect.top - box.top + scroller.scrollTop,
-          bottomGap: parseFloat(getComputedStyle(scroller).paddingBottom) || 0 }));
+          bottomGap: (parseFloat(getComputedStyle(scroller).paddingBottom) || 0) + borders }));
       } else setFillHeight(canvasFillHeight({ viewportHeight: window.innerHeight, canvasTop: rect.top + window.scrollY, bottomGap: 16 }));
     };
     const queue = () => { if (!pending) pending = requestAnimationFrame(measure); };
@@ -194,7 +220,23 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
     // Content above the canvas (operations panel, warnings, the inspector stacking on mobile) moves its top.
     const section = element.closest('section') ?? element.parentElement!;
     const observer = new ResizeObserver(queue); observer.observe(section);
-    return () => { cancelAnimationFrame(pending); window.removeEventListener('resize', queue); observer.disconnect(); };
+    // Captured above Cytoscape's own wheel listener (on the container): stopping the event there leaves the
+    // browser's default, a page scroll, while the map is partly off screen (wheelScrollsPage).
+    const wheel = (event: WheelEvent) => {
+      const scroller = findScroller();
+      if (scroller && wheelScrollsPage({ deltaY: event.deltaY, zoomKey: event.ctrlKey || event.metaKey, map: element.getBoundingClientRect(),
+        viewport: scroller.getBoundingClientRect(), scroll: { top: scroller.scrollTop, height: scroller.scrollHeight, client: scroller.clientHeight } })) { event.stopPropagation(); return; }
+      // Zoomed out, the cards and chips are HTML over the canvas, so Cytoscape never saw a wheel over them and the
+      // page scrolled instead of the map zooming. Hand that wheel to Cytoscape, which zooms at the pointer as usual.
+      const target = event.target as Node;
+      if (overlay.current?.contains(target) || chipLayer.current?.contains(target)) {
+        event.preventDefault();
+        element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaX: event.deltaX, deltaY: event.deltaY, deltaZ: event.deltaZ, deltaMode: event.deltaMode,
+          clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey, altKey: event.altKey }));
+      }
+    };
+    host.addEventListener('wheel', wheel, { capture: true, passive: false });
+    return () => { cancelAnimationFrame(pending); window.removeEventListener('resize', queue); observer.disconnect(); host.removeEventListener('wheel', wheel, { capture: true }); };
   }, []);
   const chips = useMemo<NodeChip[]>(() => overviewChips(render), [render]);
   const summaries = useMemo<SummaryCard[]>(() => {
@@ -349,17 +391,22 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
     const labelOf = new Map(render.nodes.map((node) => [node.id, node.label]));
     const family = fontFamily();
     const badgeLabel = t('grouped.sharedIpBadge'), badgeW = badgeWidth(badgeLabel, family);
+    const visitingLabel = t('grouped.crossSite.visitingBadge'), visitingW = badgeWidth(visitingLabel, family);
+    const suggestedLabel = t('grouped.crossSite.suggestedBadge'), suggestedW = badgeWidth(suggestedLabel, family);
+    /** The compact pill closing a tile's second line: "Visiting" for a visitor, "Shared IP" for tiles that report one address. */
+    const markerOf = (node: RenderNode) => node.suggested ? { label: suggestedLabel, width: suggestedW } : node.visiting ? { label: visitingLabel, width: visitingW }
+      : node.sharedWith > 0 ? { label: badgeLabel, width: badgeW } : null;
     renderer.batch(() => {
       // Parents first so children can reference them.
       const ordered = [...render.nodes].sort((a, b) => Number(!!a.parent) - Number(!!b.parent));
       const nodes: cytoscape.ElementDefinition[] = ordered.map((node) => {
         const width = sizes.get(node.id)?.width ?? 208, height = sizes.get(node.id)?.height ?? 60;
         const card = node.kind === 'group' || node.kind === 'unidentified';
-        return { group: 'nodes', data: { id: node.id, display: display(node, width, family, node.sharedWith > 0 ? badgeW + 6 : 0), tooltip: node.note ?? undefined, chip: !node.parent && !card && node.kind !== 'outside', kind: node.kind, width, height,
+        return { group: 'nodes', data: { id: node.id, display: display(node, width, family, markerOf(node) ? markerOf(node)!.width + 6 : 0), tooltip: node.note ?? undefined, chip: !node.parent && !card && node.kind !== 'outside', kind: node.kind, width, height,
           textWidth: card ? '4000px' : `${Math.max(80, width - TEXT_INSET - TEXT_END)}px`, textShift: card || node.kind === 'outside' ? 0 : TEXT_INSET - width,
           icon: card || node.kind === 'outside' ? 'none' : glyphTileUri(node.glyph), presence: node.presence ?? undefined, member: !!node.parent,
           health: node.health ?? undefined, stale: node.stale, unverified: node.unverified, corroborated: node.corroborated, networkClass: node.networkClass ?? undefined,
-          presentation: node.id.startsWith('presentation:'), titleShift: 0, ...(node.parent ? { parent: node.parent } : {}) },
+          visiting: !!node.visiting, suggested: !!node.suggested, presentation: node.id.startsWith('presentation:'), titleShift: 0, ...(node.parent ? { parent: node.parent } : {}) },
           ...(card ? {} : { position: points.get(node.id) ?? { x: 0, y: 0 } }) };
       });
       // Section headers follow the packed members; they are drawing only (never persisted or selected).
@@ -379,15 +426,15 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
         relationshipIds: edge.relationshipIds, toCard: edge.style !== 'route' && (cards.has(edge.source) || cards.has(edge.target)),
         ...(edge.label ? { label: edge.label } : {}), ...(edge.sourceEnd ? { sourceEnd: edge.sourceEnd } : {}), ...(edge.targetEnd ? { targetEnd: edge.targetEnd } : {}) } }));
       // Shared-IP markers close the address line; the full sentence is the tile's tooltip and in the inspector.
-      const badges: cytoscape.ElementDefinition[] = render.nodes.filter((node) => node.sharedWith > 0 && points.has(node.id)).map((node) => {
-        const point = points.get(node.id)!, width = sizes.get(node.id)?.width ?? 208;
+      const badges: cytoscape.ElementDefinition[] = render.nodes.filter((node) => markerOf(node) && points.has(node.id)).map((node) => {
+        const point = points.get(node.id)!, width = sizes.get(node.id)?.width ?? 208, marker = markerOf(node)!;
         // Right after the address text (clipped to leave the marker room), not floating at the tile's edge.
-        const detail = detailLine(node, width, family, badgeW + 6);
+        const detail = detailLine(node, width, family, marker.width + 6);
         const textEnd = measureContext ? (measureContext.font = `500 12px ${family}`, measureContext.measureText(detail).width) : detail.length * 6.5;
-        return { group: 'nodes', selectable: false, data: { id: `badge:${node.id}`, kind: 'badge', presentation: true, member: false, display: badgeLabel, width: badgeW, height: BADGE_HEIGHT,
-          textShift: 0, textWidth: `${badgeW + 40}px`, icon: 'none', ...(node.parent ? { parent: node.parent } : {}) },
+        return { group: 'nodes', selectable: false, data: { id: `badge:${node.id}`, kind: 'badge', presentation: true, member: false, display: marker.label, width: marker.width, height: BADGE_HEIGHT,
+          textShift: 0, textWidth: `${marker.width + 40}px`, icon: 'none', ...(node.parent ? { parent: node.parent } : {}) },
           // Address line centre: two 12px lines at 1.35 line height, centred in the tile.
-          position: { x: point.x - width / 2 + TEXT_INSET + textEnd + 6 + badgeW / 2, y: point.y + 8 } };
+          position: { x: point.x - width / 2 + TEXT_INSET + textEnd + 6 + marker.width / 2, y: point.y + 8 } };
       });
       // One invisible anchor per card, placed over its summary panel by the sync loop (never persisted or laid out).
       const anchors: cytoscape.ElementDefinition[] = [...cards].map((card) => {
@@ -415,6 +462,8 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
         if (element.position) existing.position(element.position);
       }
       renderer.nodes().ungrabify(); if (editable) renderer.nodes('[kind!="section"][kind!="badge"]').grabify();
+      // A visitor is presentation only: it can neither be pinned nor dragged out of its card.
+      renderer.nodes('[?visiting]').ungrabify();
       renderer.elements().unselect();
       if (selection) {
         const target = selection.kind === 'edge' ? renderer.edges().filter((edge) => (edge.data('relationshipIds') as string[] | undefined)?.includes(selection.id) ?? edge.id() === selection.id)
@@ -443,9 +492,9 @@ export default function TopologyCanvas({ render, positions, boxes, selection, ed
   };
   const showAll = () => { const renderer = cy.current; if (renderer) { renderer.fit(undefined, FIT_PADDING); outsideRef.current = []; setOffscreen(0); } };
 
-  return <div className="relative min-w-0 flex-1">
+  return <div ref={wrapper} className="relative min-w-0 flex-1">
     <div ref={container} data-testid="topology-canvas" aria-hidden="true" className="min-w-0 bg-card text-card-foreground"
-      style={{ height: fillHeight ? `${fillHeight}px` : 'max(480px, calc(100vh - 300px))', backgroundImage: 'radial-gradient(hsl(var(--border)) 1px, transparent 1px)', backgroundSize: '22px 22px' }} />
+      style={{ height: fillHeight ? `${fillHeight}px` : 'max(320px, calc(100vh - 300px))', backgroundImage: 'radial-gradient(hsl(var(--border)) 1px, transparent 1px)', backgroundSize: '22px 22px' }} />
     <CardSummaryOverlay ref={overlay} cards={summaries} visible={tier === 'summary'} onZoom={zoomToCard} />
     <NodeChipOverlay ref={chipLayer} chips={chips} visible={tier === 'summary'} selectedId={selection?.kind === 'node' ? selection.id : undefined} onSelect={(id) => onSelect({ kind: 'node', id })} />
     {offscreen > 0 && <button type="button" data-testid="topology-show-all" onClick={showAll}

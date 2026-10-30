@@ -22,25 +22,33 @@ type pendingResponse struct {
 
 // Session represents a connected user helper with verified identity.
 type Session struct {
-	UID            uint32 // Numeric UID (0 on Windows; kept for logging/compat)
-	IdentityKey    string // Platform identity: UID string on Unix, SID on Windows
-	Username       string
-	DisplayEnv     string
-	SessionID      string
-	PID            int // OS process ID of the helper process
-	Capabilities   *ipc.Capabilities
-	TCCStatus      *ipc.TCCStatus
-	AllowedScopes  []string
-	WinSessionID   string         // Windows session ID string (e.g., "1", "2") for targeting
-	HelperRole     ipc.HelperRole // "system" or "user" — determines scopes and capabilities
-	BinaryKind     string
-	DesktopContext string
+	UID           uint32 // Numeric UID (0 on Windows; kept for logging/compat)
+	IdentityKey   string // Platform identity: UID string on Unix, SID on Windows
+	Username      string
+	DisplayEnv    string
+	SessionID     string
+	PID           int // OS process ID of the helper process
+	Capabilities  *ipc.Capabilities
+	TCCStatus     *ipc.TCCStatus
+	AllowedScopes []string
+	WinSessionID  string // Windows session ID string (e.g., "1", "2") for targeting
+	// WinSessionVerified is true when WinSessionID came from the kernel (the
+	// peer PID's session) rather than the helper's self-report. Caller
+	// verification (#6354) only targets verified sessions on Windows.
+	WinSessionVerified bool
+	HelperRole         ipc.HelperRole // "system" or "user" — determines scopes and capabilities
+	BinaryKind         string
+	DesktopContext     string
 	// ConsentProtocolVersion is the consent prompt exchange this helper
 	// advertised at auth (ipc.ConsentProtocolVersion), 0 for version 1. Set
 	// once at auth by consentProtocolFromAuth, never changed afterwards.
 	ConsentProtocolVersion int
-	ConnectedAt            time.Time
-	LastSeen               time.Time
+	// SupportsTargetedPamDismiss is true when this SYSTEM helper advertised it
+	// can dismiss one specific consent.exe (ipc.PamDismissConsentRequest.Instance).
+	// Set once at auth by targetedPamDismissFromAuth, never changed afterwards.
+	SupportsTargetedPamDismiss bool
+	ConnectedAt                time.Time
+	LastSeen                   time.Time
 
 	conn    *ipc.Conn
 	mu      sync.Mutex
@@ -55,6 +63,29 @@ type Session struct {
 
 	broker      *Broker
 	peerProcess *ownedPeerProcessRef
+
+	// Prompt host advertisement (#10190), set once at auth by
+	// applyAuthAdvertisements and never changed afterwards: the clamped
+	// prompt protocol, the granted "<kind>@<n>" entries, and the renderer
+	// build version. Read through PromptProtocol / PromptKindAds /
+	// PromptKindVersion / RendererVersion.
+	promptProtocol  int
+	promptKinds     []string
+	rendererVersion string
+	// uiLocale is the UI language the helper probed (AuthRequest.UILocale,
+	// sanitized by uiLocaleFromAuth); set once at auth, read through UILocale.
+	uiLocale string
+	// agentHandlesTCCNotice is what this session's auth response told the
+	// helper (AuthResponse.AgentHandlesTCCNotice, #10190 W04): the agent
+	// shows the macOS permission notice from this helper's tcc_status.
+	agentHandlesTCCNotice atomic.Bool
+	// tccForward orders this session's tcc_status reports to the agent's
+	// handler (tcc_notice.go).
+	tccForward tccForwardQueue
+
+	// helperLog caps relayed helper_log records (#9266); see helperLogLimiter.
+	helperLogOnce sync.Once
+	helperLog     *ipc.HelperLogCap
 }
 
 // NewSession creates a new session for a verified user helper connection.
@@ -115,6 +146,20 @@ var ErrDuplicateCommand = fmt.Errorf("duplicate in-flight command id")
 // SendCommand sends a command to the user helper and waits for a response.
 // Returns the response envelope or an error if the timeout is reached.
 func (s *Session) SendCommand(id, cmdType string, payload any, timeout time.Duration) (*ipc.Envelope, error) {
+	wait, err := s.startCommand(id, cmdType, payload)
+	if err != nil {
+		return nil, err
+	}
+	return wait(timeout)
+}
+
+// startCommand registers the pending response for id, sends the command, and
+// returns a function that waits for the correlated reply. The send happens
+// before startCommand returns, so a caller that waits on another goroutine
+// keeps the same on-the-wire ordering as a synchronous SendCommand. The
+// returned wait must be called exactly once: it is what removes the pending
+// entry. On error nothing is left registered.
+func (s *Session) startCommand(id, cmdType string, payload any) (func(timeout time.Duration) (*ipc.Envelope, error), error) {
 	ch := make(chan *ipc.Envelope, 1)
 	s.mu.Lock()
 	if s.closed {
@@ -133,16 +178,25 @@ func (s *Session) SendCommand(id, cmdType string, payload any, timeout time.Dura
 	done := s.done
 	s.mu.Unlock()
 
-	defer func() {
+	unregister := func() {
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
-	}()
+	}
 
 	if err := s.conn.SendTyped(id, cmdType, payload); err != nil {
+		unregister()
 		return nil, err
 	}
 
+	return func(timeout time.Duration) (*ipc.Envelope, error) {
+		defer unregister()
+		return awaitResponse(ch, done, timeout)
+	}, nil
+}
+
+// awaitResponse waits for the reply registered by startCommand.
+func awaitResponse(ch chan *ipc.Envelope, done <-chan struct{}, timeout time.Duration) (*ipc.Envelope, error) {
 	select {
 	case resp, ok := <-ch:
 		if !ok || resp == nil {
@@ -581,6 +635,12 @@ func expectedResponseType(cmdType string) string {
 		return ipc.TypeLaunchResult
 	case backupipc.TypeBackupCommand:
 		return backupipc.TypeBackupResult
+	case ipc.TypeCallerVerifyRequest:
+		return ipc.TypeCallerVerifyResponse
+	case ipc.TypeMessageShow:
+		return ipc.TypeMessagePresented
+	case ipc.TypeChatOpen, ipc.TypeChatMessage:
+		return ipc.TypeChatPresented
 	default:
 		return ""
 	}
@@ -588,6 +648,24 @@ func expectedResponseType(cmdType string) string {
 
 func responseValidator(cmdType string, payload any) func(*ipc.Envelope) error {
 	switch cmdType {
+	case ipc.TypeCallerVerifyRequest:
+		// Only an offered number, not_me or timeout is a legal answer. A
+		// malformed answer is dropped here, so the caller times out (never
+		// approves) instead of acting on it.
+		req, ok := payload.(ipc.CallerVerifyRequest)
+		if !ok {
+			return func(*ipc.Envelope) error { return fmt.Errorf("caller_verify request payload has unexpected type") }
+		}
+		return func(env *ipc.Envelope) error {
+			var answer ipc.CallerVerifyResponse
+			if err := json.Unmarshal(env.Payload, &answer); err != nil {
+				return fmt.Errorf("unmarshal caller_verify response: %w", err)
+			}
+			if !req.AnswerAllowed(answer.Choice) {
+				return fmt.Errorf("caller_verify response carries an unoffered choice")
+			}
+			return nil
+		}
 	case ipc.TypeCommand:
 		req, ok := payload.(ipc.IPCCommand)
 		if !ok || req.CommandID == "" {

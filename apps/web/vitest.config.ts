@@ -6,7 +6,7 @@ import path from 'node:path';
 // monaco-editor >=0.56's package.json `exports` map only publishes
 // `"./*.js"` / `"./*"` -> `esm/vs/*.js` — it no longer exposes the AMD
 // `min/vs/**` assets (including CSS) via any subpath specifier, so
-// `ScriptForm.tsx`'s `import 'monaco-editor/min/vs/editor/editor.main.css'`
+// `lib/monacoLoader.ts`'s `import 'monaco-editor/min/vs/editor/editor.main.css'`
 // fails module resolution under Vite. Mirrored from the same alias in
 // astro.config.mjs — keep both in sync.
 const require = createRequire(import.meta.url);
@@ -30,6 +30,9 @@ export default defineConfig({
       // of the reportPdf subpath — the more specific alias must be listed first.
       '@breeze/shared/reportPdf': fileURLToPath(
         new URL('../../packages/shared/src/reportPdf/index.ts', import.meta.url)
+      ),
+      '@breeze/shared/documents': fileURLToPath(
+        new URL('../../packages/shared/src/documents/index.ts', import.meta.url)
       ),
       '@breeze/shared/testing': fileURLToPath(new URL('../../packages/shared/src/testing', import.meta.url)),
       '@breeze/shared/validators': fileURLToPath(new URL('../../packages/shared/src/validators', import.meta.url)),

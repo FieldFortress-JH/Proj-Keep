@@ -5,6 +5,10 @@ import { cn } from '@/lib/utils';
 import { FilterSelect } from '../shared/FilterSelect';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
+import type { OwnerScope } from '@/hooks/useDefaultOwnerScope';
+import { useJwtClaims } from '@/lib/authScope';
+import { useFleetOrgOwner } from '@/hooks/useFleetOrgOwner';
+import RoleOwnerScopeField from './RoleOwnerScopeField';
 
 export type Permission = {
   resource: string;
@@ -689,6 +693,10 @@ export type RoleFormData = {
   permissions: Permission[];
   parentRoleId: string | null;
   forceMfa: boolean;
+  // Create-only owner axis (#8370). Set only for a partner-scope creator; an
+  // org-scope creator omits both and the API uses its token org.
+  ownerScope?: OwnerScope;
+  orgId?: string;
 };
 
 type RoleFormModalProps = {
@@ -697,6 +705,8 @@ type RoleFormModalProps = {
   role?: Role | null;
   availableParentRoles?: Role[];
   inheritedPermissions?: EffectivePermission[];
+  /** Called when the user picks a different parent, so the page can load that parent's permissions (#9603). */
+  onParentChange?: (parentRoleId: string | null) => void;
   onSubmit: (data: RoleFormData) => void;
   onCancel: () => void;
   loading?: boolean;
@@ -708,18 +718,42 @@ export function RoleFormModal({
   role,
   availableParentRoles = [],
   inheritedPermissions = [],
+  onParentChange,
   onSubmit,
   onCancel,
   loading = false
 }: RoleFormModalProps) {
+  // #9603: a clone must not inherit the source's description (it can describe
+  // permissions the clone no longer has); pre-fill a localized, editable one.
+  const initialDescription = () =>
+    mode === 'clone'
+      ? i18n.t('settings:roleManager.cloneDescription', { name: role?.name ?? '' })
+      : role?.description || '';
   const [name, setName] = useState(mode === 'clone' ? '' : role?.name || '');
-  const [description, setDescription] = useState(role?.description || '');
+  const [description, setDescription] = useState(initialDescription);
   const [permissions, setPermissions] = useState<Permission[]>(role?.permissions || []);
   const [parentRoleId, setParentRoleId] = useState<string | null>(role?.parentRoleId || null);
   const [forceMfa, setForceMfa] = useState<boolean>(role?.forceMfa === true);
   const [catalog, setCatalog] = useState<PermissionCatalog | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogReloadKey, setCatalogReloadKey] = useState(0);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  // #8370: the owner axis is an explicit, create-only choice for partner-scope
+  // creators. It defaults to partner regardless of the header org: a partner
+  // role is the one a partner admin can assign on their own Users page, and the
+  // header org used to turn every create into an org role without saying so.
+  // Reactive claims, not the one-shot getJwtClaims(): on a cold load the token
+  // lands after first paint, and a create submitted before then would omit the
+  // owner axis without the selector ever having been shown. Create waits.
+  const jwt = useJwtClaims();
+  const isPartnerScope = jwt.status === 'resolved' && jwt.claims.scope === 'partner' && !!jwt.claims.partnerId;
+  const claimsPending = mode === 'create' && jwt.status !== 'resolved';
+  const fleet = useFleetOrgOwner();
+  const { setOrgId: setFleetOrgId } = fleet;
+  const [ownerScope, setOwnerScope] = useState<OwnerScope>('partner');
+  const showOwnerScope = mode === 'create' && isPartnerScope;
+  const needsOwnerOrg = showOwnerScope && ownerScope === 'organization' && fleet.needsOrgSelection;
 
   const reloadCatalog = useCallback(() => setCatalogReloadKey((k) => k + 1), []);
 
@@ -770,13 +804,29 @@ export function RoleFormModal({
   useEffect(() => {
     if (!isOpen) return;
     setName(mode === 'clone' ? '' : role?.name || '');
-    setDescription(role?.description || '');
+    setDescription(initialDescription());
     setPermissions(role?.permissions || []);
     setParentRoleId(role?.parentRoleId || null);
     // Clone pre-fills from the source: the server copies force_mfa onto the
     // clone, so the toggle must start from the same value it will get.
     setForceMfa(role?.forceMfa === true);
-  }, [isOpen, role, mode]);
+    setOwnerScope('partner');
+    setFleetOrgId('');
+    setFormError(null);
+  }, [isOpen, role, mode, setFleetOrgId]);
+
+  // A parent org role belongs to one org; once the owner org changes it can no
+  // longer be a valid parent (the API would 400), so drop it.
+  const ownerOrgId = fleet.orgId;
+  useEffect(() => {
+    if (!showOwnerScope || ownerScope !== 'organization') return;
+    setParentRoleId((current) => {
+      const parent = availableParentRoles.find((r) => r.id === current);
+      return parent && parent.scope === 'organization' && !parent.isSystem ? null : current;
+    });
+    // Keyed on the owner org only; the parent list itself is filtered by axis
+    // at render time.
+  }, [ownerOrgId]);
 
   if (!isOpen) return null;
 
@@ -788,11 +838,39 @@ export function RoleFormModal({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSubmit({ name, description, permissions, parentRoleId, forceMfa });
+    if (!showOwnerScope) {
+      onSubmit({ name, description, permissions, parentRoleId, forceMfa });
+      return;
+    }
+    if (ownerScope === 'partner') {
+      onSubmit({ name, description, permissions, parentRoleId, forceMfa, ownerScope });
+      return;
+    }
+    // The disabled submit button covers clicks; this covers Enter-key and
+    // programmatic submits.
+    if (fleet.needsOrgSelection) {
+      setFormError(i18n.t('common:layout.orgRequired.title'));
+      return;
+    }
+    onSubmit({ name, description, permissions, parentRoleId, forceMfa, ownerScope, orgId: fleet.bodyOrgId });
   };
 
-  // Filter out the current role from available parent roles (cannot be own parent)
-  const filteredParentRoles = availableParentRoles.filter((r) => r.id !== role?.id);
+  // Filter out the current role from available parent roles (cannot be own
+  // parent). On create with an explicit owner axis, offer only roles on that
+  // axis: the API rejects a parent from the other one.
+  const filteredParentRoles = availableParentRoles.filter(
+    (r) => r.id !== role?.id && (!showOwnerScope || r.scope === ownerScope)
+  );
+
+  const handleOwnerScopeChange = (next: OwnerScope) => {
+    setOwnerScope(next);
+    setFormError(null);
+    const parent = availableParentRoles.find((r) => r.id === parentRoleId);
+    if (parent && parent.scope !== next) {
+      setParentRoleId(null);
+      onParentChange?.(null);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
@@ -809,6 +887,21 @@ export function RoleFormModal({
         </div>
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-6">
+          {showOwnerScope && (
+            <RoleOwnerScopeField
+              ownerScope={ownerScope}
+              onOwnerScopeChange={handleOwnerScopeChange}
+              fleet={fleet}
+              disabled={loading}
+            />
+          )}
+
+          {formError && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {formError}
+            </div>
+          )}
+
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
               <label htmlFor="role-name" className="text-sm font-medium">
@@ -845,7 +938,11 @@ export function RoleFormModal({
             <select
               id="role-parent"
               value={parentRoleId || ''}
-              onChange={(e) => setParentRoleId(e.target.value || null)}
+              onChange={(e) => {
+                const next = e.target.value || null;
+                setParentRoleId(next);
+                onParentChange?.(next);
+              }}
               disabled={loading}
               className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -919,7 +1016,7 @@ export function RoleFormModal({
               {i18n.t('settings:roleManager.cancel')}</button>
             <button
               type="submit"
-              disabled={loading || !name.trim() || !catalog}
+              disabled={loading || !name.trim() || !catalog || needsOwnerOrg || claimsPending}
               title={!catalog ? i18n.t('settings:roleManager.waitingForPermissionCatalog') : undefined}
               className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
             >

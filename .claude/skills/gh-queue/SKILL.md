@@ -1,18 +1,18 @@
 ---
 name: gh-queue
-description: Use when reviewing, triaging, or managing the incoming GitHub backlog on the Breeze repo — PRs, Discussions, AND Issues. Stateful manager with a shared queue file, contributor profiles, parallel pr-review-toolkit dispatch, GraphQL discussion recipes, comment-style conventions, and session-log bookkeeping. Auto-detects object type from the request; bare invocation triages all three. Triggers on "review PR", "PR queue", "triage PRs/discussions/issues", "review discussions", "check open issues", "what's waiting on me", "gh queue", "repo queue", "review #NNN", or any request about managing the open-PR/discussion/issue backlog.
+description: Use when reviewing, triaging, or managing the incoming GitHub backlog on the Breeze repo — PRs, Discussions, Issues, AND Security Advisories. Stateful manager with a shared queue file, contributor profiles, parallel pr-review-toolkit dispatch, GraphQL discussion recipes, comment-style conventions, and session-log bookkeeping. Auto-detects object type from the request; bare invocation triages all four. Triggers on "review PR", "PR queue", "triage PRs/discussions/issues", "security advisories", "GHSA", "vulnerability reports", "review discussions", "check open issues", "what's waiting on me", "gh queue", "repo queue", "review #NNN", or any request about managing the open-PR/discussion/issue backlog.
 ---
 
 # Breeze GH Queue Manager
 
 ## Overview
 
-Long-running manager for the **incoming** GitHub backlog on the Breeze repo (`LanternOps/breeze`) — across three object types: **Pull Requests, Discussions, and Issues** (community + Billy + any agent-authored). State persists across sessions in two co-located files:
+Long-running manager for the **incoming** GitHub backlog on the Breeze repo (`LanternOps/breeze`) — across four object types: **Pull Requests, Discussions, Issues, and Security Advisories** (community + Billy + any agent-authored; advisories = private vulnerability reports and our own repository advisories). State persists across sessions in two co-located files:
 
 - **`queue.md`** — live snapshot, split into `## PRs`, `## Discussions`, `## Issues` sections (each with waiting-on-me / in-flight / recently-closed), plus one rolling session log at the bottom.
-- **`contributors.md`** — per-contributor profiles and review heuristics (apply across all three object types — Billy's patterns show up in PRs *and* discussions).
+- **`contributors.md`** — per-contributor profiles and review heuristics (apply across all object types — Billy's patterns show up in PRs *and* discussions).
 
-Both files are gitignored (the entire `.claude/skills/` tree is in `.gitignore`), so they're a private scratchpad that travels with the repo on this machine but doesn't leak into commits.
+`queue.md` and `contributors.md` are gitignored (`.gitignore` lists them by path; `SKILL.md` and `scripts/` ARE tracked), so the state files are a private scratchpad that travels with the repo on this machine but doesn't leak into commits. Never put advisory content or contributor verdicts in `SKILL.md`.
 
 **Outgoing items (mine) are out of scope** except to track own-PRs for merge. This skill manages what needs *my review/action*.
 
@@ -23,9 +23,10 @@ Pick scope from the request — no explicit flag required:
 - "review PR #5" / "PR queue" / "triage PRs" → **PRs only**
 - "triage discussions" / "review discussions" / "discussion #968" → **Discussions only**
 - "any new issues" / "triage issues" / "issue #710" → **Issues only**
-- bare "what's waiting on me" / "/pr" / "triage the backlog" / "gh queue" → **all three**
+- "security advisories" / "any vuln reports" / "GHSA-…" → **Advisories only**
+- bare "what's waiting on me" / "/pr" / "triage the backlog" / "gh queue" → **all four**
 
-When ambiguous, default to all three but lead with whatever the user named.
+When ambiguous, default to all four but lead with whatever the user named.
 
 ## When to invoke
 
@@ -90,6 +91,7 @@ An unlabeled issue is invisible to all three, so **label on sight** — that's w
   If `last commit > bounce date`, it's waiting on **me** → re-review (Tier-1 manual; scope is bounded to the original feedback).
 - **Discussions:** the `comments(last:1)` author in the re-orient query. `isAnswered=false` on a Q&A I already answered = I still owe an "accept answer." Do NOT read `isAnswered=null` on non-Q&A categories as "open" — that field is null for Ideas/Show-and-tell by design; use last-comment author instead. (Misread this once and flagged a pile of already-closed discussions as open.)
 - **Issues:** last comment author + date. A reporter who replied after my last comment is waiting on me.
+- **Advisories:** last comment author + date on the advisory page — see §1a. A reporter who replied after me is waiting on me, and the advisory's `updated_at` will NOT tell you.
 
 **Issues: the staleness sweep is a FULL pass, never an activity window.** Iterate every open issue whose author is not me, regardless of `updatedAt`, and compare the last comment's author+date against my last comment. A round that only looks at items updated "since the last round" misses everything that landed during a gap between rounds — that is exactly how #2987 (08-18), #3876 (08-25), #4000 (08-25) and #3386 (08-27) went unanswered for 18 days after a two-week outage in rounds, while the log claimed "every community issue last-comment = Todd." Two corollaries: (1) **a community issue with ZERO comments is waiting on me** — a last-comment check returns nothing and silently drops it, which is what hid the p1 #4000; (2) **never age a prior round's "not waiting on me" verdict** — re-run the comparison on every item every round, because a reporter can nudge after a sign-off (#3386). The one-liner:
 
@@ -101,7 +103,51 @@ gh issue list --repo LanternOps/breeze --state open --limit 400 --json number,au
 ```
 Anything that prints is 🔴 until the thread is opened and read.
 
-**Drafts — `isDraft=true` ≠ "not on me."** A draft whose *body* asks for early design/approach feedback ("opening for early feedback," "thoughts before I build the rest") is genuinely waiting on me. Read the body of every incoming draft before bucketing it author-blocked (missed once on #976). Respond with a design-level COMMENT review, not an approve/merge gate. **The draft flag also never auto-flips on a comment-thread handoff** — #859 sat 18 days bucketed "author-blocked draft" after the author had addressed every blocker and a reviewer posted "leaving the merge decision to @ToddHebebrand," because the staleness check stopped at `isDraft=true`. The last-activity-author rule OUTRANKS the draft flag: apply it to drafts too, every round — if the last substantive comment hands me the ball (LGTM-pending-maintainer, "no rush" posted *after* fixes landed), the item is 🔴 waiting-on-me regardless of draft status.
+### 1a. Security advisories (private — every round, full pass)
+
+Private vulnerability reports arrive as repository security advisories, not issues, so the PR/issue/discussion queries never see them. SECURITY.md promises acknowledgment within **48 hours**, and the OpenSSF Best Practices badge requires a first response within **14 days** for every report in the last 6 months.
+
+**List them** (API works for state, reporter, dates):
+
+```bash
+gh api repos/LanternOps/breeze/security-advisories --paginate \
+  --jq '.[] | select(.state!="closed") | [.ghsa_id,.state,.created_at[:10],(.submission!=null|tostring),([.credits_detailed[]?|select(.type=="reporter")|.user.login]|join(","))] | @tsv'
+```
+
+`state=triage` is a new inbound report nobody has accepted yet. `submission=true` (or a reporter credit) means an outside person filed it, so they are owed replies.
+
+**Comments are NOT in the API, and `updated_at` does not move when someone comments.** A triage advisory answered two days after filing still shows `updated_at == created_at` (2026-10-12: a report that had been answered on time was misread this way as never answered). The only source of truth is the advisory page, read logged in as me. Use the `ego-browser` skill:
+
+```bash
+gh api repos/LanternOps/breeze/security-advisories --paginate \
+  --jq '.[] | select(.state!="closed") | .ghsa_id' > /tmp/ghsa.txt
+ego-browser nodejs <<'EOF'
+const fs = await import("node:fs/promises");
+const ids = (await fs.readFile("/tmp/ghsa.txt", "utf8")).trim().split("\n");
+const task = await taskSpace("gh-queue advisories");
+const page = task.page("p1");
+for (const id of ids) {
+  await page.goto(`https://github.com/LanternOps/breeze/security/advisories/${id}`);
+  const c = await page.evaluate(() => [...document.querySelectorAll(".timeline-comment")]
+    .map(x => ({ who: x.querySelector(".author")?.innerText.trim(),
+                 at: x.querySelector("relative-time")?.getAttribute("datetime")?.slice(0, 10) }))
+    .filter(x => x.who));
+  const last = c.at(-1);
+  console.log(`${id} comments=${c.length} last=${last ? last.who + "@" + last.at : "NONE"}`);
+}
+EOF
+```
+
+About 1 s per advisory. Do the whole list every round; never only the triage ones, since a reporter can comment on a draft or published advisory too.
+
+**Bucketing:**
+- 🔴 **Waiting on me:** an externally reported advisory with no comment from ToddHebebrand, OR any advisory whose last comment is from someone else. Note the days since that comment against the 48 h / 14 day clocks.
+- 🟡 **Their court:** my comment is last and asks the reporter for something (hashes, repro, version).
+- 🟢 **Nothing owed:** advisories we filed ourselves with no outside comments (most published ones).
+
+**Privacy — this file is public.** Advisory content never goes in a PR, issue, discussion, commit, or this skill. In `queue.md` (gitignored) record only the GHSA id, state, and last-comment author + date. Triage notes, draft replies, and verdicts live in the private intake record `~/breeze-security/remediation/<YYYY-MM-DD>-<GHSA-id>-triage.md`; read it before replying. Advisory comments can only be posted in the GitHub UI (no API), so draft the reply there and hand it to me to paste.
+
+**Drafts — not reviewed (Todd, 2026-10-29).** A PR with `isDraft=true` gets no review of any kind: no code review, no design-level COMMENT review, no step-0 screen, no subagents, even when its body asks for early feedback. It enters the queue when the author marks it ready for review. In the report, list open drafts on one line ("Drafts, not reviewed: #A, #B") and do not bucket them. One exception to watch for: if a draft's last comment hands the merge or review decision to me (as on #859, which sat 18 days as a draft after the author had addressed every blocker), flag that draft on the same line so I can decide whether to ask the author to mark it ready. Do not review it.
 
 **Dependabot — "will auto-rebase" is a recurring queue.md lie.** Dependabot only auto-rebases trivial conflicts, NOT lockfile conflicts. For any "auto-rebase pending" PR, check `commits.last.committedDate` vs the note date; if stale, post `@dependabot rebase` explicitly, then merge **sequentially** (10-15s between admin-merges) so GH's mergeability recompute keeps up.
 
@@ -115,11 +161,30 @@ Bucket every in-scope item into:
 
 **Verify against code before responding (load-bearing rule).** When a thread *claims* a gap, bug, regression, or "X is broken" — read the actual code and confirm before you answer. Plausible-sounding claims are wrong often enough that posting on them unverified produces public mistakes. Two real misses came from repeating a claim instead of checking: a "security/patches ignore orgId" gap that was already fixed by #973, and a "filters are a scale regression" claim that was actually the existing page architecture. Grep/read first, then respond. A false-negative grep is also a trap — confirm with the real symbol, not a guessed string (searched `query('orgId')` and got zero hits when the code used `query.orgId`).
 
+#### PR step 0 — hostile-intent screen (EVERY external PR, before any tier decision)
+
+Correctness review does not ask "what could this diff do that the body doesn't say". Until 2026-10-20 nothing in this process did; Todd asked and the honest answer was "no". Now, for every PR whose author is not ToddHebebrand or dependabot, run the mechanical screen first and read its hits before bucketing:
+
+```bash
+.claude/skills/gh-queue/scripts/pr-threat-screen.sh <N>   # from the repo root
+```
+
+It prints only sections with hits: sensitive paths (workflows, Dockerfiles, scripts/, manifests, lockfiles, migrations, agent/helper/viewer, auth/signing/secrets), dependency manifest changes, **lockfile entries with the integrity hash checked against the npm registry** and any non-registry source, install hooks / shell-outs in `package.json` scripts, outbound hosts not on the known list, dynamic execution / decoding / raw DOM, long opaque strings, non-ASCII in code lines (bidi/homoglyph), env/secret/privilege/RLS-bypass touches, listeners/file writes/timers, and tests removed or lint suppressed. An empty report means no *mechanical* signal, not safe. Paste the hits that matter (or "screen: clean") into the review comment so the check is visible, and treat these as hard stops regardless of tier:
+
+- Any `.github/workflows/*`, Dockerfile, compose, `scripts/`, `.npmrc`, `turbo.json`, or `package.json` `scripts` change from an external author → read the whole change yourself, not a subagent, and ask what it runs and with which secrets (merge_group runs with full secrets; fork `pull_request` does not).
+- Any new dependency, override, `npm:` alias, git/tarball source, or integrity mismatch → verify the package on the registry (publisher, age, downloads, repo) before anything else. A typosquat looks like a routine bump.
+- Any new outbound host, decoded blob, `eval`/`Function`/`exec`, or non-ASCII in a code line → explain it or bounce it.
+- Anything under `agent/`, `apps/helper`, `apps/viewer`, the installer/updater, signing, SSO/auth, or `SECURITY DEFINER` / system-scope DB context → Tier 2 with the hostile-reading section, no exceptions for trusted contributors; this code runs on customer machines or bypasses tenant isolation by design.
+
+**Dependency bumps and "trivial" config from external authors are never green-on-sight.** They are exactly the diffs an adversary would choose. The old Tier 1 list below is for own/dependabot PRs and for external diffs that the screen has already shown to be clean.
+
+**Contributor trust tiers** live in `contributors.md` (§ Trust tiers). Reputation is built in weeks and is not provenance; a tier changes how much you read yourself, never whether the screen runs.
+
 #### PR-specific tiering — don't waste subagent budget on green-on-sight
 
-**Tier 1 — fast manual scan (~30s, no subagents).** `gh pr diff <N> | head -150` or `gh pr view <N> --json files,additions,deletions`. Green-on-sight: test-only diffs, dependency bumps, explicit verifiable cleanups, trivial config mirroring an existing pattern, dated-TODO removal (verify date + grep for live consumers).
+**Tier 1 — fast manual scan (~30s, no subagents).** `gh pr diff <N> | head -150` or `gh pr view <N> --json files,additions,deletions`. Green-on-sight (own/dependabot PRs, or external PRs with a clean screen): test-only diffs, dependency bumps, explicit verifiable cleanups, trivial config mirroring an existing pattern, dated-TODO removal (verify date + grep for live consumers).
 
-**Tier 2 — parallel pr-review-toolkit subagents (only the 🟡 pile).** Heuristics: touches auth/RBAC/RLS/tenant isolation; new schema/migration; diff >~200 lines or >5 files; novel subsystem; frontend PR from an AI-assisted contributor (check `Dialog.tsx`/`runAction`/helper reinvention); title makes a hard-to-skim claim. Send one message with multiple `Agent` tool uses, `subagent_type: pr-review-toolkit:code-reviewer`:
+**Tier 2 — parallel pr-review-toolkit subagents (only the 🟡 pile).** Heuristics: touches auth/RBAC/RLS/tenant isolation; new schema/migration; diff >~200 lines or >5 files; novel subsystem; frontend PR from an AI-assisted contributor (check `Dialog.tsx`/`runAction`/helper reinvention); title makes a hard-to-skim claim; any step-0 hard stop. Send one message with multiple `Agent` tool uses, `subagent_type: pr-review-toolkit:code-reviewer`:
 
 ```
 Review PR #<NUM> on LanternOps/breeze. Fetch the diff with:
@@ -130,11 +195,21 @@ Focus on: correctness bugs at file:line; tenant isolation / RLS (every new tenan
 policies — see CLAUDE.md); whole-system coherence (does the diff match the body? does it reinvent
 something?); for Billy's PRs check globally-disconnected patterns (re-implemented modals, body-sniff
 vs helper — see contributors.md); comment style (bold leads, file:line, no tables).
-Report under 250 words: must-fix vs nice-to-have, file:line + one-line rationale each. Do NOT post
-comments — return findings as text for me to consolidate.
+HOSTILE READING (separate section, required): assume the author is adversarial and the body is
+cover. Name every thing this diff could do that the body does not say: data it can read or send
+outside the tenant or the host, code it can execute (install hooks, dynamic imports, exec,
+templates reaching the shell or SQL), privilege it gains (system DB scope, SECURITY DEFINER,
+platform-admin paths, RLS predicates removed or widened, auth/signing/verification weakened,
+TLS checks relaxed), persistence it adds (timers, workers, cron, startup paths, agent/helper/
+updater/installer changes), and anything obfuscated (encoded strings, homoglyphs, dead-looking
+code that is reachable). Check that tests still cover what they covered before (deleted/skipped
+tests, loosened assertions). Say "hostile reading: nothing found" explicitly if so. The screen
+output is: <paste step-0 hits or "clean">.
+Report under 300 words: must-fix vs nice-to-have, file:line + one-line rationale each, hostile
+reading last. Do NOT post comments — return findings as text for me to consolidate.
 ```
 
-Consolidate findings before posting. Group must-fix vs nice. When in doubt, lean Tier 1.
+Consolidate findings before posting. Group must-fix vs nice. When in doubt, lean Tier 1 for own/dependabot PRs; for external PRs that hit a step-0 stop, when in doubt lean Tier 2.
 
 #### Discussions & Issues — mostly manual
 
@@ -194,7 +269,7 @@ Then read the commit **body** before closing, not the subject: several deliberat
 ### 6. After every action
 
 Update `queue.md`:
-- Move closed/merged items out of the waiting section of the right type (`## PRs` / `## Discussions` / `## Issues`)
+- Move closed/merged items out of the waiting section of the right type (`## PRs` / `## Discussions` / `## Issues` / `## Advisories` — ids and dates only)
 - Add a one-line entry to the session log at the bottom with today's **absolute** date (`### 2026-05-30 — ...`), never "today"/"yesterday"
 - If you learned a contributor pattern, update `contributors.md`
 
@@ -205,7 +280,7 @@ When an item arrives from someone not in `contributors.md`: skim their first few
 ## Common gh commands
 
 ```bash
-# PRs waiting on me / drafts / single PR
+# PRs waiting on me / drafts (list only, never reviewed — see §1) / single PR
 gh pr list --repo LanternOps/breeze --state open --search "review-requested:@me" --limit 20
 gh pr list --repo LanternOps/breeze --state open --draft --limit 20
 gh pr view <N> --repo LanternOps/breeze --comments

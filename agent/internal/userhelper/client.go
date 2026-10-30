@@ -66,6 +66,12 @@ type Client struct {
 	scopes              []string
 	stopChan            chan struct{}
 	desktopMgr          *helperDesktopManager
+	prompts             *nativePromptRenderer // prompt host renderer (#10190)
+
+	// agentHandlesTCCNotice is this connection's
+	// AuthResponse.AgentHandlesTCCNotice (#10190 W04), set at authentication.
+	agentHandlesTCCNotice bool
+
 	// desktopFence is the helper half of the start fence: seeded from
 	// the service on connect, maintained from the starts and stops this helper
 	// sees. Zero value ready to use.
@@ -110,7 +116,7 @@ func NewWithOptions(socketPath string, role ipc.HelperRole, binaryKind, context 
 	if binaryKind == "" {
 		binaryKind = ipc.HelperBinaryUserHelper
 	}
-	return &Client{
+	c := &Client{
 		socketPath: socketPath,
 		role:       role,
 		binaryKind: binaryKind,
@@ -120,6 +126,29 @@ func NewWithOptions(socketPath string, role ipc.HelperRole, binaryKind, context 
 		executor:   executor.New(nil),
 		pending:    make(map[string]chan *ipc.Envelope),
 	}
+	show := showNativePromptOS
+	if role == ipc.HelperRoleSystem {
+		show = showSystemPromptOS // W07: the elevation first question (P14)
+	}
+	c.prompts = newNativePromptRenderer(advertisedNativePromptKinds(role), show, c.sendPromptMessage, time.Now)
+	return c
+}
+
+// closePrompts takes every native prompt dialog down when the connection
+// ends; a new client re-receives what is still open after reconnect.
+func (c *Client) closePrompts() {
+	if c.prompts != nil {
+		c.prompts.closeAll()
+	}
+}
+
+// sendPromptMessage sends a renderer -> agent prompt message (#10190).
+func (c *Client) sendPromptMessage(msgType string, payload any) error {
+	conn := c.currentConn()
+	if conn == nil {
+		return errors.New("prompt: not connected")
+	}
+	return conn.SendTyped(fmt.Sprintf("%s-%d", msgType, promptMessageSeq.Add(1)), msgType, payload)
 }
 
 // Run connects to the root daemon, authenticates, and enters the command loop.
@@ -145,6 +174,7 @@ func (c *Client) Run() error {
 	}
 	defer c.conn.Close()
 	defer c.desktopMgr.stopAll() // Release DXGI/COM handles on any exit path
+	defer c.closePrompts()       // No native prompt dialog outlives its connection (#10190)
 
 	if err := c.authenticate(); err != nil {
 		return fmt.Errorf("authenticate: %w", err)
@@ -195,6 +225,8 @@ func (c *Client) Run() error {
 		}
 	}
 
+	c.wireDesktopICETrickle()
+
 	// Hand each session's clipboard counters to the service for the central
 	// audit log (#1012). Sent once, from session teardown.
 	c.desktopMgr.mgr.OnClipboardSummary = func(sessionID string, summary ipc.ClipboardSummary) {
@@ -205,15 +237,21 @@ func (c *Client) Run() error {
 	}
 
 	// Start TCC permission check loop (macOS only; no-op on other platforms).
-	// Skip capture probes while a live session is active to avoid contending
-	// with the streaming capturer in the same helper process.
+	// It never captures the screen (#8390), so it needs no coordination with
+	// a live session's capturer.
+	agentHandlesTCC := c.agentHandlesTCCNotice
 	safeGo("tcc_check", func() {
-		runTCCCheckLoop(c.conn, runDone, c.context, c.binaryKind, func() bool {
-			return !c.desktopMgr.hasActiveSessions()
-		})
+		runTCCCheckLoop(c.conn, runDone, c.context, c.binaryKind, agentHandlesTCC)
 	})
 
 	log.Info("user helper connected and authenticated", "agentId", c.agentID)
+
+	// Relay queued and future warn+ log records to the agent for the life of
+	// this connection, when the process has no shipper of its own (#9266).
+	if fwd := activeLogForwarder.Load(); fwd != nil {
+		conn := c.conn
+		safeGo("log_forward", func() { fwd.Pump(conn, runDone) })
+	}
 
 	// Enter command loop
 	return c.commandLoop()
@@ -304,6 +342,7 @@ func (c *Client) authenticate() error {
 	displayEnv := detectDisplayEnv()
 	// Opaque, host-identity-free session id (#3109) — see newSessionID.
 	sessionID := newSessionID()
+	promptProtocol, promptKinds := NativePromptAdvertisement(c.role)
 
 	supportsConsent := consentUISupported()
 	authReq := ipc.AuthRequest{
@@ -323,7 +362,15 @@ func (c *Client) authenticate() error {
 		// Advertised only alongside SupportsConsentUI: the agent hands v2
 		// prompts only to helpers that render them (sessionbroker's
 		// consentProtocolFromAuth applies the same condition).
-		ConsentProtocolVersion: consentProtocolForAuth(supportsConsent),
+		ConsentProtocolVersion:     consentProtocolForAuth(supportsConsent),
+		SupportsTargetedPamDismiss: supportsTargetedPamDismissForAuth(c.role),
+		// Prompt host (#10190): protocol 1 with zero kinds in W02, so the
+		// broker grants no prompt scope and every prompt stays legacy.
+		PromptProtocolVersion: promptProtocol,
+		PromptKinds:           promptKinds,
+		RendererVersion:       helperRendererVersion(),
+		// The session's UI language (#10190 W03); the agent negotiates it.
+		UILocale: helperUILocale(),
 	}
 
 	if err := c.conn.SendTyped("auth", ipc.TypeAuthRequest, authReq); err != nil {
@@ -377,13 +424,14 @@ func (c *Client) authenticate() error {
 	c.sessionKey = key
 	c.agentID = authResp.AgentID
 	c.scopes = authResp.AllowedScopes
+	c.agentHandlesTCCNotice = !ShowsOwnTCCReminder(authResp)
 	c.setAuthenticatedAt(time.Now())
 
 	return nil
 }
 
 // currentCapabilities computes the capabilities this helper would report now.
-// On macOS desktop helpers this runs a real capture probe.
+// On macOS desktop helpers this runs the non-capturing access check.
 func (c *Client) currentCapabilities() ipc.Capabilities {
 	caps := detectCapabilitiesFn(c.binaryKind, c.context)
 	// On Windows, user-role helpers cannot capture desktop (no SYSTEM token
@@ -505,6 +553,12 @@ func (c *Client) commandLoop() error {
 		case ipc.TypeDesktopLeaseUpdate:
 			safeGo("desktop_lease_update", func() { c.handleDesktopLeaseUpdate(env) })
 
+		case ipc.TypeDesktopICETrickleBegin:
+			safeGo("desktop_ice_trickle_begin", func() { c.handleDesktopICETrickleBegin(env) })
+
+		case ipc.TypeDesktopRemoteICECandidate:
+			safeGo("desktop_remote_ice_candidate", func() { c.handleDesktopRemoteICECandidate(env) })
+
 		case ipc.TypeDesktopInput:
 			safeGo("desktop_input", func() { c.handleDesktopInput(env) })
 
@@ -523,6 +577,11 @@ func (c *Client) commandLoop() error {
 		case ipc.TypeSASResponse:
 			if !c.resolvePendingResponse(env) {
 				log.Warn("unsolicited sas_response from daemon", "id", env.ID)
+			}
+
+		case ipc.TypePromptShow, ipc.TypePromptUpdate, ipc.TypePromptClose, ipc.TypePromptActionResult, ipc.TypePromptBrandingSync:
+			if c.prompts != nil {
+				c.prompts.handle(env)
 			}
 
 		case ipc.TypeDisconnect:
@@ -608,6 +667,31 @@ func safeGo(name string, fn func()) {
 	}()
 }
 
+// runCommandRecovered runs a command handler and converts a panic into a
+// failed result. safeGo already keeps a panic from killing the helper, but it
+// cannot reply: without this the agent waits out its whole IPC budget (65 s for
+// take_screenshot) and reports a timeout instead of the real failure (#10304).
+func runCommandRecovered(cmd ipc.IPCCommand, fn func() ipc.IPCCommandResult) (result ipc.IPCCommandResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			log.Error("recovered panic in command handler",
+				"command", cmd.Type,
+				"commandId", cmd.CommandID,
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(buf[:n]),
+			)
+			result = ipc.IPCCommandResult{
+				CommandID: cmd.CommandID,
+				Status:    "failed",
+				Error:     fmt.Sprintf("%s failed: internal panic in user helper: %v", cmd.Type, r),
+			}
+		}
+	}()
+	return fn()
+}
+
 func (c *Client) handleCommand(env *ipc.Envelope) {
 	var cmd ipc.IPCCommand
 	if err := json.Unmarshal(env.Payload, &cmd); err != nil {
@@ -635,21 +719,22 @@ func (c *Client) handleCommand(env *ipc.Envelope) {
 	// Dispatch based on command type. Screenshot/computer_action need to run
 	// in the user session (this process) since the service runs in Session 0
 	// and has no display for DXGI/GDI/SendInput.
-	var result ipc.IPCCommandResult
-	switch cmd.Type {
-	case tools.CmdTakeScreenshot, tools.CmdComputerAction:
-		result = c.executeToolCommand(cmd)
-	case "exec":
-		result = c.executeProcess(cmd)
-	case tools.CmdScript, tools.CmdRunScript, tools.CmdScriptCancel, tools.CmdScriptListRunning:
-		result = c.executeScript(cmd)
-	default:
-		result = ipc.IPCCommandResult{
-			CommandID: cmd.CommandID,
-			Status:    "failed",
-			Error:     fmt.Sprintf("unsupported command type: %s", cmd.Type),
+	result := runCommandRecovered(cmd, func() ipc.IPCCommandResult {
+		switch cmd.Type {
+		case tools.CmdTakeScreenshot, tools.CmdComputerAction:
+			return c.executeToolCommand(cmd)
+		case "exec":
+			return c.executeProcess(cmd)
+		case tools.CmdScript, tools.CmdRunScript, tools.CmdScriptCancel, tools.CmdScriptListRunning:
+			return c.executeScript(cmd)
+		default:
+			return ipc.IPCCommandResult{
+				CommandID: cmd.CommandID,
+				Status:    "failed",
+				Error:     fmt.Sprintf("unsupported command type: %s", cmd.Type),
+			}
 		}
-	}
+	})
 	if err := c.conn.SendTyped(env.ID, ipc.TypeCommandResult, result); err != nil {
 		log.Warn("failed to send command result", "id", env.ID, "error", err)
 	}
@@ -1192,9 +1277,16 @@ func (c *Client) handlePamDismissConsent(env *ipc.Envelope) {
 		return
 	}
 
+	if req.Instance != nil && !req.Instance.Valid() {
+		if err := c.conn.SendError(env.ID, ipc.TypePamDismissConsentResult, "invalid PAM consent instance"); err != nil {
+			log.Warn("failed to send PAM dismiss instance error", "id", env.ID, "error", err)
+		}
+		return
+	}
+
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	result := newPamActuator().Dismiss(ctx)
+	result := dismissPamConsent(ctx, newPamActuator(), req.Instance)
 	if err := c.conn.SendTyped(env.ID, ipc.TypePamDismissConsentResult, ipc.PamDismissConsentResult{
 		Success:       result.Success,
 		Reason:        result.Reason,
@@ -1202,6 +1294,35 @@ func (c *Client) handlePamDismissConsent(env *ipc.Envelope) {
 	}); err != nil {
 		log.Warn("failed to send PAM dismiss result", "id", env.ID, "error", err)
 	}
+}
+
+// reasonTargetedDismissUnsupported is reported when a targeted dismissal reaches
+// an actuator that cannot target one consent.exe. Nothing is pressed.
+const reasonTargetedDismissUnsupported = "targeted_dismiss_unsupported"
+
+// dismissPamConsent runs the deny path's untargeted Dismiss, or — when the
+// agent named a consent.exe instance (#8995) — dismisses only that instance. A
+// targeted request never falls back to the untargeted Escape, which would
+// cancel whichever UAC prompt happened to be found first.
+func dismissPamConsent(ctx context.Context, actuator pamactuator.Actuator, instance *ipc.PamConsentInstance) pamactuator.Result {
+	if instance == nil {
+		return actuator.Dismiss(ctx)
+	}
+	targeted, ok := actuator.(pamactuator.InstanceDismisser)
+	if !ok {
+		return pamactuator.Result{Success: false, Reason: reasonTargetedDismissUnsupported,
+			DetailMessage: "this PAM actuator cannot dismiss a specific consent.exe instance"}
+	}
+	return targeted.DismissInstance(ctx, pamactuator.ConsentInstance{
+		PID:       instance.PID,
+		CreatedAt: time.Unix(0, instance.CreatedUnixNano),
+	})
+}
+
+// supportsTargetedPamDismissForAuth is advertised at auth: only the SYSTEM
+// helper handles pam_dismiss_consent, and it honours Instance (#8995).
+func supportsTargetedPamDismissForAuth(role ipc.HelperRole) bool {
+	return role == ipc.HelperRoleSystem
 }
 
 func (c *Client) handleTrayUpdate(env *ipc.Envelope) {
@@ -1285,6 +1406,49 @@ func (c *Client) handleDesktopLeaseUpdate(env *ipc.Envelope) {
 			"sessionId", update.SessionID, "reason", update.Reason)
 	}
 	c.desktopMgr.mgr.ApplyLeaseUpdate(update)
+}
+
+// wireDesktopICETrickle sends the desktop manager's late local candidates
+// to the service, which relays them to the API (#9182). Sent in order on
+// pion's serial candidate callback; nothing is sent before the service's
+// desktop_ice_trickle_begin.
+func (c *Client) wireDesktopICETrickle() {
+	c.desktopMgr.mgr.OnLocalICECandidate = func(sessionID, startGeneration string, cand desktop.LocalICECandidate) {
+		notice := localICECandidateNotice(sessionID, startGeneration, cand)
+		if err := c.conn.SendTyped("desk-ice-"+sessionID, ipc.TypeDesktopLocalICECandidate, notice); err != nil {
+			log.Warn("failed to send desktop ICE candidate via IPC", "session", sessionID, "seq", cand.Seq, "error", err)
+		}
+	}
+}
+
+func (c *Client) handleDesktopICETrickleBegin(env *ipc.Envelope) {
+	var req ipc.DesktopICETrickleBegin
+	if err := json.Unmarshal(env.Payload, &req); err != nil {
+		log.Warn("invalid desktop_ice_trickle_begin payload", "error", err)
+		return
+	}
+	if err := c.desktopMgr.beginICETrickle(req); err != nil {
+		// The service sends begin only after this helper's start succeeded,
+		// so a refusal means the session is already gone or the request is
+		// bad; either way its late candidates stay local.
+		log.Warn("desktop ICE trickle not started; late candidates will not reach the viewer",
+			"sessionId", req.SessionID, "generation", req.StartGeneration, "reason", err.Error())
+	}
+}
+
+func (c *Client) handleDesktopRemoteICECandidate(env *ipc.Envelope) {
+	var req ipc.DesktopRemoteICECandidate
+	if err := json.Unmarshal(env.Payload, &req); err != nil {
+		log.Warn("invalid desktop_remote_ice_candidate payload", "error", err)
+		return
+	}
+	if err := c.desktopMgr.addRemoteICECandidate(req); err != nil {
+		if errors.Is(err, desktop.ErrNoICESession) || errors.Is(err, desktop.ErrStaleICEGeneration) {
+			log.Debug("dropping relayed viewer ICE candidate", "sessionId", req.SessionID, "reason", err.Error())
+			return
+		}
+		log.Warn("failed to apply relayed viewer ICE candidate", "sessionId", req.SessionID, "error", err.Error())
+	}
 }
 
 func (c *Client) handleDesktopStop(env *ipc.Envelope) {
@@ -1540,19 +1704,15 @@ func detectCapabilities(binaryKind, desktopContext string) ipc.Capabilities {
 		caps.CanTray = false
 		caps.CanClipboard = false
 		if runtime.GOOS == "darwin" {
-			// A permission check: ProbeCaptureAccess never calls
-			// ScreenCaptureKit (#8058). The backend a real session uses is
-			// chosen when it opens its capturer.
-			granted, err := desktop.ProbeCaptureAccess(desktop.CaptureConfig{
-				DesktopContext: desktopContext,
-			})
-			if err != nil {
-				log.Warn("desktop helper capability probe failed",
-					"context", desktopContext,
-					"error", err.Error())
-				caps.CanCapture = false
-			} else {
-				caps.CanCapture = granted
+			// A permission check: it never captures (#8390) and never calls
+			// ScreenCaptureKit (#8058). A session may try unless access is
+			// known to be denied; its own capture is the precise check, and
+			// the backend is chosen when it opens its capturer.
+			access := checkCaptureAccessFn(desktop.CaptureConfig{DesktopContext: desktopContext})
+			caps.CanCapture = access.CanCapture()
+			if !caps.CanCapture {
+				log.Warn("desktop helper cannot capture: Screen Recording access denied",
+					"context", desktopContext, "reason", access.Reason)
 			}
 		}
 	}

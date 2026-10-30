@@ -38,7 +38,7 @@ import { buildSellerSnapshot, buildBillToAddress } from './sellerSnapshot';
 import { resolveThemeId, resolvePageSize } from './documentThemes';
 import { resolvePartnerDocumentLocale } from './documentLocale';
 import { freezeDocumentFooter, resolveDocumentFooter } from './documentFooter';
-import { loadContractBlockRenderData, resolveAutoVariables, findUnresolvedVariables, loadContractPdfInputs, type ContractBlockRenderData } from './contractTemplateRender';
+import { loadContractBlockRenderData, resolveQuoteAutoVariables, findUnresolvedVariables, loadContractPdfInputs, type ContractBlockRenderData } from './contractTemplateRender';
 import { portalBase } from './portalUrl';
 import { emitQuoteEvent } from './quoteEvents';
 import { notifyQuoteOutcome } from './quoteOutcomeNotify';
@@ -453,7 +453,7 @@ export function assertQuoteSendGates(
   // `{{token}}` placeholder into a legal document, or (on the accept path)
   // execute it with the variable substituted as an empty string.
   if (contractRenderData.length > 0) {
-    const autoValues = resolveAutoVariables(quote);
+    const autoValues = resolveQuoteAutoVariables(quote);
     const contentByBlockId = new Map(blocks.map((b) => [b.id, b.content as { variableValues?: Record<string, string> } | null]));
     const unresolved = new Set<string>();
     for (const data of contractRenderData) {
@@ -1003,7 +1003,7 @@ async function deliverQuoteEmail(
       signature: partnerRow?.emailSignature ?? undefined,
       custom: partnerEmailCustomFromSettings(partnerRow?.settings, 'quote_send'),
     });
-    // MSP-branded envelope: display name "<Partner> via Breeze" on the
+    // MSP-branded envelope: display name is the company name on the
     // platform's own from-address (SPF/DKIM stays aligned — we never spoof
     // the MSP's domain), and replies go to the MSP's billing email so a
     // customer's "quick question" reply reaches the seller, not a no-reply box.
@@ -1012,7 +1012,7 @@ async function deliverQuoteEmail(
       to: recipients,
       cc: opts.cc && opts.cc.length > 0 ? opts.cc : undefined,
       // MSP-branded envelope: the registry's `partner_display_name` fallback
-      // renders "<Partner> via Breeze" on the platform's own from-address
+      // renders the company name on the platform's own from-address
       // (SPF/DKIM stays aligned — we never spoof the MSP's domain) until the
       // partner has a verified sending domain. Both values come from rows this
       // function already holds, never from request input (spec §8.1).

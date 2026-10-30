@@ -108,6 +108,7 @@ export const partnerOrganizationExportRecordSchema = strictPartnerExportRecordSc
   name: z.string().min(1).max(255),
   slug: z.string().min(1).max(100),
   type: z.enum(['customer', 'internal']),
+  externalLinks: z.array(z.object({ system: z.string(), externalId: z.string(), label: z.string().nullable() }).strict()),
 });
 export const organizationExportEnvelopeSchema = createPartnerExportEnvelopeSchema(
   partnerOrganizationExportRecordSchema,
@@ -426,6 +427,12 @@ export const partnerAutomationExportRecordSchema = strictPartnerExportRecordSche
     resource: z.literal('scripts'),
     id: z.string().uuid(),
   }).strict()).max(500),
+  /** W06 (#5221): the Job's newest flow conversion generation, or null. Additive. */
+  conversion: z.object({
+    id: z.string().uuid(),
+    state: z.enum(['shadow', 'switched', 'reverted']),
+    flowId: z.string().uuid(),
+  }).strict().nullable(),
 });
 export const automationExportEnvelopeSchema = createPartnerExportEnvelopeSchema(
   partnerAutomationExportRecordSchema,
@@ -633,6 +640,22 @@ export const PARTNER_ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'i
 const nullableTimestamp = partnerExportTimestampSchema.nullable();
 const nullableUuid = z.string().uuid().nullable();
 
+/** alerts:write returns state only; alert content requires alerts:read. */
+export const partnerAlertWriteResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  changed: z.boolean(),
+  data: z.object({
+    id: z.string().uuid(),
+    orgId: z.string().uuid(),
+    status: z.enum(PARTNER_ALERT_STATUSES),
+    acknowledgedAt: nullableTimestamp,
+    resolvedAt: nullableTimestamp,
+    resolutionReason: z.string().nullable(),
+    acknowledgedByPrincipalId: nullableUuid,
+    resolvedByPrincipalId: nullableUuid,
+  }).strict(),
+}).strict();
+
 export const partnerAlertExportRecordSchema = z.object({
   id: z.string().uuid(),
   orgId: z.string().uuid(),
@@ -691,6 +714,8 @@ export const PARTNER_TICKET_STATUSES = ['new', 'open', 'pending', 'on_hold', 're
 export const PARTNER_TICKET_PRIORITIES = ['low', 'normal', 'high', 'urgent'] as const;
 export const PARTNER_TICKET_SOURCES = ['portal', 'email', 'alert', 'manual', 'api', 'ai'] as const;
 export const PARTNER_TICKET_WORK_KINDS = ['support', 'deliverable', 'project_task'] as const;
+// #7900: the fixed ITIL classification (separate from workKind).
+export const PARTNER_TICKET_TYPES = ['incident', 'service_request', 'problem', 'change'] as const;
 export const PARTNER_TICKET_COMMENT_TYPES = ['comment', 'internal', 'status_change', 'assignment', 'time_entry', 'system'] as const;
 export const PARTNER_TICKET_ORIGIN_PRINCIPAL_KINDS = ['user', 'ai_agent', 'system', 'service_principal', 'unknown'] as const;
 /** Long free-text ticket fields are capped in the DTO (see alerts.message). */
@@ -719,6 +744,7 @@ export const partnerTicketExportRecordSchema = z.object({
   priority: z.enum(PARTNER_TICKET_PRIORITIES),
   source: z.enum(PARTNER_TICKET_SOURCES),
   workKind: z.enum(PARTNER_TICKET_WORK_KINDS),
+  ticketType: z.enum(PARTNER_TICKET_TYPES),
   categoryId: nullableUuid,
   assigneeId: nullableUuid,
   deviceId: nullableUuid,
@@ -737,8 +763,22 @@ export const partnerTicketExportRecordSchema = z.object({
   resolutionSlaMinutes: z.number().int().nullable(),
   slaBreachedAt: nullableTimestamp,
   slaBreachReason: z.string().max(1000).nullable(),
+  // #8973: the stored SLA deadlines (read-only, additive). Null when the
+  // target is null. *_warnAt is the 80% "breaching soon" point.
+  responseDueAt: nullableTimestamp,
+  resolutionDueAt: nullableTimestamp,
+  responseWarnAt: nullableTimestamp,
+  resolutionWarnAt: nullableTimestamp,
   createdAt: partnerExportTimestampSchema,
   updatedAt: partnerExportTimestampSchema,
+  // The migration window that imported the ticket (#8313), null for a live
+  // one. A mirror skips imported rows with it, so an import is never pushed
+  // back into its own source.
+  migrationWindowId: nullableUuid,
+  // #8972: set when this ticket was merged into another; the record is then a
+  // read-only tombstone. Null on every other ticket.
+  mergedIntoTicketId: nullableUuid,
+  mergedAt: nullableTimestamp,
   // Opaque, monotonic per row: changes whenever the row is written. Compare
   // for equality only; never parse.
   changeVersion: z.string().regex(/^[0-9]{1,20}$/u),
@@ -836,6 +876,15 @@ export const partnerTicketCommentExportRecordSchema = z.object({
   newValue: z.string().max(2000).nullable(),
   createdAt: partnerExportTimestampSchema,
   editedAt: nullableTimestamp,
+  // #8313: the migration window that imported the comment (null when live),
+  // and, for an imported comment, who wrote it in the source — display only,
+  // no Breeze user or contact. `name` is also in authorName.
+  migrationWindowId: nullableUuid,
+  originalAuthor: z.object({
+    name: z.string().max(510).nullable(),
+    email: z.string().max(640).nullable(),
+    kind: z.enum(['staff', 'requester']),
+  }).strict().nullable(),
   revision: z.string().regex(/^[a-f0-9]{64}$/u),
 }).strict();
 
@@ -929,4 +978,35 @@ export const partnerTicketCommentWriteResponseSchema = z.object({
   data: partnerTicketCommentExportRecordSchema.nullable(),
   blocked: z.array(partnerExportBlockedRecordSchema).max(1).optional(),
   idempotencyReplay: z.literal(true).optional(),
+}).strict();
+
+/** Current external-ticket read model, shared by refs and PSA mappings. */
+export const partnerAlertExternalTicketRecordSchema = z.object({
+  source: z.enum(['partner_api', 'psa']),
+  partnerServicePrincipalId: nullableUuid,
+  externalId: z.string(),
+  externalUrl: z.string().nullable(),
+  externalNumber: z.string().nullable(),
+  state: z.string().nullable(),
+  createdAt: partnerExportTimestampSchema,
+  updatedAt: nullableTimestamp,
+}).strict();
+
+export const partnerAlertExternalTicketsResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  data: z.array(partnerAlertExternalTicketRecordSchema),
+}).strict();
+
+export const partnerAlertExternalTicketPutResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  changed: z.boolean(),
+  data: z.object({
+    alertId: z.string().uuid(), orgId: z.string().uuid(), partnerServicePrincipalId: z.string().uuid(),
+    externalId: z.string(), externalUrl: z.string().nullable(), externalNumber: z.string().nullable(),
+    createdAt: partnerExportTimestampSchema, updatedAt: partnerExportTimestampSchema,
+  }).strict(),
+}).strict();
+
+export const partnerAlertExternalTicketDeleteResponseSchema = z.object({
+  schemaVersion: z.literal('1'), deleted: z.boolean(),
 }).strict();

@@ -219,6 +219,7 @@
     "created2": "Création",
     "expires2": "Expiration",
     "protection2": "Protection",
+    "integrity": "Intégrité",
     "hold": "Tiens",
     "standard": "Standard",
     "restorePointCount_one": "{{count}} point de restauration",
@@ -487,6 +488,22 @@
     "selectASnapshot": "Sélectionnez un instantané",
     "chooseTheRecoveryPointYouWantToRestore": "Choisissez le point de récupération à restaurer.",
     "noSnapshotsAvailable": "Aucune capture d’écran disponible.",
+    "device": "Appareil",
+    "selectADevice": "Sélectionnez un appareil",
+    "chooseTheDeviceToRestore": "Choisissez l’appareil dont vous voulez restaurer la sauvegarde.",
+    "deviceOption_one": "{{device}} ({{count}} instantané)",
+    "deviceOption_other": "{{device}} ({{count}} instantanés)",
+    "unknownDevice": "Appareil inconnu",
+    "reviewDevice": "Appareil : {{device}}",
+    "snapshotNeedsSecondFactor": "Second facteur requis",
+    "secondFactorNote": "Ce point de restauration n’est pas vérifié. Le démarrage de la restauration vous demandera de confirmer avec votre second facteur.",
+    "secondFactorNoteNotEnrolled": "Ce point de restauration n’est pas vérifié et vous n’avez aucun second facteur configuré. Le démarrage de la restauration en exigera un.",
+    "secondFactorSetUp": "Configurer l’authentification à deux facteurs",
+    "commandDetails": "Détails de la commande",
+    "copyCommandId": "Copier l’ID de la commande",
+    "commandIdCopied": "ID de la commande copié",
+    "commandIdCopyFailed": "Impossible de copier l’ID de la commande",
+    "carriedSnapshotUnavailable": "L’instantané avec lequel vous avez ouvert l’assistant n’est plus disponible. Choisissez un appareil et l’un de ses instantanés.",
     "selectRestoreType": "Sélectionner le type de restauration",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Restaure tout en complet, la sélective restaure des fichiers spécifiques.",
     "fullRestore": "Restauration complète",
@@ -529,9 +546,18 @@
     "noRestoreHistoryYet": "Aucun historique de restauration pour l’instant.",
     "files2": "Fichiers :",
     "size": "Taille :",
-    "filesSelected_one": "{{count}} fichier sélectionné",
-    "filesSelected_other": "{{count}} fichiers sélectionnés",
-    "unknownDevice": "Appareil inconnu",
+    "filesSelected_one": "{{formatted}} fichier sélectionné",
+    "filesSelected_other": "{{formatted}} fichiers sélectionnés",
+    "folderFileCount_one": "{{formatted}} fichier",
+    "folderFileCount_other": "{{formatted}} fichiers",
+    "allFilesFromSnapshot": "Tous les fichiers de l'instantané",
+    "selectionFiles_one": "{{formatted}} fichier",
+    "selectionFiles_other": "{{formatted}} fichiers",
+    "selectionFolders_one": "{{formatted}} dossier",
+    "selectionFolders_other": "{{formatted}} dossiers",
+    "largeFolderSelectionTitle": "Sélection volumineuse",
+    "selectFolder": "Sélectionner le dossier {{name}}",
+    "confirmLargeFolderSelection": "Cette sélection couvre environ {{formatted}} fichiers et la restauration peut prendre du temps. Continuer?",
     "kindVm": "Restaurer en tant que VM",
     "kindInstantBoot": "Démarrage instantané",
     "kindSelective": "Restauration sélective",
@@ -629,6 +655,10 @@
     "path": "Chemin :",
     "useTheRestoreWorkflowToRecoverOrExport": "Utilisez le flux de restauration pour récupérer ou exporter des fichiers à partir de cet instantané.",
     "select": "Sélectionner",
+    "folderFileCount_one": "{{count}} fichier",
+    "folderFileCount_other": "{{count}} fichiers",
+    "selectFolder": "Sélectionner le dossier {{name}}",
+    "confirmLargeFolderSelection": "Cette sélection couvre environ {{count}} fichiers et la restauration peut prendre du temps. Continuer?",
     "name": "Nom",
     "size2": "Taille",
     "modified": "Modifié"
@@ -720,7 +750,9 @@
     "vaultType": "Type de voûte",
     "retentionCount": "Nombre de rétentions",
     "numberOfSnapshotsToKeepInTheVault": "Nombre d’instantanés à conserver dans le coffre (1 à 100).",
-    "cancel": "Annuler"
+    "cancel": "Annuler",
+    "failedToSave": "Impossible d'enregistrer le coffre. Veuillez réessayer.",
+    "deviceConfigNotSent": "Coffre enregistré, mais sa configuration n'a pas pu être envoyée à l'appareil : {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Chargement des coffres...",
@@ -742,7 +774,12 @@
     "actions": "Actions",
     "sync": "Synchroniser",
     "edit": "Modifier",
-    "deactivate": "Désactiver"
+    "deactivate": "Désactiver",
+    "inactive": "Inactif",
+    "syncStarted": "Synchronisation du coffre démarrée",
+    "failedToSync": "Impossible de démarrer la synchronisation du coffre. Veuillez réessayer.",
+    "failedToDeactivate": "Impossible de désactiver le coffre. Veuillez réessayer.",
+    "deviceConfigNotSent": "Coffre enregistré, mais sa configuration n'a pas pu être envoyée à l'appareil : {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Chargement de la récupération après sinistre...",
@@ -993,6 +1030,8 @@
     "codeExpires": "Expire à {{time}}",
     "overdueNotice": "Aucune confirmation pour l'instant — consultez la console de récupération.",
     "fileIndexPreparing": "Préparation de l'index des fichiers pour les références entre instantanés…",
+    "snapshotsLoadFailed": "Impossible de charger les instantanés. Rechargez la page pour réessayer.",
+    "noSnapshots": "Aucun instantané restaurable en bare-metal pour l'instant. Une sauvegarde complète de la machine marquée restaurable en bare-metal est requise.",
     "statusFailed": "Échec de la récupération",
     "statusRefused": "Récupération refusée",
     "status": {
@@ -1002,7 +1041,8 @@
       "restoring": "Restauration en cours",
       "validated": "Validée",
       "rebooted": "Redémarrée",
-      "checked_in": "Confirmée"
+      "checked_in": "Confirmée",
+      "completed": "Terminé"
     }
   },
   "backupHealth": {
@@ -1013,6 +1053,7 @@
     "statusTitle": "Statut",
     "recencyTitle": "Dernière sauvegarde réussie",
     "coverage": "{{covered}} des {{total}} postes ont une sauvegarde récente",
+    "definition": "« Récente » signifie une sauvegarde réussie au cours des 48 dernières heures. L’état d’un appareil reflète sa dernière exécution : il peut avoir une sauvegarde récente et afficher tout de même Critique si cette exécution a échoué.",
     "providerOnly": "{{value}} postes connus du seul fournisseur",
     "m365Accounts": "{{value}} comptes Microsoft 365",
     "status": {
@@ -1069,10 +1110,14 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare metal",
+      "m365_mail": "Messagerie Microsoft 365",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
       "m365_onedrive": "OneDrive",
       "m365_teams": "Teams",
+      "gws_mail": "Messagerie Google Workspace",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Disques partagés Google",
       "other": "Autre"
     },
     "noObservation": "Aucune observation",
@@ -1091,7 +1136,12 @@
       "errorUnlink": "Impossible de dissocier l'appareil du fournisseur",
       "error": "Impossible de charger l'état de la sauvegarde externe",
       "alsoCheck": "Vérifiez aussi les connexions de sauvegarde tierces dans Intégrations."
-    }
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} comptes SaaS",
+    "workloadBackup": "Sauvegarde de {{workload}}",
+    "sourceProvider": "Fournisseurs de sauvegarde"
   },
   "restoreResultNotices": {
     "systemStateRequiresRebuildTitle": "L'état du système est appliqué par une reconstruction bare-metal",
@@ -1129,5 +1179,10 @@
     "checking": "Vérification en cours",
     "unverified": "Non vérifiée",
     "failed": "Échec de la vérification d'intégrité"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} point d'analyse ignoré : les jonctions et les points de montage ne sont ni suivis ni restaurés. C'est normal, ce n'est pas une erreur.",
+    "summary_other": "{{count}} points d'analyse ignorés : les jonctions et les points de montage ne sont ni suivis ni restaurés. C'est normal, ce n'est pas une erreur.",
+    "showDetails": "Afficher les chemins ignorés"
   }
 }

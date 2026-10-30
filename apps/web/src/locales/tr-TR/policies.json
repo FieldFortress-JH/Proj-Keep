@@ -158,7 +158,9 @@
       "organizationPolicyTitle": "Organizasyon politikası — yalnızca {{organization}} için geçerlidir",
       "summary": "{{filtered}} / {{total}} politikaları",
       "inheritsBadge": "Devralıyor",
-      "statusFilterLabel": "Durum"
+      "statusFilterLabel": "Durum",
+      "partnerPolicy": "İş ortağı",
+      "partnerPolicyAppliesOnlyWhereAssigned": "İş ortağı politikası — yalnızca atandığı yerde geçerlidir. İş ortağı çapında olması için tüm kuruluşlara atayın."
     },
     "configurationPoliciesPage": {
       "failedToFetchConfigurationPolicies": "Yapılandırma politikaları getirilemedi",
@@ -198,7 +200,9 @@
       "appliedToAllOrganizationsUncheckAllOrganizations": "Tüm kuruluşlara uygulanır. Bir alt küme seçmek için \"Tüm kuruluşlar\" seçeneğinin işaretini kaldırın.",
       "polite": "kibar",
       "loading": "Yükleniyor…",
-      "loadMoreOrganizations": "Daha fazla kuruluş yükle"
+      "loadMoreOrganizations": "Daha fazla kuruluş yükle",
+      "appliedToAllOrgs": "Politika artık tüm kuruluşlara uygulanıyor",
+      "removedFromAllOrgs": "Politika artık tüm kuruluşlara uygulanmıyor"
     },
     "featureTabs": {
       "automationTab": {
@@ -354,7 +358,11 @@
         "pathPrefix": "Yol Öneki",
         "optional": "(isteğe bağlı)",
         "backupsBreeze": "yedeklemeler/esinti/",
-        "keyPrefixForOrganizingObjectsInThe": "Paketteki nesneleri düzenlemek için kullanılan anahtar öneki.",
+        "keyPrefixHelp": "Bu hedefin anahtar öneki. Yeni anlık görüntüler <prefix>/snapshots/ altında saklanır. Mevcut anlık görüntüler yerinde kalır. Değiştirilirse bir sonraki yedekleme tam yedekleme olur.",
+        "keyPrefixInvalidTooLong": "Geçersiz anahtar öneki: en fazla {{max}} karakter olmalıdır.",
+        "keyPrefixInvalidSegment": "Geçersiz anahtar öneki: boş, \".\" veya \"..\" segment içeremez.",
+        "keyPrefixInvalidCharacters": "Geçersiz anahtar öneki: her segmentte yalnızca harf, rakam ve ! _ . * ' ( ) - kullanın; segmentleri / ile ayırın.",
+        "keyPrefixInvalidReserved": "Geçersiz anahtar öneki: \"snapshots\" segmenti içeremez.",
         "customEndpoint": "Özel Uç Nokta",
         "optional2": "(isteğe bağlı)",
         "httpsS3UsWest002Backblazeb2Com": "https://s3.us-west-002.backblazeb2.com",
@@ -666,7 +674,18 @@
         "maxEventsPerCycle2": "maxEventsPerCycle",
         "minimumLevel": "minimumSeviye",
         "collectionIntervalMinutes2": "koleksiyonAralığıDakika",
-        "rateLimitPerHour2": "RateLimitPerHour"
+        "rateLimitPerHour2": "RateLimitPerHour",
+        "applicationProvidersHeading": "Uygulama sağlayıcıları (Uyarı ve Bilgi)",
+        "applicationProvidersHelp": "Hata ve Kritik düzeyindeki Uygulama olayları tüm sağlayıcılardan toplanır; Uyarı ve Bilgi olayları yalnızca yerleşik sağlayıcılardan ({{providers}}) ve burada listelenen sağlayıcılardan toplanır. Olay Görüntüleyicisi’nin \"Kaynak\" sütununda veya Get-WinEvent -ListProvider çıktısında gösterilen tam sağlayıcı adını kullanın.",
+        "applicationProvidersScope": "Bir cihaz için yalnızca öncelikli Olay Günlükleri ilkesi uygulanır. Farklı ilkelerin sağlayıcı listeleri birleştirilmez.",
+        "providerNameLabel": "Uygulama olayı sağlayıcısının adı",
+        "addProvider": "Sağlayıcı ekle",
+        "removeProvider": "Kaldır",
+        "removeProviderNamed": "{{provider}} sağlayıcısını kaldır",
+        "providerNameInvalid": "Bir harf veya rakamla başlayan 1–{{max}} karakter kullanın. İzin verilenler: harfler, rakamlar, boşluklar, noktalar, alt çizgiler, dolar işaretleri, parantezler ve kısa çizgiler.",
+        "providerLimitReached": "En fazla {{max}} ek sağlayıcı ekleyebilirsiniz. Başka bir sağlayıcı eklemek için birini kaldırın.",
+        "providerAlreadyListed": "Bu sağlayıcı zaten listede.",
+        "providerLimit": "{{max}} ek sağlayıcıdan {{total}} tanesi"
       },
       "featureTabShell": {
         "override": "Geçersiz kıl",
@@ -701,7 +720,11 @@
         "showOpenPortal": "showOpenPortal",
         "showDeviceInfo": "showDeviceInfo",
         "showRequestSupport": "showRequestSupport",
-        "portalUrl": "portalUrl'si"
+        "portalUrl": "portalUrl'si",
+        "endpointMessaging": "Uç nokta mesajları",
+        "endpointMessagingHelp": "Teknisyenlerin cihazdaki kişiye mesaj göndermesini sağlar.",
+        "allowUserReply": "Kullanıcının yanıtlarına izin ver",
+        "allowUserReplyHelp": "Cihazdaki kişinin, teknisyenin başlattığı bir sohbette yanıt vermesine izin verir. Kapalıyken sohbetler tek yönlüdür."
       },
       "inlineEntityPicker": {
         "search": "Ara...",
@@ -735,7 +758,7 @@
         "muteAlertNotificationsDuringWindow": "Pencere sırasında yeni uyarı oluşturulmaz.",
         "suppressAlerts2": "Uyarıları bastır",
         "suppressPatching": "Yamalamayı engelle",
-        "delayPatchInstallationsDuringWindow": "Pencere sırasında yama kurulumlarını geciktirin.",
+        "delayPatchInstallationsDuringWindow": "Pencere sırasında zamanlanan yüklemeler atlanır ve bir sonraki zamanlanmış çalışmada yapılır.",
         "suppressPatching2": "bastırmaYaması",
         "suppressAutomations": "Otomasyonları bastırın",
         "pauseAutomationRunsDuringWindow": "Pencere sırasında otomasyon çalışmalarını duraklatın.",
@@ -744,15 +767,16 @@
         "pauseScriptExecutionDuringWindow": "Pencere sırasında komut dosyasının yürütülmesini duraklatın.",
         "suppressScripts2": "bastırmaScriptleri",
         "rebootIfARebootIsPending": "Yeniden başlatma bekleniyorsa yeniden başlat",
-        "duringTheWindowRebootDevicesThatHave": "Pencere sırasında, yeniden başlatma bekleyen aygıtları yeniden başlatın. Windows oturum açmış kullanıcıyı yeniden başlatmadan ~5 dakika önce uyarır; Linux, oturum açmış kullanıcılara bir uyarı vererek yeniden başlatmayı 15 dakika sonrasına planlar. macOS desteklenmiyor.",
+        "duringTheWindowRebootDevicesThatHave": "Pencere sırasında, yeniden başlatması bekleyen cihazları yeniden başlatır. Uyarı süresi, cihazın yama ilkesindeki yeniden başlatma gecikmesinden gelir. macOS desteklenmez.",
         "rebootIfPending": "yeniden başlatma IfPending",
-        "maintenanceRebootIfPendingToggle": "bakım-yeniden başlatma-eğer-beklemede-geçiş",
         "notifyOnStart": "Başlangıçta bildir",
         "sendNotificationWhenWindowOpens": "Pencere açıldığında bildirim gönder.",
         "notifyOnStart2": "notifyOnStart",
         "notifyOnEnd": "Sonunda bildir",
         "sendNotificationWhenWindowCloses": "Pencere kapatıldığında bildirim gönder.",
-        "notifyOnEnd2": "notifyOnEnd"
+        "notifyOnEnd2": "notifyOnEnd",
+        "weeklyOpensEverySunday": "Haftalık pencereler, seçilen saat diliminde her pazar başlangıç saatinde açılır.",
+        "monthlyOpensOnTheFirst": "Aylık pencereler, seçilen saat diliminde her ayın 1'inde başlangıç saatinde açılır."
       },
       "monitorsTab": {
         "agentCollectionTitle": "Aracı toplama",
@@ -769,6 +793,7 @@
         "overridesLabel": "Geçersiz kılmalar:",
         "failedToLoadMonitors": "İzleyiciler yüklenemedi",
         "createMonitor": "Monitör oluştur",
+        "notAttachable": "Bu monitör bu ilkeye eklenemez. İş ortağına ait ilkeler yalnızca iş ortağı genelindeki monitörleri kullanabilir.",
         "monitorDeleted": "Monitör silindi",
         "recommended": {
           "title": "Önerilen monitörler",
@@ -791,25 +816,6 @@
         "approvalRulesLiveInThePAMConsole": "Onay kuralları PAM konsolunda mevcuttur",
         "thisPolicyOnlyControlsWhetherDevicesCapture": "Bu politika yalnızca cihazların yükseltme istemlerini yakalayıp yakalamadığını kontrol eder. Kararlar (otomatik onaylama, reddetme, onay gerektir), istek kuyruğu ve denetim geçmişi,",
         "privilegedAccessConsole": "Ayrıcalıklı Erişim konsolu"
-      },
-      "patchAppRulesSection": {
-        "applicationRules": "Başvuru Kuralları",
-        "blockSpecificApplicationsFromAutomatedPatchingOr": "Belirli uygulamaların otomatik yama uygulanmasını engelleyin veya bunları maksimum sürüme sabitleyin.",
-        "blocked": "Engellendi",
-        "pinned": "Sabitlendi",
-        "maxVersion": "Maksimum sürüm",
-        "pinnedApplicationsNeedAVersion": "Sabitlenen uygulamaların bir sürümü olması gerekir.",
-        "addApplication": "Uygulama ekle",
-        "searchCatalogAndDetectedApplications": "Katalogda ve algılanan uygulamalarda arama yapın...",
-        "searching": "Aranıyor...",
-        "catalog": "katalog",
-        "couldnTLoadApplicationsYouCanStill": "Uygulamalar yüklenemedi — hâlâ aşağıdaki paket kimliğine göre ekleyebilirsiniz.",
-        "noMatches": "Eşleşme yok.",
-        "orEnterAPackageIDManually": "Veya manuel olarak bir paket kimliği girin",
-        "block": "blok",
-        "pin": "pini",
-        "thirdParty": "third_party",
-        "removeRuleFor": "{{application}} kuralını kaldır"
       },
       "patchTab": {
         "daily": "Günlük",
@@ -868,6 +874,13 @@
         "rebootMaxDeferralsDescription": "Bir kullanıcının tek bir yeniden başlatmayı, işlem devam etmeden önce kaç kez erteleyebileceği.",
         "rebootDeferralMinutes": "Erteleme süresi (dakika)",
         "rebootDeferralMinutesDescription": "Her ertelemenin yeniden başlatmayı ne kadar ileri ötelediği.",
+        "rebootPromptText": "Yeniden başlatma uyarısı metni",
+        "rebootPromptTextDescription": "İsteğe bağlı. Kullanıcıların gördüğü yeniden başlatma uyarılarının metnini değiştirir; örneğin uyarıları kullanıcılarınızın dilinde göstermek için. Yerleşik İngilizce metni korumak için alanı boş bırakın.",
+        "rebootPromptTitle": "Başlık",
+        "rebootPromptButton": "Yeniden başlat düğmesi etiketi",
+        "rebootPromptBody": "Mesaj",
+        "rebootPromptBodyDescription": "Düz metin. {{placeholder}}, yeniden başlatmaya kalan süreyle değiştirilir. Windows sabit Evet/Hayır düğmeleri gösterir; bu nedenle orada düğme etiketi mesajın içinde belirtilir.",
+        "rebootPromptInvalid": "Yeniden başlatma uyarısı metni düz metin olmalıdır (< veya > yok, başlıkta veya düğme etiketinde satır sonu yok) ve {{placeholder}} dışında yer tutucu kullanamaz.",
         "windowsUpdateSource": "Windows Update Kaynak",
         "manageWindowsUpdateExclusivelyThroughBreeze": "Windows Update'yi yalnızca Breeze aracılığıyla yönetin",
         "suppressesTheEndpointSNativeWindowsUpdate": "Uç noktanın yerel Windows Update otomatik yükleme kanalını bastırır, böylece güncellemelerin yalnızca Breeze onay halkaları üzerinden akmasını sağlayarak beklenmeyen yeniden başlatmaları ve programınızın dışında yamaları önler. Windows-yalnızca; Breeze'in kendi tarama/onaylama/yükleme yolu etkilenmez. Devre dışı bırakıldığında temiz bir şekilde geri döner (önceden var olan yönetici Grup İlkesi'ne dokunulmaz).",
@@ -889,7 +902,25 @@
         "text2xl": "2xl",
         "saveChanges": "Değişiklikleri Kaydet",
         "createRing": "Yüzük Oluştur",
-        "thirdPartyRingHint": "Üçüncü taraf güncellemeleri için otomatik onay kuralları, bağlantılı Güncelleme Halkasında yapılandırılır."
+        "thirdPartyRingHint": "Üçüncü taraf güncellemeleri için otomatik onay kuralları, bağlantılı Güncelleme Halkasında yapılandırılır.",
+        "ringOwnsApprovalHint": "Otomatik onay ve uygulama kuralları, bağlantılı Güncelleme Halkasında ayarlanır.",
+        "noRingManualApprovalHint": "Bağlı halka yok — yamalar yalnızca elle onaydan sonra kurulur.",
+        "unavailableRingOption": "Kullanılamayan halka",
+        "ringInvalidTitle": "Bağlantılı Güncelleme Halkası artık kullanılamıyor.",
+        "ringInvalidBody": "Bu ilkenin yamaları, bir halka seçip kaydedene kadar bekletilir.",
+        "ringDetailsNoHold": "Kullanıma sunma sırası {{order}} · onay öncesi bekleme yok",
+        "ringDetailsWithHold_one": "Kullanıma sunma sırası {{order}} · onay öncesi {{count}} gün bekleme",
+        "ringDetailsWithHold_other": "Kullanıma sunma sırası {{order}} · onay öncesi {{count}} gün bekleme",
+        "rebootPreviewHeading": "Önizleme",
+        "rebootPreviewDescription": "Şimdi bir yeniden başlatma planlanırsa bilgisayarın başındaki kişinin göreceği ekran. Saatler örnektir.",
+        "rebootPreviewDefaultMarker": "Varsayılan",
+        "rebootPreviewDefaultTitle": "Güncellemelerin yüklenmesini tamamlamak için yeniden başlatın",
+        "rebootPreviewDefaultBody": "BT destek ekibiniz, güncellemelerin yüklenmesini tamamlamak için bu bilgisayarı yeniden başlatmalı.",
+        "rebootPreviewConsequence": "Hiçbir şey yapmazsanız bu bilgisayar {{time}} saatinde yeniden başlatılır. Çalışmanızı bundan önce kaydedin.",
+        "rebootPreviewRestartNow": "Şimdi yeniden başlat",
+        "rebootPreviewPostponeUntil": "{{time}} saatine ertele",
+        "rebootPreviewDeadline": "Erteleme, yeniden başlatmayı hiçbir zaman {{time}} saatinden sonraya taşımaz.",
+        "rebootPreviewOk": "Tamam"
       },
       "peripheralControlTab": {
         "linkPeripheralPolicy": "Bağlantı Çevre Birimi Politikası",
@@ -976,6 +1007,9 @@
         "showIndicatorHelp": "Bir teknisyen bağlıyken ekrandaki başlığı gösterin.",
         "notifyOnEnd": "Oturum sonu bildirimi",
         "notifyOnEndHelp": "Oturum sona erdiğinde son kullanıcıya bilgi verin.",
+        "allowUserEnd": "Kullanıcının oturumu sonlandırmasına izin ver",
+        "allowUserEndHelp": "Cihazdaki kişi, onay verdikten sonra ekrandaki göstergeden oturumu sonlandırabilir. Teknisyen “Kullanıcı tarafından sonlandırıldı” ifadesini görür.",
+        "allowUserEndNeedsIndicator": "Kullanıcıların oturumu sonlandırabilmesi için etkin oturum göstergesini açın.",
         "identityLevel": "Teknisyen kimliği",
         "identityLevelHelp": "Son kullanıcının teknisyen kimliğinin ne kadarını gördüğü. MSP adı her zaman gösterilir.",
         "identityNameEmail": "Ad ve e-posta",
@@ -1016,7 +1050,25 @@
         "fullScan": "Tam tarama",
         "maxFileSizeMb": "Maksimum dosya boyutu (MB)",
         "scanTimeoutMinutes": "Tarama zaman aşımı (dakika)",
-        "scanRunsServerSideDescription": "Breeze bu taramayı sunucudan başlatır — cihazın yerel bir zamanlamaya ihtiyacı yoktur."
+        "scanRunsServerSideDescription": "Breeze bu taramayı sunucudan başlatır — cihazın yerel bir zamanlamaya ihtiyacı yoktur.",
+        "ruleSets": {
+          "title": "Tespit kural kümeleri",
+          "description": "Bu ilkenin IOC taramalarının kullandığı kural kümeleri.",
+          "manageLink": "Tespit kurallarını yönet",
+          "loading": "Kural kümeleri yükleniyor…",
+          "loadError": "Kural kümeleri yüklenemedi. İlke mevcut kural kümelerini korur; diğer ayarları yine de kaydedebilirsiniz.",
+          "none": "Bu ilke için kullanılabilir kural kümesi yok.",
+          "legacyNote": "Kural kümesi yok: taramalar yalnızca yerleşik eski imzaları kullanır.",
+          "cap": "Bir ilke en fazla {{max}} kural kümesi kullanabilir.",
+          "unavailable": "Kullanılamayan kural kümesi",
+          "blocking": "Bu ilke kullanılamayan kural kümelerini (silinmiş, taşınmış veya başka bir kuruluşa ait) kullanamaz. Kaydetmeden önce bunları kaldırın.",
+          "overrideDraft": "Devralınan ayarlar bu ilkenin kullanamayacağı kural kümeleri içeriyor. Kullanılamayan kural kümelerini kaldırın, ardından kaydedin.",
+          "errors": {
+            "tooMany": "Bir ilke en fazla {{max}} kural kümesi kullanabilir.",
+            "invalidIds": "Kural kümesi listesi geçerli değil. Sayfayı yeniden yükleyip tekrar deneyin.",
+            "notAttachable": "Bu ilke seçilen kural kümelerinden bazılarını kullanamaz. Aşağıda vurgulanmıştır."
+          }
+        }
       },
       "sensitiveDataTab": {
         "credentials": "Kimlik Bilgileri",
@@ -1109,14 +1161,56 @@
         "thisPolicyOnlyControlsWhetherDevicesAre": "Bu politika yalnızca cihazların taranıp taranmadığını kontrol eder. Tespit edilen CVE'ler, risk puanları ve iyileştirme eylemleri şu şekilde yönetilir:",
         "vulnerabilitiesConsole": "Güvenlik açıkları konsolu"
       },
+      "systemProtectionTab": {
+        "title": "Sistem Koruması",
+        "description": "Yama, betik ve yazılım yüklemelerinden önce bir Windows Sistem Geri Yükleme noktası oluşturmayı dene",
+        "beforePatching": "Yama yüklemelerinden önce",
+        "beforePatchingHelp": "İşletim sistemi güncellemelerini yüklemeden önce bir geri yükleme noktası oluşturmayı dene.",
+        "beforeScripts": "Betiklerden önce",
+        "beforeScriptsHelp": "Cihazda bir betik çalıştırmadan önce bir geri yükleme noktası oluşturmayı dene.",
+        "beforeSoftwareInstall": "Yazılım yüklemelerinden önce",
+        "beforeSoftwareInstallHelp": "Yazılım yüklemeden veya güncellemeden önce bir geri yükleme noktası oluşturmayı dene.",
+        "labelPrefix": "Etiket öneki",
+        "labelPrefixHelp": "Windows’ta her geri yükleme noktası açıklamasının başında gösterilir. En fazla 64 karakter.",
+        "platformDefaultNote": "Atanmış ilke yok. Platform varsayılanı: yalnızca yama yüklemelerinden önce bir geri yükleme noktası denenir.",
+        "legacyAgentWarning": "Bunu kapatmak yalnızca Sistem Geri Yükleme desteği bildiren aracılarda etkili olur. Eski aracılar yama yüklemelerinden önce geri yükleme noktası denemeye devam eder.",
+        "aboutTitle": "Sistem Geri Yükleme hakkında",
+        "aboutBody": "Yalnızca Windows cihazlar için geçerlidir. Sistem Geri Yükleme sistem dosyalarını, kayıt defterini, yüklü programları ve ayarları kapsar. Bir yedekleme değildir ve kişisel dosyaları kapsamaz. Windows varsayılan olarak 24 saatte en fazla bir geri yükleme noktası oluşturulmasına izin verir; oluşturulan bir nokta daha sonra Windows tarafından kaldırılabilir veya kullanılamaz hale gelebilir."
+      },
+      "securityAgentsTab": {
+        "title": "Güvenlik Aracıları",
+        "description": "Yönetilen güvenlik aracılarını cihazlara dağıtın ve yüklü tutun",
+        "deployVendor": "{{vendor}} dağıt",
+        "comingSoon": "Yakında",
+        "platformWindows": "Windows: otomatik olarak yüklenir.",
+        "platformMacos": "macOS: MDM onayı gerektirir, bu nedenle Breeze otomatik olarak yüklemez. Bu cihazlar uygulanamaz olarak gösterilir.",
+        "platformLinux": "Linux: desteklenmiyor.",
+        "keysNotice": "Yüklemeler, sağlayıcı entegrasyonundaki müşteriye özel anahtarları kullanır (Huntress kuruluş anahtarları, SentinelOne site belirteçleri). Bu entegrasyonda eşlenmemiş kuruluşlar atlanır ve başarısız dağıtım olmadan uygulanamaz olarak gösterilir. Bir sağlayıcıyı kapatmak uygulamayı durdurur ancak aracıyı asla kaldırmaz.",
+        "closerWarning": "Cihaza daha yakın atanmış (site, grup veya cihaz ya da miras alan alt politika) ve kendi Güvenlik Aracıları ayarlarına sahip bir yapılandırma politikası, bu cihazlar için bu ayarların yerine tamamen geçer. Orada atlanan bir sağlayıcı uygulanmaz.",
+        "partnerWideBadge": "Tüm kuruluşlara uygulanır",
+        "noneEnabledNote": "Hiçbir sağlayıcı etkin değil: bu politikanın eriştiği cihazlar tüm güvenlik aracılarının dışında tutulur.",
+        "catalogMissing": "Bu iş ortağı için şu sağlayıcı henüz kurulmadı: {{vendors}}. Önce entegrasyonu bağlayın, ardından tekrar kaydedin.",
+        "catalogMissingLink": "Entegrasyonu bağla",
+        "executeRequired": "Yüklemeleri açmak için cihazlarda komut çalıştırma izni (MFA ile) gerekir. Bu izne sahip bir yöneticiden bu ayarı kaydetmesini isteyin.",
+        "binaryMissing": "Yerleşik paketin dağıtılabilir bir yükleyicisi olana kadar şu sağlayıcı açılamaz: {{vendors}}. En son sürüm, yükleme bağımsız değişkenleri SITE_TOKEN={s1_site_token} içeren bir Windows MSI olmalıdır. Bunu paketin Sürümler sekmesinde düzeltin, ardından tekrar kaydedin.",
+        "binaryMissingLink": "Sürümler sekmesini aç",
+        "platformMacosUnsupported": "macOS: desteklenmiyor.",
+        "sentinelOneMsiNote": "Önce SentinelOne MSI dosyasını, yükleme bağımsız değişkenleri SITE_TOKEN={s1_site_token} içerecek şekilde yerleşik SentinelOne paketinin Sürümler sekmesine ekleyin. Breeze yükleyiciyi sağlamaz ve dosya eklenene kadar SentinelOne açılamaz.",
+        "catalogMissingBuiltin": "{{vendors}} henüz bu iş ortağının yazılım kataloğunda değil. Yazılım → Katalog → Yerleşik paketler bölümünden ekleyin, ardından yeniden kaydedin.",
+        "catalogMissingBuiltinLink": "Yerleşik paketleri aç",
+        "dnsBuiltinNote": "Önce {{vendor}} istemcisini Yazılım → Katalog → Yerleşik paketler bölümünden bu iş ortağının yazılım kataloğuna ekleyin; orada olmadan etkinleştirilemez.",
+        "dnsVariableNote": "Her kuruluşun normal (gizli olmayan) bir değişken olarak tanımlanmış {{variable}} kiracı değişkenine ihtiyacı vardır. Bu değişkeni olmayan kuruluşlar atlanır ve uygulanamaz olarak gösterilir.",
+        "dnsVariableLink": "Değişkenleri aç",
+        "dnsCoverageNote": "Breeze {{vendor}} konsolunu eşitlemez; bu nedenle kapsam yalnızca her cihazın istemciyi alıp alamayacağını gösterir (beklemede veya uygulanamaz). Kurulum ve hizmet durumu (eksik, çalışmıyor) oluşturulan yazılım politikasının uyumluluğunda görünür."
+      },
       "warrantyTab": {
         "warrantyAlertingIsOptInDevicesWith": "Garanti uyarısı isteğe bağlıdır: herhangi bir garanti politikası atanmamış cihazlar asla uyarı vermez. Aşağıdaki eşikler yalnızca sabit vadeli kapsam için geçerlidir; aktif AppleCare abonelikler sona ermek yerine yenilenir, dolayısıyla sona erme uyarıları her zaman bastırılır.",
         "enableWarrantyExpiryAlerts": "Garanti sona erme uyarılarını etkinleştir",
         "generateAlertsWhenFixedTermDeviceWarranties": "Sabit süreli cihaz garantilerinin sona ermesi yaklaştığında uyarı oluşturun.",
         "warningThresholdDays": "Uyarı eşiği (gün)",
-        "generateAWarningAlertWhenWarrantyExpires": "Garantinin süresi bu kadar gün içinde dolduğunda bir uyarı uyarısı oluşturun.",
-        "criticalThresholdDays": "Kritik eşik (gün)",
-        "generateACriticalAlertWhenWarrantyExpires": "Garantinin süresi bu kadar gün içinde dolduğunda kritik bir uyarı oluşturun.",
+        "warnThresholdHelp": "Garantinin süresi bu kadar gün içinde dolduğunda Bilgi önem düzeyinde bir uyarı oluşturun.",
+        "urgentThresholdDays": "Acil durum eşiği (gün)",
+        "urgentThresholdHelp": "Garantinin süresi bu kadar gün içinde dolduğunda Düşük önem düzeyinde bir uyarı oluşturun. Süresi dolmuş bir garanti Orta önem düzeyinde uyarı oluşturur.",
         "enabled": "etkin",
         "warnDays": "warnDays",
         "criticalDays": "kritikDayler",
@@ -1136,6 +1230,20 @@
         "title": "Bu ilkedeki cihazlar iki kez uyarı verecek",
         "body": "Bu koşullar hem bağlı bir monitör hem de eski bir kural veya izleme olarak mevcut: {{names}}"
       }
+    },
+    "partnerGroupAssignment": {
+      "title": "Cihaz grupları (tüm kuruluşlar)",
+      "description": "İş ortağı genelindeki bir cihaz grubunu hedefleyin. Grup ataması cihaz grubu düzeyinde uygulanır; bu nedenle diğer ilkelerin kuruluş ve site düzeyindeki atamalarından önceliklidir.",
+      "selectGroup": "Bir cihaz grubu seçin",
+      "assign": "Ata",
+      "remove": "Kaldır",
+      "assigned": "Cihaz grubu atandı",
+      "removed": "Cihaz grubu ataması kaldırıldı",
+      "failedToLoad": "Cihaz grupları yüklenemedi",
+      "failedToAssign": "Cihaz grubu atanamadı",
+      "failedToRemove": "Cihaz grubu ataması kaldırılamadı",
+      "empty": "Henüz iş ortağı genelinde cihaz grubu yok. Cihaz Grupları → Tüm kuruluşlar altında bir tane oluşturun.",
+      "loading": "Cihaz grupları yükleniyor…"
     }
   },
   "software": {
@@ -1195,7 +1303,7 @@
       "uploadFile": "Dosya yükle",
       "source2": "kaynak",
       "downloadUrl": "indirme URL'si",
-      "noFileSelectedMsiExeDmgDeb": "Hiçbir dosya seçilmedi (.msi, .exe, .dmg, .deb, .pkg)",
+      "noFileSelectedMsiExeDmgDeb": "Hiçbir dosya seçilmedi (.msi, .exe, .dmg, .deb, .pkg, .zip)",
       "supportedOs": "desteklenen işletim sistemleri",
       "pkgInstall": "pkg kurulumu",
       "silentInstallArgs2": "sessizInstallArgs",
@@ -1251,7 +1359,19 @@
       "thisOrganizationOnly": "Yalnızca bu organizasyon",
       "partnerWideUrlOnly": "İş ortağı genelindeki paketler bir indirme URL’si kullanır — bunlar için dosya yükleme henüz kullanılamıyor.",
       "selectedFileRemoved": "Seçilen dosya kaldırıldı — iş ortağı genelindeki paketler bir indirme URL’si kullanır.",
-      "scopeLockedAfterCreate": "Paket zaten bu kapsamla oluşturuldu — oluşturulduktan sonra sahiplik değiştirilemez."
+      "scopeLockedAfterCreate": "Paket zaten bu kapsamla oluşturuldu — oluşturulduktan sonra sahiplik değiştirilemez.",
+      "installScripts": "Yükleme betikleri",
+      "installScriptsHelp": "zip paketleri için zorunlu, diğerlerinde isteğe bağlıdır. Betikler Windows'ta SYSTEM, macOS ve Linux'ta root olarak çalışır, 10 dakika sonra zaman aşımına uğrar, devices.execute iznini ve tam olarak bir hedef işletim sistemini gerektirir.",
+      "availableTokens": "Kullanılabilir belirteçler:",
+      "preInstallScript": "Yükleme öncesi betik",
+      "postInstallScript": "Yükleme sonrası betik",
+      "preInstallScriptPlaceholder": "Yükleyiciden önce çalışır (Windows'ta PowerShell, macOS ve Linux'ta bash)",
+      "postInstallScriptPlaceholder": "Yükleyiciden sonra veya zip dosyası çıkarıldıktan sonra çalışır",
+      "silentArgsNotUsedForType": "Sessiz yükleme argümanları pkg, dmg, deb veya zip yükleyicileri için kullanılmaz.",
+      "issueZipRequiresPostInstallScript": "zip paketleri için yükleme sonrası betik gerekir: aracı yalnızca arşivi çıkarır.",
+      "issueScriptsRequireSingleOs": "Yükleme betikleri için tam olarak bir hedef işletim sistemi gerekir.",
+      "issueScriptTooLarge": "Her yükleme betiği en fazla 64 KiB olmalıdır.",
+      "issueArgsUnsupportedForFileType": "Sessiz yükleme argümanları bu yükleyici türü için desteklenmez."
     },
     "builtinPackageDetail": {
       "managedBuiltIn": "Yönetilen yerleşik",
@@ -1297,9 +1417,8 @@
       "noSoftwarePoliciesFoundCreateOneTo": "Hiçbir yazılım ilkesi bulunamadı. Başlamak için bir tane oluşturun.",
       "recentViolations": "Son İhlaller",
       "noCurrentSoftwareViolations": "Mevcut yazılım ihlali yok.",
-      "violationS": "ihlalleri",
-      "remediation": "Düzeltme:",
-      "checked": "Kontrol edildi:",
+      "remediation": "Düzeltme: {{value}}",
+      "checked": "Kontrol edildi: {{date}}",
       "deactivatePolicy": "Politikayı Devre Dışı Bırak",
       "areYouSureYouWantToDeactivate": "Devre dışı bırakmak istediğinizden emin misiniz?",
       "thePolicyWillBeMarkedInactiveAnd": "? Politika etkin değil olarak işaretlenecek ve uyumluluk verileri temizlenecek.",
@@ -1327,7 +1446,26 @@
       "installSkippedNoCatalog": "Gerekli bir kuralın bağlı bir katalog öğesi yok, bu yüzden yüklenecek bir şey yok. Bunu düzeltmek için politika düzenleyicisinde bir katalog bağlantısı ekleyin.",
       "installSkippedCapOrPlatform": "Bu bir hata değil — geçiş başına yükleme sınırına ulaşıldı ya da bu cihazın platformunda yazılım için bir yükleme yöntemi yok. Bir sonraki geçişte tekrar denenebilir.",
       "installAttempts": "{{count}} deneme",
-      "installLastAttempt": "Son yükleme denemesi: "
+      "installLastAttempt": "Son yükleme denemesi: ",
+      "managedByConfigPolicy": "Yapılandırma politikası tarafından yönetilir",
+      "managedByConfigPolicyHint": "Bu politika bir yapılandırma politikasından oluşturulmuştur ve burada salt okunurdur. Yapılandırma Politikaları bölümünden değiştirin.",
+      "securityAgentCoverage": "Güvenlik aracısı kapsamı",
+      "coverageDevice": "Cihaz",
+      "coverageVendor": "Sağlayıcı",
+      "coverageReason": "Neden",
+      "vendorOnlyAgent": "Yalnızca sağlayıcıda bilinen aracı",
+      "coverageRowsNote": "{{total}} kayıttan {{shown}} tanesi gösteriliyor",
+      "violationCount": "{{count}} ihlal",
+      "violationCount_one": "{{count}} ihlal",
+      "violationCount_other": "{{count}} ihlal",
+      "violationTypes": {
+        "unauthorized": "Yetkisiz",
+        "missing": "Eksik",
+        "outdated": "Güncel değil",
+        "not_running": "Çalışmıyor",
+        "service_unverified": "Hizmet doğrulanmadı",
+        "serviceTitle": "Hizmet: {{name}}"
+      }
     },
     "deploymentList": {
       "running": "Koşuyor",
@@ -1390,6 +1528,8 @@
       "error": "Hata",
       "deploymentComplete": "Dağıtım tamamlandı",
       "inProgress": "Devam ediyor",
+      "completedWithErrors": "Hatalarla tamamlandı",
+      "scheduledFor": "Zamanlandı: {{time}}",
       "autoRefreshing": "Her 5 saniyede bir otomatik olarak yenilenir",
       "queuedOffline": "Sıraya alındı — cihaz çevrimdışı",
       "cancelled": "İptal edildi",
@@ -1411,7 +1551,8 @@
       "devicesFinished": "{{finished}} / {{total}} cihaz tamamlandı",
       "setupNeeded": "Kurulum gerekli",
       "managerUnavailableSummary_one": "{{count}} cihazda paket yöneticisi eksik. Bu, tek seferlik bir cihaz kurulum işidir — o cihaza winget (Windows) veya Homebrew (macOS) yükleyin; o zamana kadar cihaza yapılan her paket yöneticisi dağıtımı başarısız olacaktır.",
-      "managerUnavailableSummary_other": "{{count}} cihazda paket yöneticisi eksik. Bu, tek seferlik bir cihaz kurulum işidir — o cihazlara winget (Windows) veya Homebrew (macOS) yükleyin; o zamana kadar bu cihazlara yapılan her paket yöneticisi dağıtımı başarısız olacaktır."
+      "managerUnavailableSummary_other": "{{count}} cihazda paket yöneticisi eksik. Bu, tek seferlik bir cihaz kurulum işidir — o cihazlara winget (Windows) veya Homebrew (macOS) yükleyin; o zamana kadar bu cihazlara yapılan her paket yöneticisi dağıtımı başarısız olacaktır.",
+      "deviceOutputTail": "Cihaz çıktısı (son satırlar)"
     },
     "deploymentWizard": {
       "selectSoftware": "Yazılımı Seçin",
@@ -1541,20 +1682,25 @@
       "registry": "kayıt defteri",
       "fileExists": "file_exists",
       "msiProductCode": "msi_product_code",
-      "fileVersion": "file_version"
+      "fileVersion": "file_version",
+      "serviceRunning": "Hizmet çalışıyor",
+      "readOnlyHint": "API ile oluşturuldu. Burada düzenlenemez; kaydettiğinizde olduğu gibi korunur.",
+      "serviceName": "Hizmet adı",
+      "serviceNamePlaceholder": "ör. ctrld",
+      "serviceNameHint": "Windows hizmet adı, macOS launchd etiketi veya Linux systemd birimi. Yüklemeden önce ve sonra denetlenir.",
+      "serviceNameInvalid": "Kontrol karakteri içermeyen ve başında \"-\" bulunmayan bir hizmet adı girin (en fazla 256 bayt)."
     },
     "deviceDrawer": {
       "failedToFetchDevices": "Cihazlar getirilemedi",
-      "devicesWith": "Cihazlar",
-      "by": "yazan",
+      "devicesWith": "{{name}} yüklü cihazlar",
+      "by": "yayıncı: {{vendor}}",
       "noDevicesFoundWithThisSoftware": "Bu yazılıma sahip cihaz bulunamadı.",
       "hostname": "Ana Bilgisayar Adı",
       "oS": "İşletim Sistemi",
       "version": "Sürüm",
       "lastSeen": "Son Görülme",
-      "device": "cihaz",
-      "total": "toplam",
-      "s": "s"
+      "deviceTotal_one": "toplam {{count}} cihaz",
+      "deviceTotal_other": "toplam {{count}} cihaz"
     },
     "policyForm": {
       "dryRunUnassigned": "0 cihaz — genellikle bu ilke henüz hiçbir cihaza atanmadığı için; tamamen uyumlu bir filo veya boş bir site izin listesi de 0 verir",
@@ -1659,7 +1805,10 @@
       "catalogTab": "Katalog",
       "summaryCompleted7d": "Tamamlandı (7 gün)",
       "summaryFailed7d": "Başarısız (7 gün)",
-      "categoryFilterLabel": "Kategori"
+      "categoryFilterLabel": "Kategori",
+      "requiredVariables": "Gerekli değişkenler",
+      "uninstallCommand": "Kaldırma komutu",
+      "managedByBreezeHint": "Breeze tarafından yönetilir. Bu paket burada düzenlenemez, silinemez veya yeni sürüm eklenemez."
     },
     "softwareInventory": {
       "allowed": "İzin veriliyor",
@@ -1801,7 +1950,10 @@
       "uploadsRequireS3Storage": "Dosya yüklemeleri için sunucuda S3 nesne depolamasının yapılandırılmış olması gerekir.",
       "editingVersion": "Sürüm düzenleniyor",
       "failedToUpdateVersion": "Sürüm güncellenemedi",
-      "replaceFileAddNewVersion": "Yükleyici dosyasını değiştirmek için bunun yerine yeni bir sürüm ekleyin."
+      "replaceFileAddNewVersion": "Yükleyici dosyasını değiştirmek için bunun yerine yeni bir sürüm ekleyin.",
+      "inactiveStoredScripts": "Kayıtlı yükleme betikleri etkin değil; etkinleştirmek için sürümü yeniden oluşturun.",
+      "addZipFromAddPackage": "zip paketlerini Paket Ekle bölümünden ekleyin.",
+      "builtinVersionsReadOnly": "Breeze tarafından yönetilir. Dahili paketlerin sürümleri burada eklenemez veya değiştirilemez."
     },
     "variableInput": {
       "insertADeployTimeVariable": "Dağıtım zamanı değişkeni ekleyin",
@@ -1835,6 +1987,30 @@
       "queuedNone": "Kuyruğa hiçbir şey eklenmedi: önizlemedeki cihazların artık düzeltmeye ihtiyacı yok ya da düzeltme zaten beklemede.",
       "queuedPartial": "Önizlemedeki {{requested}} cihazdan {{queued}} tanesi için düzeltme kuyruğa alındı; kalanların artık ihtiyacı yok ya da zaten beklemede.",
       "previewFailedWithReason": "Düzeltme önizlemesi yüklenemedi: {{reason}}"
+    },
+    "builtinPackagesPanel": {
+      "title": "Dahili paketler",
+      "description": "Breeze tarafından sabitlenen ve doğrulanan DNS filtreleme istemcileri. Birini kataloğunuza ekleyin, her kuruluş için değişkenini ayarlayın, ardından diğer paketler gibi dağıtın.",
+      "colPackage": "Paket",
+      "colPlatform": "Platform",
+      "colPinnedVersion": "Sabitlenen sürüm",
+      "colRequiredVariables": "Gerekli değişkenler",
+      "colUninstallCommand": "Kaldırma komutu",
+      "colStatus": "Durum",
+      "addToCatalog": "Kataloğa ekle",
+      "adding": "Ekleniyor…",
+      "inCatalog": "Katalogda",
+      "archived": "Arşivlendi",
+      "restoreToCatalog": "Geri yükle",
+      "addedToCatalog": "{{name}} kataloğa eklendi",
+      "couldNotAddToCatalog": "{{name}} kataloğa eklenemedi",
+      "couldNotLoadBuiltinPackages": "Dahili paketler yüklenemedi",
+      "loadingBuiltinPackages": "Dahili paketler yükleniyor…",
+      "setVariablesPerOrganization": "Kuruluş başına Ayarlar → Değişkenler bölümünden ayarlanır",
+      "copyUninstallCommand": "Kaldırma komutunu kopyala",
+      "uninstallCommandCopied": "Kaldırma komutu kopyalandı",
+      "breezeDoesNotUninstall": "Breeze bu istemcileri kaldırmaz. Birini kaldırmak için komutu cihazda çalıştırın.",
+      "copyFailed": "Kopyalama başarısız oldu. Komutu seçip elle kopyalayın."
     }
   }
 }

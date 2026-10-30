@@ -303,11 +303,11 @@ All self-service actions are scoped to the single device where the Helper is run
 
 ## Organization Controls
 
-Organizations can enable or disable the Helper chat feature on a per-org basis. The toggle is delivered to agents through the heartbeat response, so changes take effect within 60 seconds without requiring an agent restart.
+Organizations can enable or disable the Helper on a per-org basis. The toggle is delivered to agents through the heartbeat response, so changes take effect within 60 seconds without requiring an agent restart.
 
 ### Enabling / Disabling Helper Chat
 
-The Helper chat toggle is managed through organization settings. When disabled, the Helper tray icon remains visible but the chat interface is hidden.
+The Helper toggle is managed through organization settings or the **Deploy Breeze Assist to devices** toggle on a configuration policy's **Breeze Helper** feature (the policy takes precedence when one applies). A newly created Breeze Helper policy feature starts with the toggle on. When a device's effective Helper setting is off, the agent stops and removes a Helper it installed on its next heartbeat, and the Helper API refuses every request from that device with `403` and code `helper_disabled` ("Breeze Helper is disabled for this device by policy"), so a client can tell it apart from a credential failure.
 
 ```bash
 # Check current helper settings (returned in heartbeat response)
@@ -317,7 +317,17 @@ The Helper chat toggle is managed through organization settings. When disabled, 
 }
 ```
 
-The agent reads `helperEnabled` from each heartbeat response and stores it as an atomic boolean. When the value changes, the Helper is notified to show or hide its chat UI.
+The agent reads `helperEnabled` from each heartbeat response. When the effective setting turns off, the agent stops the Helper in every user session and uninstalls it, provided the agent installed it.
+
+The agent records each Helper install it makes. A Helper installed another way (Intune, a software policy, or by hand) is left alone while the setting is off: the agent does not start, update or remove it, and the device page reports it as not installed by Breeze (`helperInstallIssue: unmanaged_install`). Turning the setting on adopts that copy when the agent installs the next Helper version the server offers.
+
+On Windows the agent also checks the WebView2 Runtime before it starts the Helper. If the runtime is older than the installed Helper build needs, the agent does not start the Helper and the device reports `webview2_outdated`; update the WebView2 Runtime on the device to clear it. A Helper that keeps closing right after it starts is reported as `crash_loop`, with the exit codes in the agent log, and the agent tries it again after 6 hours or when a new Helper version is installed.
+
+The device page's **Breeze Assist** row shows the last reported state: **Installed**, **Not deployed**, or **Unavailable** with the reason (`webview2_outdated`, `crash_loop` or `unmanaged_install`). In the device list these three show as **Assist unavailable**, with the reason in the tooltip, because Assist is on disk in each case. All of this needs agent 0.125.0; an older server shows the new reasons as unknown.
+
+<Aside type="caution" title="Known issue in v0.125.0">
+  Crash-loop detection does not fire yet: a crash-looping Helper keeps restarting and is not reported as `crash_loop` ([#10302](https://github.com/LanternOps/breeze/issues/10302)).
+</Aside>
 
 ### Window and Tray Behavior
 
@@ -375,6 +385,30 @@ Authorization: Bearer brz_<helper-token>
 │  └─────────────────────────┘   │
 └─────────────────────────────────┘
 ```
+
+### Windows Helper Lifecycle (Always-On vs. On-Demand)
+
+On Windows the agent service starts the helper processes itself, one per interactive session, in two roles: a **SYSTEM helper** (screen capture, input, the PAM approval dialog and consent-prompt handling) and a **user helper** (tray, chat, notifications, user-context scripts). How many it keeps running depends on the lifecycle mode:
+
+| Mode | Behavior |
+|------|----------|
+| `always-on` | A SYSTEM helper and a user helper in every eligible session, all the time. Default on workstations and on Windows Server without the RD Session Host role. |
+| `on-demand` | No helpers at rest. A helper is started when an operation needs one (a remote desktop connection or a script targeted at a session) and stopped about two minutes after the operation ends. Default on RD Session Hosts, where one helper per session per user adds up. |
+
+**PAM on on-demand hosts.** While the device's effective PAM policy has UAC interception enabled, an on-demand host also keeps a SYSTEM helper in every session a user is signed into. The SYSTEM helper shows the elevation dialog and handles `consent.exe`, and a UAC prompt can appear at any time. Sessions at the logon screen and disconnected sessions get no PAM helper. User helpers stay on-demand. When the policy turns interception off, those SYSTEM helpers are stopped on the next reconcile. If an elevation request arrives before the helper for that session is up (for example, right after the user signs in), the agent starts one for that session and waits up to 30 seconds for it. If no helper comes up, the agent logs an error. When it gives up on the request (the session exists but is not active or connected, or the helper did not start: crash cooldown, repeated failures, or not ready within the 30-second wait, after which the user's UAC prompt is no longer being handled), it reports that to the server. When it cannot tell (the session could not be resolved, the session check itself failed or the session was not in the list, the session dropped out of the list while the agent waited, the helper lease was refused, the helper came up but the agent could not find it, or the agent is still starting and its helper manager is not up yet), it leaves the request pending for the stale-request expiry (`PAM_PENDING_REQUEST_TTL_MINUTES`, 15 minutes by default) rather than close a request it might still handle. A request still waiting for a technician is then closed as expired, so nobody can approve it, and the PAM requests list shows that the device could not act under its Expired or All filter, with the agent's reason as a tooltip. Agents older than this report leave the request pending until the stale-request expiry closes it.
+
+**Choosing the mode.** The agent resolves the mode in this order:
+
+1. **Local agent config.** `helper_lifecycle_mode` in `agent.yaml`, or the `BREEZE_HELPER_LIFECYCLE_MODE` environment variable. Values: `always-on`, `on-demand`, or `auto`. Use this when you need to override the mode on one machine. It always wins, so the policy setting below has no effect on that device. Restart the agent service after changing it.
+2. **Configuration policy.** The **Helper lifecycle on RD Session Hosts** setting on the policy's Breeze Helper feature (`auto`, `always-on`, `on-demand`). Applied live from the heartbeat.
+3. **Auto-detection.** With neither set (or both `auto`), RD Session Hosts run on-demand and every other machine runs always-on.
+
+```yaml
+# agent.yaml: force a helper in every session on this host
+helper_lifecycle_mode: always-on
+```
+
+The agent logs the resolved mode at startup (`helper lifecycle mode resolved`, with `mode`, `rdsHost`, and `override` fields) and reports it in its heartbeat.
 
 ### IPC Message Types
 
@@ -452,7 +486,7 @@ Some tools run on the end-user's machine rather than the server -- for example, 
 | POST | `/helper/screenshots` | Upload a screenshot for AI analysis |
 
 <Aside>
-  All Helper endpoints require a valid helper bearer token (`Authorization: Bearer brz_...`) -- a separate credential from the agent's own token, issued to the device at enrollment time. The token is validated by hashing with SHA-256 and matching against the `helperTokenHash` column in the `devices` table. Decommissioned and quarantined devices are rejected with 403.
+  All Helper endpoints require a valid helper bearer token (`Authorization: Bearer brz_...`) -- a separate credential from the agent's own token, issued to the device at enrollment time. The token is validated by hashing with SHA-256 and matching against the `helperTokenHash` column in the `devices` table. Decommissioned and quarantined devices are rejected with 403, and so is a device whose effective Helper setting is off (`helper_disabled`).
 </Aside>
 
 ### Creating a Session

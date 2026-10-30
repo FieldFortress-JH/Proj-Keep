@@ -83,22 +83,42 @@ CVE-2026-85393
 
 # braces — CVE-2026-93687 is the Trivy-DB id for GHSA-vfj7-8cjw-p6xm, which the
 # npm audit gate already excepts (scripts/security/npm-audit-exceptions.json,
-# tracking #7862). No fixed release (<=3.0.3 affected; 3.0.3 is latest). Build
-# tooling only (tailwindcss/chokidar/fast-glob and Expo Metro → micromatch →
-# braces); `pnpm why braces --prod` is empty for every shipped app and no
-# production image deps stage installs it.
-# Remove together with that exception (expires 2026-10-16).
+# tracking #7862). No fixed release at the last re-review (see the JSON entry's
+# reason for the date and evidence). Build tooling only (tailwindcss/chokidar/
+# fast-glob and Expo Metro → micromatch → braces). `pnpm why braces --prod` is
+# empty for every shipped server and web package and no production image deps
+# stage installs it; breeze-mobile reaches it through expo, but the Android/iOS
+# bundles contain no braces or micromatch sources.
+# Remove together with that exception; its `expires` date is the re-review
+# deadline for this ignore too.
 #
 # Added 2026-10-03 (Trivy DB refresh).
 CVE-2026-93687
 
-# http-cache-semantics — CVE-2026-93748 is the Trivy-DB id for
-# GHSA-ch52-4w7c-c8xp, which the npm audit gate already excepts (tracking
-# #7863). No fixed release (<=4.2.0 affected; 4.2.0 is latest). Present in the
-# web/portal images via astro, but only astro's build-time remote-image cache
-# imports it and it calls only storable()/timeToLive(), never the max-stale
-# path; the built servers load it 0 times. Full reachability evidence lives in
-# the npm-audit exception. Remove together with it (expires 2026-10-16).
+# zod 3.25.76 — reaches pnpm-lock.yaml only through breeze-mobile → expo →
+# @expo/cli (Expo build tooling, dev/EAS hosts). Not in the Android/iOS Hermes
+# bundles and not in any production Docker deps stage; every workspace package
+# is on zod ^4.6.7. No fixed 3.x release exists (fix is 4.6.6). Same reviewed
+# exception as scripts/security/npm-audit-exceptions.json; tracking #9968.
+# Remove when @expo/cli depends on zod >= 4.6.6 (re-check after expo-sdk bumps).
+CVE-2023-54404
+GHSA-mrhx-c7xc-m3w5
+
+# zip 4.6.1 (Rust) — CVE-2026-115905 / GHSA-m665-v7pm-7grj, "Zip Cloaking":
+# ZipStreamReader extracts by Local File Header name while ZipArchive trusts
+# the Central Directory, so a crafted archive can write a different path.
+# Reaches apps/viewer/src-tauri/Cargo.lock only through tauri-plugin-updater
+# 2.14.0, which requires zip ^4 (every 4.x is yanked; fix is 9.0.5), so it
+# cannot be bumped — same upstream block as #8910 / the Cargo Audit exception
+# in apps/viewer/src-tauri/.cargo/audit.toml.
+# Not reachable as described: the updater only uses zip::ZipArchive (never
+# ZipStreamReader), in extract_zip on Windows, and only on bytes that already
+# passed verify_signature against the viewer's pinned updater pubkey
+# (Update::install verifies first; download_and_install uses download's
+# verified bytes). The viewer's own code does not call zip.
+# Remove together with the #8910 audit.toml exception once a stable
+# tauri-plugin-updater depends on zip >= 9.0.5.
 #
-# Added 2026-10-03 (Trivy DB refresh).
-CVE-2026-93748
+# Added 2026-10-29 (Trivy DB refresh).
+CVE-2026-115905
+GHSA-m665-v7pm-7grj

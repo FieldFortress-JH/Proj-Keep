@@ -395,6 +395,13 @@ export interface QuoteDetail {
    *  Optional: older payloads/fixtures omit it, which reads as "unknown"
    *  (AcceptOnBehalfDialog shows no email promise). */
   autoEmailInvoiceOnAccept?: boolean;
+  /** #9256: server has an email transport. Omitted (older payload) = unknown. */
+  emailConfigured?: boolean;
+  /** #9867: each contract auto variable's value as the client will read it
+   *  (a draft resolves bill-to/seller the way send will freeze them). null =
+   *  the server could not resolve them; omitted on older payloads. Either way
+   *  the editor falls back to showing the `{{token}}`. */
+  contractAutoValues?: Record<string, string> | null;
 }
 
 export const STATUS_LABELS: Record<QuoteStatus, string> = {

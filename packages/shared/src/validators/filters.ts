@@ -12,6 +12,9 @@ export const filterOperatorSchema = z.enum([
   'greaterThanOrEquals',
   'lessThan',
   'lessThanOrEquals',
+  // Software-version operators
+  'below',
+  'atLeast',
   // String operators
   'contains',
   'notContains',
@@ -63,21 +66,35 @@ const relativeTimeValueSchema = z.object({
   unit: z.enum(['minutes', 'hours', 'days', 'weeks', 'months'])
 });
 
+export const softwareVersionValueSchema = z.object({
+  name: z.string().trim().min(1).max(500),
+  version: z.string().trim().min(1).max(100)
+});
+
 // Union order is significant throughout: Zod returns the FIRST branch that
 // parses, so a broader branch placed earlier shadows a narrower one. `z.string()`
 // leading means an ISO date string stays a string (harmless — Postgres coerces
 // it against the column), while `z.coerce.date()` only ever fires for a real
 // `Date` instance or inside the range schemas.
+//
+// The arrays MUST come before `z.coerce.date()`: coercion calls `new Date(v)`,
+// and `new Date(['server-1'])` stringifies the one-element array and parses it
+// as 2001-01-01. A single "is any of" / "has" selection such as `['Floor 2']`
+// was turned into a Date, and the filter engine then failed with "Value must
+// be array" (#8760 review).
 export const filterValueSchema = z.union([
   z.string(),
   z.number(),
   z.boolean(),
-  z.coerce.date(),
   z.array(z.string()),
   z.array(z.number()),
+  z.coerce.date(),
   numberRangeValueSchema,
   dateRangeValueSchema,
-  relativeTimeValueSchema
+  relativeTimeValueSchema,
+  // Required name/version keys cannot match the existing range/time branches.
+  // Keep this after those branches so their existing precedence is preserved.
+  softwareVersionValueSchema
 ]);
 
 // ============================================
@@ -241,7 +258,10 @@ export const rolloutConfigSchema = z.object({
   type: z.enum(['immediate', 'staggered']),
   staggered: z
     .object({
-      batchSize: z.union([z.number().positive(), z.string().regex(/^\d+%$/)]),
+      batchSize: z.union([
+        z.number().positive(),
+        z.string().regex(/^\d+%$/, 'Batch size must be a positive number or a percentage such as 25%'),
+      ]),
       batchDelayMinutes: z.number().min(0),
       pauseOnFailureCount: z.number().min(1).optional(),
       pauseOnFailurePercent: z.number().min(1).max(100).optional()
@@ -259,6 +279,38 @@ export const deploymentTargetConfigSchema = z.object({
   deviceIds: z.array(z.string().guid()).optional(),
   groupIds: z.array(z.string().guid()).optional(),
   filter: filterConditionGroupSchema.optional()
+});
+
+/**
+ * The `target` of a script run (`POST /scripts/:id/execute`): one or more saved
+ * device groups. A narrowing of `deploymentTargetConfigSchema` to `groups`, not
+ * a new target vocabulary. The server resolves it to concrete device ids at
+ * execution time (materialized membership); nothing stores the group id.
+ */
+export const scriptRunGroupTargetSchema = z.object({
+  type: z.literal('groups'),
+  groupIds: z.array(z.string().guid()).min(1).max(100)
+});
+
+/**
+ * `deploymentTargetConfigSchema` with the member lists made mandatory for the
+ * types that need them. Used to validate an automation's `conditions` when it is
+ * a target config: without it an empty `groupIds` or a missing `filter` persists
+ * and the run quietly targets nothing.
+ */
+export const automationTargetConfigSchema = deploymentTargetConfigSchema.superRefine((target, ctx) => {
+  const need = (ok: boolean, path: string, message: string) => {
+    if (!ok) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
+  };
+  if (target.type === 'groups') {
+    need((target.groupIds?.length ?? 0) > 0, 'groupIds', 'A groups target requires at least one group');
+  }
+  if (target.type === 'devices') {
+    need((target.deviceIds?.length ?? 0) > 0, 'deviceIds', 'A devices target requires at least one device');
+  }
+  if (target.type === 'filter') {
+    need(target.filter !== undefined, 'filter', 'A filter target requires a filter');
+  }
 });
 
 export const deploymentScheduleSchema = z.object({

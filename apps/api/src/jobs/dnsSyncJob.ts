@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Job, type JobsOptions, Queue, Worker } from 'bullmq';
-import { and, eq, isNotNull, lte, sql } from 'drizzle-orm';
+import { and, eq, isNotNull, sql } from 'drizzle-orm';
 import * as dbModule from '../db';
 import {
   dnsEventAggregations,
@@ -17,7 +17,14 @@ import {
   type DnsPolicyDomain,
   type DnsThreatCategory
 } from '../db/schema';
-import { createDnsProvider, DnsProviderHttpError, type DnsEvent, type DnsEventSlice } from '../services/dnsProviders';
+import {
+  createDnsProvider,
+  DnsProviderHttpError,
+  type DnsEvent,
+  type DnsEventSlice,
+  type DnsEventSliceTruncation,
+  type DnsEventSliceWalkEnd
+} from '../services/dnsProviders';
 import { getBullMQConnection } from '../services/redis';
 import { bullmqJobId, isReusableState } from '../services/bullmqUtils';
 import { decryptForColumn } from '../services/secretCrypto';
@@ -257,6 +264,25 @@ function normalizePolicyDomains(value: unknown): string[] {
   return output;
 }
 
+/**
+ * Policy domains the provider may not have seen: never-synced policy, or a
+ * domain whose `addedAt` is after `lastSynced` (or unparseable). Pure.
+ */
+export function unsyncedPolicyDomains(value: unknown, lastSynced: Date | null | undefined): string[] {
+  if (!Array.isArray(value)) return [];
+  const cutoff = lastSynced ? lastSynced.getTime() : null;
+  const out: string[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const entry = item as DnsPolicyDomain;
+    const domain = normalizeDomain(entry.domain);
+    if (!domain) continue;
+    const added = entry.addedAt ? Date.parse(entry.addedAt) : NaN;
+    if (cutoff === null || Number.isNaN(added) || added > cutoff) out.push(domain);
+  }
+  return out;
+}
+
 function normalizeDomainList(domains: string[] | undefined): string[] {
   if (!Array.isArray(domains)) return [];
   const seen = new Set<string>();
@@ -462,7 +488,7 @@ async function processSyncAll(): Promise<{ queued: number }> {
 }
 
 // Phase 3 of a DNS event sync: turn the fetched provider events into security
-// event rows + aggregation deltas, prune per retention, and mark the
+// event rows + aggregation deltas, and mark the
 // integration synced — all inside a single DB context. Extracted so the
 // provider fetch in processSyncIntegration runs OUTSIDE any held transaction
 // (#1697); the caller wraps this in runWithSystemDbAccess. Returns the number
@@ -607,18 +633,9 @@ async function persistDnsEventSync(params: {
 
   await persistAggregationDeltas(Array.from(aggregationMap.values()));
 
-  const retentionDays = Number(config.retentionDays);
-  if (Number.isFinite(retentionDays) && retentionDays > 0) {
-    const cutoff = new Date(Date.now() - Math.round(retentionDays) * 24 * 60 * 60 * 1000);
-    await db
-      .delete(dnsSecurityEvents)
-      .where(
-        and(
-          eq(dnsSecurityEvents.integrationId, integrationId),
-          lte(dnsSecurityEvents.timestamp, cutoff)
-        )
-      );
-  }
+  // Retention (config.retentionDays) is applied by the daily batched sweep in
+  // jobs/dnsSecurityRetention.ts, to events AND aggregations (#10020) — not
+  // here, where an unbatched DELETE rode on every successful slice.
 
   await db
     .update(dnsFilterIntegrations)
@@ -629,9 +646,95 @@ async function persistDnsEventSync(params: {
       totalEventsProcessed: sql`${dnsFilterIntegrations.totalEventsProcessed} + ${insertedCount}`,
       updatedAt: new Date()
     })
-    .where(eq(dnsFilterIntegrations.id, integrationId));
+    // #10019 — never overwrite the 'deleting' marker of a row a DELETE has stopped.
+    .where(and(eq(dnsFilterIntegrations.id, integrationId), eq(dnsFilterIntegrations.isActive, true)));
 
   return insertedCount;
+}
+
+/** Truncated windows named in `lastSyncError`; the rest are counted. */
+const MAX_LISTED_TRUNCATIONS = 3;
+
+/**
+ * Tenant-visible account of the windows a walk could only partly fetch
+ * (#10047). Built only from timestamps and counts — never provider response
+ * text, which must not reach `lastSyncError`.
+ */
+function describeTruncations(truncations: readonly DnsEventSliceTruncation[]): string {
+  const listed = truncations
+    .slice(0, MAX_LISTED_TRUNCATIONS)
+    .map((t) => `${t.from.toISOString()}..${t.to.toISOString()} (${t.reachableRecords} fetched)`)
+    .join(', ');
+  const more = truncations.length - MAX_LISTED_TRUNCATIONS;
+  return (
+    `${truncations.length} ${truncations.length === 1 ? 'window' : 'windows'} held more records than the ` +
+    'provider lets a sync page through; records past that limit were not fetched and will not be retried: ' +
+    listed +
+    (more > 0 ? `, and ${more} more` : '')
+  );
+}
+
+function describeStoppedShort(stoppedShort: { from: Date; to: Date }): string {
+  return (
+    `Reached the per-run request budget; ${stoppedShort.from.toISOString()}..` +
+    `${stoppedShort.to.toISOString()} not yet fetched, resumes next run`
+  );
+}
+
+/**
+ * Record how a sliced walk ended, in one write after its slices are persisted:
+ *
+ * - Some slice could only be partly fetched (#10047) → `lastSyncStatus =
+ *   'truncated'`, with the affected windows in `lastSyncError`. Those records
+ *   are past the provider's paging limit and are never fetched, so this is
+ *   data loss, not a catch-up: it is distinct from `partial`, and outranks it
+ *   when a run is both (the message then carries both). The slices were still
+ *   checkpointed — re-fetching them would hit the same limit.
+ * - Stopped short at the provider's request budget (#10018) → `lastSyncStatus
+ *   = 'partial'` with the unfetched range in `lastSyncError`. `lastSync` is
+ *   left at the last completed slice (or where it was, if none completed), so
+ *   the next run resumes there. Without this the row kept the previous run's
+ *   `success` while it fell days behind.
+ * - A new slice width → merged into `config.syncSliceWidthMs` with jsonb `||`
+ *   (no read-modify-write of the tenant's settings), to seed the next run.
+ *
+ * Both statuses describe the LAST run: the next run's first completed slice
+ * writes `success` again, and a run that reaches `until` cleanly leaves it.
+ */
+async function recordSliceWalkEnd(
+  integrationId: string,
+  config: DnsIntegrationConfig,
+  end: DnsEventSliceWalkEnd,
+  truncations: readonly DnsEventSliceTruncation[]
+): Promise<void> {
+  const { stoppedShort, sliceWidthMs } = end;
+  const widthChanged = sliceWidthMs !== undefined && sliceWidthMs !== config.syncSliceWidthMs;
+
+  let status: { lastSyncStatus: 'truncated' | 'partial'; lastSyncError: string } | undefined;
+  if (truncations.length > 0) {
+    status = {
+      lastSyncStatus: 'truncated',
+      lastSyncError:
+        describeTruncations(truncations) + (stoppedShort ? `. Also: ${describeStoppedShort(stoppedShort)}` : '')
+    };
+  } else if (stoppedShort) {
+    status = { lastSyncStatus: 'partial', lastSyncError: describeStoppedShort(stoppedShort) };
+  }
+  if (!status && !widthChanged) return;
+
+  await db
+    .update(dnsFilterIntegrations)
+    .set({
+      ...(status ?? {}),
+      ...(widthChanged
+        ? {
+            config: sql`${dnsFilterIntegrations.config} || jsonb_build_object('syncSliceWidthMs', ${sliceWidthMs}::bigint)`
+          }
+        : {}),
+      updatedAt: new Date()
+    })
+    // #10019 — never overwrite the 'deleting' marker of a row a DELETE has stopped.
+    .where(and(eq(dnsFilterIntegrations.id, integrationId), eq(dnsFilterIntegrations.isActive, true)));
 }
 
 // Exported for focused catch-block coverage (#1035 item 2): a unit test mocks
@@ -659,6 +762,10 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
   }
 
   const config = parseIntegrationConfig(integration.config);
+  // Windows the provider could only partly fetch (#10047), recorded on the
+  // integration once the walk ends — after every slice's `success` write — or,
+  // if the run fails after one, in the error it records instead.
+  const truncations: DnsEventSliceTruncation[] = [];
 
   try {
     const provider = createDnsProvider({
@@ -675,27 +782,32 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
 
     // A provider either hands back its whole window at once (one slice ending
     // at `until`) or yields it in chronological slices (Umbrella, whose API
-    // cannot page past ~10k events per window — #7207).
-    const slices: AsyncIterable<DnsEventSlice> = provider.syncEventSlices
-      ? provider.syncEventSlices(since, until)
-      : (async function* () {
-          yield { events: await provider.syncEvents(since, until), until };
-        })();
-    const iterator = slices[Symbol.asyncIterator]();
+    // cannot page past ~10k events per window — #7207). A sliced walk starts
+    // at the width the previous run ended on and returns how it ended (#10018).
+    const iterator: AsyncGenerator<DnsEventSlice, DnsEventSliceWalkEnd | void, undefined> =
+      provider.syncEventSlices
+        ? provider.syncEventSlices(since, until, { initialSliceMs: config.syncSliceWidthMs })
+        : (async function* () {
+            yield { events: await provider.syncEvents(since, until), until };
+          })();
 
     let fetched = 0;
     let inserted = 0;
+    let walkEnd: DnsEventSliceWalkEnd | undefined;
     try {
       for (;;) {
         // Phase 2 — fetch the next slice with NO DB context held
         // (#1105/#1697). The ~20s-timeout HTTP must not pin a pooled
         // connection, so each resume of the provider's walk runs outside one.
         const step = await dbModule.runOutsideDbContext(() => iterator.next());
-        if (step.done) break;
+        if (step.done) {
+          walkEnd = step.value || undefined;
+          break;
+        }
         const slice = step.value;
 
         // Phase 3 — persist this slice in ONE context (security events,
-        // aggregations, retention prune, and `lastSync` advanced to the
+        // aggregations, and `lastSync` advanced to the
         // slice's end commit together). Per slice, not per run: a failure on
         // a later slice keeps every earlier one, and the next run resumes
         // from the last checkpoint instead of retrying — and re-losing — the
@@ -711,6 +823,7 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
           })
         );
         fetched += slice.events.length;
+        if (slice.truncated) truncations.push(slice.truncated);
       }
     } finally {
       // Release any provider-held session (best-effort; see
@@ -737,6 +850,11 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
       });
     }
 
+    if (walkEnd || truncations.length > 0) {
+      const end = walkEnd ?? {};
+      await runWithSystemDbAccess(() => recordSliceWalkEnd(integration.id, config, end, truncations));
+    }
+
     return {
       integrationId: integration.id,
       fetched,
@@ -761,10 +879,16 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
             .update(dnsFilterIntegrations)
             .set({
               lastSyncStatus: 'error',
-              lastSyncError: tenantVisibleSyncError(error),
+              // A truncated slice is already checkpointed, so the next run
+              // starts past it: if the loss is not named here, it is never
+              // recorded at all (#10047).
+              lastSyncError:
+                truncations.length > 0
+                  ? `${tenantVisibleSyncError(error)}. Earlier in this run: ${describeTruncations(truncations)}`
+                  : tenantVisibleSyncError(error),
               updatedAt: new Date()
             })
-            .where(eq(dnsFilterIntegrations.id, integration.id))
+            .where(and(eq(dnsFilterIntegrations.id, integration.id), eq(dnsFilterIntegrations.isActive, true)))
         )
       );
       recorded = true;
@@ -810,6 +934,9 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
   }
 
   const config = parseIntegrationConfig(row.integration.config);
+  // Stamped as last_synced on success: a domain added while this run is in
+  // flight has addedAt > this, so the next run still treats it as unsynced.
+  const syncStartedAt = new Date();
 
   try {
     const provider = createDnsProvider({
@@ -819,11 +946,29 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
       config
     });
 
-    const addDomains = data.operations
-      ? normalizeDomainList(data.operations.add)
-      : normalizePolicyDomains(row.policy.domains);
+    // #8404: reconcile only what the provider has not seen. Before #8337 policy
+    // sync jobs never enqueued, so earlier edits sat unsynced; a delta-only push
+    // would reach the provider for the latest edit, then mark the whole policy
+    // `synced` while older domains were never pushed. `sync_status` cannot tell
+    // us (every edit resets it to `pending`), so we compare each domain's
+    // `addedAt` against `last_synced`: a healthy policy yields no backlog and
+    // keeps today's delta-only push (no re-adds, O(delta) provider calls). A
+    // never-synced policy, or one whose last attempt failed (last_synced is not
+    // advanced on error), carries a backlog that is pushed alongside the delta.
+    const policyDomains = normalizePolicyDomains(row.policy.domains);
+    const stillPresent = new Set(policyDomains);
+    let addDomains: string[];
+    if (data.operations) {
+      const wanted = new Set([
+        ...normalizeDomainList(data.operations.add),
+        ...unsyncedPolicyDomains(row.policy.domains, row.policy.lastSynced)
+      ]);
+      addDomains = policyDomains.filter((domain) => wanted.has(domain));
+    } else {
+      addDomains = policyDomains;
+    }
     const removeDomains = data.operations
-      ? normalizeDomainList(data.operations.remove)
+      ? normalizeDomainList(data.operations.remove).filter((domain) => !stillPresent.has(domain))
       : [];
 
     // Phase 2 — push domain mutations to the provider with NO DB context held
@@ -852,7 +997,7 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
         .update(dnsPolicies)
         .set({
           syncStatus: 'synced',
-          lastSynced: new Date(),
+          lastSynced: syncStartedAt,
           syncError: null,
           updatedAt: new Date()
         })

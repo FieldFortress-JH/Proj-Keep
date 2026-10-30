@@ -17,14 +17,23 @@ import BillingDocumentsTab from './BillingDocumentsTab';
 import BillingConnectionsTab from './BillingConnectionsTab';
 import PaymentsSettingsTab from './PaymentsSettingsTab';
 import BillingRatesTab from './BillingRatesTab';
+import BillingAgreementsTab from './BillingAgreementsTab';
+import {
+  agreementDefaultsDraft,
+  agreementDefaultsPatch,
+  validateAgreementDefaults,
+  type AgreementDefaultsDraft,
+} from './agreementDefaultsForm';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
-const BILLING_TABS = ['defaults', 'documents', 'rates', 'connections', 'payments'] as const;
+const BILLING_TABS = ['defaults', 'documents', 'agreements', 'rates', 'connections', 'payments'] as const;
 type BillingTab = (typeof BILLING_TABS)[number];
 
 interface PartnerBilling {
   currencyCode: string; defaultTaxRate: string | null; invoiceNumberPrefix: string; invoiceTermsDays: number;
   autoEmailInvoiceOnQuoteAccept: boolean; notifyCustomerOnBehalfAcceptance?: boolean; invoiceDeviceAppendix: boolean; invoiceFooter: string | null;
+  // #8604 labor line itemization defaults (absent on older APIs → defaults).
+  invoiceLineGrouping?: 'entry' | 'day'; invoiceLineShowDate?: boolean; invoiceLineShowNote?: boolean; invoiceLineShowWorkedTime?: boolean;
   documentTheme: 'classic' | 'condensed'; documentPageSize: 'letter' | 'a4';
   // partners.name — the seller name documents print when billingCompanyName is
   // blank (sellerSnapshot: nonBlank(billingCompanyName) ?? nonBlank(name)).
@@ -33,6 +42,8 @@ interface PartnerBilling {
   billingAddressLine1: string | null; billingAddressLine2: string | null; billingAddressCity: string | null;
   billingAddressRegion: string | null; billingAddressPostalCode: string | null; billingAddressCountry: string | null;
   billingTermsAndConditions: string | null;
+  // #9075 W4a: agreement-request defaults (absent on older APIs → built-in defaults).
+  agreementDefaultExpiryDays?: number; agreementReminderIntervalDays?: number | null; agreementMaxReminders?: number;
   // "Company details" fallback tier for the letterhead override (#6228) — same
   // shape GET /orgs/partners/me already returns (partnerPublicColumns()).
   settings?: { contact?: unknown; address?: unknown } | null;
@@ -53,6 +64,11 @@ export default function PartnerBillingSettingsPage() {
   // still enforces and the 403 toast remains the backstop (#7517).
   const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide) !== false;
   const canWrite = hasWriteGrant && canManagePartnerWide;
+  // #9075 W4a: the Agreements tab ALSO needs agreements:send (the PATCH route
+  // requires it whenever an agreement field is present). Without it the tab is
+  // read-only and the save omits those fields, so the rest of the page saves.
+  const hasAgreementsSendGrant = can('agreements', 'send');
+  const canEditAgreements = canWrite && hasAgreementsSendGrant;
   const [activeTab, setActiveTab] = useHashTab<BillingTab>(BILLING_TABS, 'defaults');
 
   const [currencyCode, setCurrencyCode] = useState('USD');
@@ -62,6 +78,10 @@ export default function PartnerBillingSettingsPage() {
   const [autoEmailInvoice, setAutoEmailInvoice] = useState(true);
   const [notifyOnBehalfAcceptance, setNotifyOnBehalfAcceptance] = useState(false);
   const [deviceAppendix, setDeviceAppendix] = useState(false);
+  const [lineShowDate, setLineShowDate] = useState(false);
+  const [lineShowNote, setLineShowNote] = useState(true);
+  const [lineShowWorkedTime, setLineShowWorkedTime] = useState(true);
+  const [lineGrouping, setLineGrouping] = useState<'entry' | 'day'>('entry');
   const [footer, setFooter] = useState('');
   const [documentTheme, setDocumentTheme] = useState<'classic' | 'condensed'>('classic');
   const [documentPageSize, setDocumentPageSize] = useState<'letter' | 'a4'>('letter');
@@ -75,6 +95,7 @@ export default function PartnerBillingSettingsPage() {
   const [postal, setPostal] = useState('');
   const [country, setCountry] = useState('');
   const [terms, setTerms] = useState('');
+  const [agreementDefaults, setAgreementDefaults] = useState<AgreementDefaultsDraft>(() => agreementDefaultsDraft({}));
   // Resolved "company details" values, read straight off the same GET response —
   // the InheritedField placeholder/source for the letterhead override fields (#6228).
   const [inheritedCompanyName, setInheritedCompanyName] = useState<string | null>(null);
@@ -100,6 +121,10 @@ export default function PartnerBillingSettingsPage() {
       // Default OFF (#6635): only an explicit true reads as on.
       setNotifyOnBehalfAcceptance(p.notifyCustomerOnBehalfAcceptance === true);
       setDeviceAppendix(p.invoiceDeviceAppendix === true);
+      setLineShowDate(p.invoiceLineShowDate === true);
+      setLineShowNote(p.invoiceLineShowNote !== false);
+      setLineShowWorkedTime(p.invoiceLineShowWorkedTime !== false);
+      setLineGrouping(p.invoiceLineGrouping === 'day' ? 'day' : 'entry');
       setFooter(p.invoiceFooter ?? '');
       setDocumentTheme(p.documentTheme ?? 'classic');
       setDocumentPageSize(p.documentPageSize ?? 'letter');
@@ -113,6 +138,7 @@ export default function PartnerBillingSettingsPage() {
       setPostal(p.billingAddressPostalCode ?? '');
       setCountry(p.billingAddressCountry ?? '');
       setTerms(p.billingTermsAndConditions ?? '');
+      setAgreementDefaults(agreementDefaultsDraft(p));
       const companyContact = parseCompanyContact(p.settings?.contact);
       const companyAddress = parseCompanyAddress(p.settings?.address);
       setInheritedCompanyName(p.name?.trim() || null);
@@ -132,6 +158,7 @@ export default function PartnerBillingSettingsPage() {
   // A server flag describes the value that was submitted; editing it supersedes the flag.
   useEffect(() => { setServerErrors({}); }, [taxPercent, termsDays, prefix]);
   const defaultsInvalid = Object.keys(validateBillingDefaults({ taxPercent, termsDays, prefix })).length > 0;
+  const agreementsInvalid = canEditAgreements && Object.keys(validateAgreementDefaults(agreementDefaults)).length > 0;
 
   const websiteTrimmed = website.trim();
   const websiteInvalid = websiteTrimmed !== '' && !isHttpUrl(websiteTrimmed);
@@ -142,6 +169,11 @@ export default function PartnerBillingSettingsPage() {
     // runs the same validator live); never send them to the API.
     if (defaultsInvalid) {
       setActiveTab('defaults');
+      return;
+    }
+    // Same for the Agreements tab: flagged inline there, never sent.
+    if (agreementsInvalid) {
+      setActiveTab('agreements');
       return;
     }
     setServerErrors({});
@@ -160,6 +192,10 @@ export default function PartnerBillingSettingsPage() {
             autoEmailInvoiceOnQuoteAccept: autoEmailInvoice,
             notifyCustomerOnBehalfAcceptance: notifyOnBehalfAcceptance,
             invoiceDeviceAppendix: deviceAppendix,
+            invoiceLineGrouping: lineGrouping,
+            invoiceLineShowDate: lineShowDate,
+            invoiceLineShowNote: lineShowNote,
+            invoiceLineShowWorkedTime: lineShowWorkedTime,
             invoiceFooter: footer.trim() === '' ? null : footer,
             documentTheme,
             documentPageSize,
@@ -173,6 +209,7 @@ export default function PartnerBillingSettingsPage() {
             billingAddressPostalCode: postal.trim() === '' ? null : postal.trim(),
             billingAddressCountry: country.trim() === '' ? null : country.trim().toUpperCase(),
             billingTermsAndConditions: terms.trim() === '' ? null : terms,
+            ...(canEditAgreements ? agreementDefaultsPatch(agreementDefaults) : {}),
           }),
         }),
         errorFallback: t('partnerBillingSettings.saveError'),
@@ -198,8 +235,8 @@ export default function PartnerBillingSettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [saving, websiteInvalid, defaultsInvalid, setActiveTab, canWrite, currencyCode, taxPercent, prefix, termsDays, autoEmailInvoice, notifyOnBehalfAcceptance, deviceAppendix,
-      footer, documentTheme, documentPageSize, companyName, phone, website, addr1, addr2, city, region, postal, country, terms, load, t]);
+  }, [saving, websiteInvalid, defaultsInvalid, agreementsInvalid, canEditAgreements, agreementDefaults, setActiveTab, canWrite, currencyCode, taxPercent, prefix, termsDays, autoEmailInvoice, notifyOnBehalfAcceptance, deviceAppendix,
+      lineGrouping, lineShowDate, lineShowNote, lineShowWorkedTime, footer, documentTheme, documentPageSize, companyName, phone, website, addr1, addr2, city, region, postal, country, terms, load, t]);
 
   if (loading) return <p className="text-sm text-muted-foreground">{t('partnerBillingSettings.loading')}</p>;
   // A 403 is a permission state, not a transient failure — no Retry.
@@ -217,6 +254,7 @@ export default function PartnerBillingSettingsPage() {
   const TABS: Array<{ id: BillingTab; labelKey: string; reserved?: true }> = [
     { id: 'defaults', labelKey: 'partnerBillingSettingsTabs.defaults' },
     { id: 'documents', labelKey: 'partnerBillingSettingsTabs.documents' },
+    { id: 'agreements', labelKey: 'partnerBillingSettingsTabs.agreements' },
     { id: 'rates', labelKey: 'partnerBillingSettingsTabs.rates' },
     { id: 'payments', labelKey: 'partnerBillingSettingsTabs.payments' },
     { id: 'connections', labelKey: 'partnerBillingSettingsTabs.connections' },
@@ -249,7 +287,7 @@ export default function PartnerBillingSettingsPage() {
         tabIndex={-1}
         className="space-y-6"
       >
-      {!canWrite && (activeTab === 'defaults' || activeTab === 'documents') && (
+      {!canWrite && (activeTab === 'defaults' || activeTab === 'documents' || activeTab === 'agreements') && (
         <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground" data-testid="partner-billing-readonly">
           {hasWriteGrant ? t('partnerBillingSettings.readOnlyNoPartnerWideNotice') : t('partnerBillingSettings.readOnlyNotice')}
         </p>
@@ -271,6 +309,10 @@ export default function PartnerBillingSettingsPage() {
           autoEmailInvoice={autoEmailInvoice} setAutoEmailInvoice={setAutoEmailInvoice}
           notifyOnBehalfAcceptance={notifyOnBehalfAcceptance} setNotifyOnBehalfAcceptance={setNotifyOnBehalfAcceptance}
           deviceAppendix={deviceAppendix} setDeviceAppendix={setDeviceAppendix}
+          lineShowDate={lineShowDate} setLineShowDate={setLineShowDate}
+          lineShowNote={lineShowNote} setLineShowNote={setLineShowNote}
+          lineShowWorkedTime={lineShowWorkedTime} setLineShowWorkedTime={setLineShowWorkedTime}
+          lineGrouping={lineGrouping} setLineGrouping={setLineGrouping}
           footer={footer} setFooter={setFooter}
           documentTheme={documentTheme} setDocumentTheme={setDocumentTheme}
           documentPageSize={documentPageSize} setDocumentPageSize={setDocumentPageSize}
@@ -285,6 +327,12 @@ export default function PartnerBillingSettingsPage() {
           inheritedPhone={inheritedPhone} inheritedWebsite={inheritedWebsite} inheritedAddress={inheritedAddress}
         />
         </fieldset>
+      )}
+      {activeTab === 'agreements' && (
+        <BillingAgreementsTab
+          value={agreementDefaults} onChange={setAgreementDefaults}
+          canEdit={canEditAgreements} missingSendGrant={canWrite && !hasAgreementsSendGrant}
+        />
       )}
       {activeTab === 'rates' && <BillingRatesTab currencyCode={currencyCode} />}
       {activeTab === 'connections' && <BillingConnectionsTab />}

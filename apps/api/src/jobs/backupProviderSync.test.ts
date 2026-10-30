@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { VendorCustomer, VendorDevice } from '../services/backupProviders/types';
 
 // ---------------------------------------------------------------------------
 // The three-phase contract (mirrors huntressSync.test.ts, #1697): vendor HTTP
@@ -72,8 +73,8 @@ const { FakeProviderRequestError } = vi.hoisted(() => {
 });
 
 const { listCustomers, listDevices, persistVendorSnapshot, evaluateProviderAlerts } = vi.hoisted(() => ({
-  listCustomers: vi.fn(async () => []),
-  listDevices: vi.fn(async () => []),
+  listCustomers: vi.fn(async (): Promise<VendorCustomer[]> => []),
+  listDevices: vi.fn(async () => ({ devices: [] as VendorDevice[], failedCustomerIds: [] as string[] })),
   persistVendorSnapshot: vi.fn(async () => ({
     customers: 2, unmappedCustomers: 1, devices: 3, unmappedDevices: 4, linked: 2, ambiguous: 1,
   })),
@@ -81,17 +82,19 @@ const { listCustomers, listDevices, persistVendorSnapshot, evaluateProviderAlert
 }));
 
 listCustomers.mockImplementation(async () => { fetchDepths.push(contextDepth); return []; });
-listDevices.mockImplementation(async () => { fetchDepths.push(contextDepth); return []; });
+listDevices.mockImplementation(async () => { fetchDepths.push(contextDepth); return { devices: [], failedCustomerIds: [] }; });
 
 vi.mock('../services/backupProviders/types', () => ({ ProviderRequestError: FakeProviderRequestError }));
 vi.mock('../services/backupProviders/registry', () => ({
-  getBackupProvider: () => ({ key: 'cove', label: 'Cove Data Protection', listCustomers, listDevices }),
+  getBackupProvider: (key: string) => ({ key, inventoryKind: key === 'dropsuite' ? 'saas' : undefined, label: key, listCustomers, listDevices }),
 }));
 vi.mock('../services/backupProviders/credentials', () => ({
   decryptProviderCredentials: vi.fn(() => ({ partnerName: 'p', username: 'u', password: 'x' })),
 }));
 vi.mock('../services/backupProviders/persist', () => ({ persistVendorSnapshot }));
 vi.mock('../services/backupProviders/alerts', () => ({ evaluateProviderAlerts }));
+vi.mock('../services/backupProviders/mapping', () => ({ autoMapCustomers: vi.fn(async () => 0) }));
+vi.mock('../services/backupProviders/deviceMatching', () => ({ matchProviderDevices: vi.fn(async () => ({ linked: 0, ambiguous: 0 })) }));
 
 vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
 vi.mock('../services/redis', () => ({ getBullMQConnection: vi.fn(() => ({})) }));
@@ -107,7 +110,8 @@ vi.mock('../services/bullmqUtils', () => ({
   enqueueOrReplaceStale: vi.fn(async () => ({ id: 'job-1' })),
 }));
 
-import { selectDueConnections, syncConnectionById } from './backupProviderSync';
+import { selectDueConnections, syncConnectionById, processSyncConnection } from './backupProviderSync';
+import { makeRealJob } from './__helpers__/realBullJob';
 
 const CONNECTION_ID = '00000000-0000-4000-8000-0000000000c1';
 const BASE_ROW = {
@@ -181,6 +185,18 @@ describe('syncConnectionById — phase boundaries', () => {
     expect(fetchDepths).toEqual([0, 0]);
   });
 
+  it('passes Dropsuite SaaS inventory semantics through the sync and publishes three workloads', async () => {
+    connectionRow.provider = 'dropsuite';
+    persistVendorSnapshot.mockResolvedValue({ customers: 1, unmappedCustomers: 0, devices: 3, unmappedDevices: 0, linked: 0, ambiguous: 0 });
+    await syncConnectionById(CONNECTION_ID);
+    expect(persistVendorSnapshot).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      provider: 'dropsuite', inventoryKind: 'saas',
+    }), expect.anything());
+    expect(updatePayloads.find(u => u.payload.lastSyncStatus === 'success')?.payload).toMatchObject({
+      lastSyncDevices: 3, lastSyncUnmappedDevices: 0, lastSyncLinkedDevices: 0, lastSyncAmbiguousDevices: 0,
+    });
+  });
+
   it('marks the connection running before fetching and successful after persisting', async () => {
     await syncConnectionById(CONNECTION_ID);
     expect(updatePayloads[0]!.payload).toMatchObject({ lastSyncStatus: 'running', lastSyncError: null });
@@ -221,7 +237,55 @@ describe('syncConnectionById — abort guards', () => {
   });
 });
 
+import { nudgeConnectionHealth } from '../services/connectionHealth/nudge';
+
 describe('syncConnectionById — failure handling', () => {
+  it('keeps a failed customer’s old rows and updates the other customer in a successful sync', async () => {
+    const customers: VendorCustomer[] = ['revoked-customer', 'working-customer'].map((id) => ({
+      vendorCustomerId: id, name: id, parentId: null, level: 'business', externalCode: null,
+    }));
+    const device: VendorDevice = {
+      vendorDeviceId: 'working:mail', vendorCustomerId: 'working-customer', name: 'Mail',
+      computerName: null, osType: 'unknown', osVersion: null, clientVersion: null,
+      macAddresses: [], accountType: 'm365', dataSources: ['m365_mail'], status: 'completed',
+      vendorStatusCode: null, lastSessionAt: null, lastSuccessAt: null, lastCompletedAt: null,
+      selectedBytes: null, usedBytes: 100, errorsCount: 0, vendorCreatedAt: null, vendorExpiresAt: null, raw: {},
+    };
+    listCustomers.mockResolvedValueOnce(customers);
+    listDevices.mockResolvedValueOnce({ devices: [device], failedCustomerIds: ['revoked-customer'] });
+    const actualPersist = await vi.importActual<typeof import('../services/backupProviders/persist')>(
+      '../services/backupProviders/persist',
+    );
+    const inserted: Array<Record<string, unknown>> = [];
+    const selections = [
+      [{ id: 'c-old', vendorCustomerId: 'revoked-customer' }, { id: 'c-good', vendorCustomerId: 'working-customer' }],
+      [{ id: 'c-old', vendorCustomerId: 'revoked-customer', orgId: BASE_ROW.partnerId },
+        { id: 'c-good', vendorCustomerId: 'working-customer', orgId: BASE_ROW.partnerId }],
+      [{ id: 'old-row', vendorDeviceId: 'revoked:mail', customerId: 'c-old', accountType: 'gws' },
+        { id: 'good-row', vendorDeviceId: 'working:mail', customerId: 'c-good' }],
+    ];
+    const returns = [[{ id: 'c-good', vendorCustomerId: 'working-customer' }], [{ id: 'good-row', orgId: BASE_ROW.partnerId }]];
+    const tx = {
+      select: vi.fn(() => chain(selections.shift() ?? [])),
+      insert: vi.fn(() => {
+        const builder = chain(returns.shift() ?? []);
+        builder.values = vi.fn((rows: Array<Record<string, unknown>>) => { inserted.push(...rows); return builder; });
+        return builder;
+      }),
+      update: vi.fn(() => chain([])), delete: vi.fn(() => chain([])), execute: vi.fn(async () => []),
+    };
+    persistVendorSnapshot.mockImplementationOnce(async (...args: unknown[]) => actualPersist.persistVendorSnapshot(
+      tx as never, args[1] as Parameters<typeof actualPersist.persistVendorSnapshot>[1],
+      args[2] as Parameters<typeof actualPersist.persistVendorSnapshot>[2],
+    ));
+    await syncConnectionById(CONNECTION_ID);
+    expect(tx.delete).not.toHaveBeenCalled();
+    expect(inserted.filter((row) => 'vendorDeviceId' in row))
+      .toMatchObject([{ vendorDeviceId: 'working:mail', customerId: 'c-good', usedBytes: 100 }]);
+    expect(updatePayloads.find((u) => u.payload.lastSyncStatus === 'success')?.payload)
+      .toMatchObject({ status: 'connected', lastSyncDevices: 0, lastSyncUnmappedDevices: 0, lastSyncLinkedDevices: 0, lastSyncAmbiguousDevices: 0, lastSyncError: '1 customer(s) skipped: access denied or unavailable' });
+  });
+
   it('does not persist anything when the vendor enumeration fails, and records the error', async () => {
     const boom = new Error('cove page 3 of 7 failed');
     listDevices.mockRejectedValueOnce(boom);
@@ -237,6 +301,23 @@ describe('syncConnectionById — failure handling', () => {
     await expect(syncConnectionById(CONNECTION_ID, { isFinalAttempt: false })).rejects.toThrow('transient');
     expect(updatePayloads.some((u) => u.payload.lastSyncStatus === 'running')).toBe(true);
     expect(updatePayloads.some((u) => u.payload.lastSyncStatus === 'error')).toBe(false);
+  });
+
+  it('nudges connection health only when a terminal failure is recorded (W4)', async () => {
+    listDevices.mockRejectedValueOnce(new Error('transient'));
+    await expect(syncConnectionById(CONNECTION_ID, { isFinalAttempt: false })).rejects.toThrow('transient');
+    expect(nudgeConnectionHealth).not.toHaveBeenCalled();
+
+    listDevices.mockRejectedValueOnce(new Error('exhausted'));
+    await expect(syncConnectionById(CONNECTION_ID, { isFinalAttempt: true })).rejects.toThrow('exhausted');
+    expect(nudgeConnectionHealth).toHaveBeenCalledTimes(1);
+    expect(nudgeConnectionHealth).toHaveBeenCalledWith('backup_provider');
+  });
+
+  it('nudges connection health on a mid-retry reauth failure (W4)', async () => {
+    listCustomers.mockRejectedValueOnce(new FakeProviderRequestError('credentials rejected', true));
+    await syncConnectionById(CONNECTION_ID, { isFinalAttempt: false }).then(() => null, (e: unknown) => e);
+    expect(nudgeConnectionHealth).toHaveBeenCalledWith('backup_provider');
   });
 
   it('on a reauth failure sets status reauth_required and throws UnrecoverableError even mid-retry', async () => {
@@ -279,5 +360,23 @@ describe('syncConnectionById — failure handling', () => {
     await syncConnectionById(CONNECTION_ID);
     expect(order[0]).toMatch(/^persist@[1-9]/);
     expect(order[1]).toBe('alerts@0');
+  });
+});
+
+describe('processSyncConnection — final-attempt detection with a real BullMQ Job (#8351)', () => {
+  const data = { type: 'sync-connection' as const, connectionId: CONNECTION_ID };
+
+  it('leaves the row running on the first of three attempts (attemptsMade 0)', async () => {
+    listDevices.mockRejectedValueOnce(new Error('transient'));
+    await expect(processSyncConnection(data, makeRealJob(data, { attemptsMade: 0, attempts: 3 })))
+      .rejects.toThrow('transient');
+    expect(updatePayloads.some((u) => u.payload.lastSyncStatus === 'error')).toBe(false);
+  });
+
+  it('records the terminal error on the third of three attempts (attemptsMade 2)', async () => {
+    listDevices.mockRejectedValueOnce(new Error('exhausted'));
+    await expect(processSyncConnection(data, makeRealJob(data, { attemptsMade: 2, attempts: 3 })))
+      .rejects.toThrow('exhausted');
+    expect(updatePayloads.some((u) => u.payload.lastSyncStatus === 'error')).toBe(true);
   });
 });

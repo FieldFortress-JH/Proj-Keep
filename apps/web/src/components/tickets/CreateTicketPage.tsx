@@ -11,6 +11,7 @@ import { buildResponseValidator, coerceFormResponses, type TicketFormField } fro
 import { useHashState } from '@/lib/useHashState';
 import TicketFormFields from './TicketFormFields';
 import type { TicketPriority } from './ticketConfig';
+import { TICKET_TYPE_ORDER, isTicketType, ticketTypeLabelKey, type TicketType } from './ticketType';
 import { useDeviceOptions } from '../../hooks/useDeviceOptions';
 
 interface Option { id: string; name: string }
@@ -47,6 +48,11 @@ export default function CreateTicketPage() {
   const [deviceId, setDeviceId] = useState('');
   const [categoryId, setCategoryId] = useState('');
   const [priority, setPriority] = useState<TicketPriority>('normal');
+  // Routing rules fill fields the caller did not choose, so priority is only
+  // sent once the user (or a picked intake form's default) actually set it.
+  const [priorityTouched, setPriorityTouched] = useState(false);
+  // #7900: staff pick the type at creation; Incident is the default.
+  const [ticketType, setTicketType] = useState<TicketType>('incident');
   const [requesters, setRequesters] = useState<RequesterOption[]>([]);
   const [requesterId, setRequesterId] = useState('');
   const [requesterName, setRequesterName] = useState('');
@@ -225,7 +231,8 @@ export default function CreateTicketPage() {
             description: description.trim() || undefined,
             deviceId: deviceId || undefined,
             categoryId: categoryId || undefined,
-            priority,
+            ...(priorityTouched ? { priority } : {}),
+            ticketType,
             // Requester: a picked portal user, or a free-text name/email. Omit
             // everything when left blank — the API then defaults the requester to
             // the creating staff member (legacy behaviour).
@@ -245,7 +252,7 @@ export default function CreateTicketPage() {
     } finally {
       setSaving(false);
     }
-  }, [orgId, subject, description, deviceId, categoryId, priority, requesterId, requesterName, requesterEmail, selectedForm, formValues, t, deviceOptions.canSubmit]);
+  }, [orgId, subject, description, deviceId, categoryId, priority, priorityTouched, ticketType, requesterId, requesterName, requesterEmail, selectedForm, formValues, t, deviceOptions.canSubmit]);
 
   const selectCls = 'w-full rounded-md border bg-background px-2.5 py-1.5 text-sm';
 
@@ -293,7 +300,7 @@ export default function CreateTicketPage() {
                 // options — otherwise we'd invisibly attach an inactive/unloaded
                 // category the user can neither see nor change.
                 if (next.categoryId && categories.some((c) => c.id === next.categoryId)) setCategoryId(next.categoryId);
-                if (next.defaultPriority) setPriority(next.defaultPriority);
+                if (next.defaultPriority) { setPriority(next.defaultPriority); setPriorityTouched(true); }
               } else {
                 setFormValues({});
               }
@@ -394,8 +401,22 @@ export default function CreateTicketPage() {
         </div>
         <div>
           <label className="text-sm font-medium" htmlFor="ct-pri">{t('createTicketPage.priority')}</label>
-          <select id="ct-pri" value={priority} onChange={(e) => setPriority(e.target.value as TicketPriority)} className={selectCls} data-testid="create-ticket-priority-input">
+          <select id="ct-pri" value={priority} onChange={(e) => { setPriority(e.target.value as TicketPriority); setPriorityTouched(true); }} className={selectCls} data-testid="create-ticket-priority-input">
             <option value="low">{t('createTicketPage.priorityOptions.low')}</option><option value="normal">{t('createTicketPage.priorityOptions.normal')}</option><option value="high">{t('createTicketPage.priorityOptions.high')}</option><option value="urgent">{t('createTicketPage.priorityOptions.urgent')}</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-sm font-medium" htmlFor="ct-type">{t('createTicketPage.type')}</label>
+          <select
+            id="ct-type"
+            value={ticketType}
+            onChange={(e) => { if (isTicketType(e.target.value)) setTicketType(e.target.value); }}
+            className={selectCls}
+            data-testid="create-ticket-type-input"
+          >
+            {TICKET_TYPE_ORDER.map((type) => (
+              <option key={type} value={type}>{t(/* i18n-dynamic */ ticketTypeLabelKey(type))}</option>
+            ))}
           </select>
         </div>
       </div>

@@ -15,11 +15,21 @@ vi.mock('../db', () => ({
 vi.mock('./commandQueue', () => ({
   CommandTypes: {
     VAULT_SYNC: 'vault_sync',
+    VAULT_CONFIGURE: 'vault_configure',
   },
+}));
+
+vi.mock('./vaultDeviceCommands', () => ({
+  buildVaultConfigurePayload: vi.fn(),
+  resolveLatestVaultSyncSnapshotId: vi.fn(),
 }));
 
 vi.mock('./aiDispatch', () => ({
   aiQueueCommandForExecution: vi.fn(),
+}));
+
+vi.mock('./localVaultUpdate', () => ({
+  updateVaultWithinCurrentSite: vi.fn(),
 }));
 
 import { db } from '../db';
@@ -28,6 +38,8 @@ import type { AiTool } from './aiTools';
 import { validateToolInput } from './aiToolSchemas';
 import { aiQueueCommandForExecution } from './aiDispatch';
 import { registerVaultTools } from './aiToolsVault';
+import { buildVaultConfigurePayload, resolveLatestVaultSyncSnapshotId } from './vaultDeviceCommands';
+import { updateVaultWithinCurrentSite } from './localVaultUpdate';
 
 const ORG_ID = '11111111-1111-1111-1111-111111111111';
 const DEVICE_ID = '22222222-2222-2222-2222-222222222222';
@@ -43,7 +55,7 @@ const EXPECTED_TOOLS = [
 const EXPECTED_TIERS: Record<(typeof EXPECTED_TOOLS)[number], number> = {
   query_vaults: 1,
   get_vault_status: 1,
-  trigger_vault_sync: 2,
+  trigger_vault_sync: 3, // W03 (#6757): supervised
   configure_vault: 2,
 };
 
@@ -121,6 +133,8 @@ function setDefaultDbMocks() {
     command: { id: 'cmd-1', status: 'queued' },
     error: null,
   } as any);
+  vi.mocked(buildVaultConfigurePayload).mockResolvedValue({ vaultPath: '/vaults/main', retentionCount: 7, enabled: true });
+  vi.mocked(resolveLatestVaultSyncSnapshotId).mockResolvedValue('snap-latest');
 }
 
 function mockSelectSequence(rowsList: any[][]) {
@@ -196,7 +210,7 @@ function prepareHandlerMocks(toolName: string) {
       ]);
       break;
     case 'trigger_vault_sync':
-      mockSelectSequence([[{ id: VAULT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, isActive: true }]]);
+      mockSelectSequence([[{ id: VAULT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, vaultPath: '/vaults/main', isActive: true }]]);
       break;
     case 'configure_vault':
       mockSelectSequence([[{ id: VAULT_ID, orgId: ORG_ID, deviceId: DEVICE_ID }]]);
@@ -310,6 +324,45 @@ describe('aiToolsVault handlers', () => {
     }
   });
 
+  const restrictedAuth = () => ({
+    ...makeAuth(), allowedSiteIds: ['site-1'], canAccessSite: (siteId: string | null) => siteId === 'site-1',
+  }) as unknown as AuthContext;
+
+  // W03-D12 (#6757, quorum QW5): a site-restricted update row-locks the device
+  // inside the caller's sites, exactly as PATCH /backup/vault/:id does, so a
+  // concurrent site move cannot slip between the check and the write.
+  it('routes a site-restricted configure_vault update through the locked update (W03-D12)', async () => {
+    prepareHandlerMocks('configure_vault');
+    // vault row, then deviceIdSiteDenied's device-site read (in the caller's site).
+    mockSelectSequence([[{ id: VAULT_ID, orgId: ORG_ID, deviceId: DEVICE_ID }], [{ siteId: 'site-1' }]]);
+    vi.mocked(updateVaultWithinCurrentSite).mockResolvedValue({ id: VAULT_ID, vaultPath: '/vaults/updated' } as any);
+    const auth = restrictedAuth();
+
+    const result = JSON.parse(await toolMap.get('configure_vault')!.handler(
+      { action: 'update', vaultId: VAULT_ID, vaultPath: '/vaults/updated' }, auth,
+    ));
+
+    expect(result.success).toBe(true);
+    expect(updateVaultWithinCurrentSite).toHaveBeenCalledWith(
+      ORG_ID, VAULT_ID, expect.objectContaining({ vaultPath: '/vaults/updated' }), ['site-1'],
+    );
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses the update when the locked update finds the device outside the sites (W03-D12)', async () => {
+    prepareHandlerMocks('configure_vault');
+    mockSelectSequence([[{ id: VAULT_ID, orgId: ORG_ID, deviceId: DEVICE_ID }], [{ siteId: 'site-1' }]]);
+    vi.mocked(updateVaultWithinCurrentSite).mockResolvedValue(undefined);
+    const auth = restrictedAuth();
+
+    const result = JSON.parse(await toolMap.get('configure_vault')!.handler(
+      { action: 'update', vaultId: VAULT_ID, vaultPath: '/vaults/updated' }, auth,
+    ));
+
+    expect(result.error).toBe('Vault not found or access denied');
+    expect(buildVaultConfigurePayload).not.toHaveBeenCalled();
+  });
+
   it('binds the AI configure_vault update to (id, orgId, deviceId), not id alone', async () => {
     prepareHandlerMocks('configure_vault');
     const updateChains: any[] = [];
@@ -328,6 +381,86 @@ describe('aiToolsVault handlers', () => {
     const { columns, values } = predicateParts(updateChains[0].where.mock.calls[0]![0]);
     expect(columns).toEqual(expect.arrayContaining(['id', 'org_id', 'device_id']));
     expect(values).toEqual(expect.arrayContaining([VAULT_ID, ORG_ID, DEVICE_ID]));
+  });
+
+  // #8385: the helper rejects a sync with no snapshot id, and the vault
+  // configured through the AI tool never reached the device.
+  it("defaults an AI vault sync to the device's newest snapshot and names the vault path", async () => {
+    prepareHandlerMocks('trigger_vault_sync');
+    await toolMap.get('trigger_vault_sync')!.handler({ vaultId: VAULT_ID }, makeAuth());
+
+    expect(resolveLatestVaultSyncSnapshotId).toHaveBeenCalledWith(DEVICE_ID, ORG_ID);
+    expect(aiQueueCommandForExecution).toHaveBeenCalledWith(
+      expect.anything(),
+      'trigger_vault_sync',
+      DEVICE_ID,
+      'vault_sync',
+      { vaultId: VAULT_ID, vaultPath: '/vaults/main', snapshotId: 'snap-latest' },
+      expect.anything(),
+    );
+  });
+
+  it('refuses an AI vault sync when the device has no snapshot to sync', async () => {
+    prepareHandlerMocks('trigger_vault_sync');
+    vi.mocked(resolveLatestVaultSyncSnapshotId).mockResolvedValueOnce(null);
+
+    const result = JSON.parse(await toolMap.get('trigger_vault_sync')!.handler({ vaultId: VAULT_ID }, makeAuth()));
+
+    expect(result.error).toMatch(/no backup snapshot/i);
+    expect(aiQueueCommandForExecution).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('pushes vault_configure after an AI vault update', async () => {
+    prepareHandlerMocks('configure_vault');
+    vi.mocked(buildVaultConfigurePayload).mockResolvedValueOnce({ vaultPath: '/vaults/updated', retentionCount: 7, enabled: true });
+
+    const result = JSON.parse(await toolMap.get('configure_vault')!.handler(
+      { action: 'update', vaultId: VAULT_ID, vaultPath: '/vaults/updated' },
+      makeAuth(),
+    ));
+
+    expect(result.deviceConfig).toEqual({ status: 'queued' });
+    expect(buildVaultConfigurePayload).toHaveBeenCalledWith(DEVICE_ID, ORG_ID);
+    expect(aiQueueCommandForExecution).toHaveBeenCalledWith(
+      expect.anything(),
+      'configure_vault',
+      DEVICE_ID,
+      'vault_configure',
+      { vaultPath: '/vaults/updated', retentionCount: 7, enabled: true },
+      expect.objectContaining({ userId: 'user-1', expectedOrgId: ORG_ID }),
+    );
+  });
+
+  it('does not push vault_configure when the AI update matched no vault', async () => {
+    prepareHandlerMocks('configure_vault');
+    mockUpdateSequence([[]]);
+
+    const result = JSON.parse(await toolMap.get('configure_vault')!.handler(
+      { action: 'update', vaultId: VAULT_ID, vaultPath: '/vaults/updated' },
+      makeAuth(),
+    ));
+
+    expect(result.error).toMatch(/not found/i);
+    expect(aiQueueCommandForExecution).not.toHaveBeenCalled();
+  });
+
+  it('pushes vault_configure after an AI vault create and reports a failed push', async () => {
+    mockSelectSequence([[{ id: DEVICE_ID, orgId: ORG_ID, siteId: null }]]);
+    vi.mocked(db.insert).mockImplementation(() => createInsertChain([{ id: VAULT_ID, deviceId: DEVICE_ID, orgId: ORG_ID }]) as any);
+    vi.mocked(aiQueueCommandForExecution).mockResolvedValueOnce({ command: null, error: 'Device not found' } as any);
+
+    const result = JSON.parse(await toolMap.get('configure_vault')!.handler(
+      { action: 'create', deviceId: DEVICE_ID, vaultPath: '/vaults/main' },
+      makeAuth(),
+    ));
+
+    expect(result.success).toBe(true);
+    expect(result.deviceConfig).toEqual({ status: 'failed', error: 'Device not found' });
+    expect(aiQueueCommandForExecution).toHaveBeenCalledWith(
+      expect.anything(), 'configure_vault', DEVICE_ID, 'vault_configure', expect.anything(),
+      expect.objectContaining({ expectedOrgId: ORG_ID }),
+    );
   });
 
   it('safeHandler returns error JSON when the handler throws', async () => {

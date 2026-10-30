@@ -17,11 +17,26 @@ import PolicyForm, {
   type CatalogOption,
   type PolicyFormValues,
 } from "./PolicyForm";
+import { useHashState } from "@/lib/useHashState";
 import { asList } from "@/lib/asList";
 import { runAction, ActionError } from "@/lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
 import { useTranslation } from "react-i18next";
 import { i18n } from "@/lib/i18n";
+import { replaceUrl, seedRouterHistoryState } from '../../lib/replaceUrl';
+import SecurityAgentCoverageStateBadge from "../security/SecurityAgentCoverageStateBadge";
+import {
+  COVERAGE_STATES,
+  coverageReasonLabel,
+  coverageStateLabel,
+  fetchSecurityAgentCoverage,
+  isCoverageState,
+  totalCounts,
+  vendorLabel,
+  type CoverageRow,
+  type CoverageState,
+  type CoverageVendorSummary,
+} from "../../lib/securityAgentCoverage";
 type Policy = {
   id: string;
   name: string;
@@ -30,6 +45,9 @@ type Policy = {
   // because client-side prefill drafts (not yet server rows) omit it.
   orgId?: string | null;
   partnerId?: string | null;
+  // Non-null = generated from a configuration policy's feature link; the API
+  // answers 409 managed_software_policy_read_only on PATCH/DELETE/remediate.
+  managedByLinkId?: string | null;
   mode: "allowlist" | "blocklist" | "audit";
   rules?: {
     software: Array<{
@@ -70,6 +88,12 @@ type ViolationRow = {
       rule?: {
         catalogId?: string;
       };
+      // #6958: the observed service behind a not_running / service_unverified violation.
+      service?: {
+        name: string;
+        observedStatus: string | null;
+        observedAt: string | null;
+      };
     }>;
     remediationStatus?: string;
     // Desired-state install remediation, projected by GET /violations (#5509).
@@ -102,6 +126,41 @@ const installStatusBadgeStyles: Record<string, string> = {
   skipped: "bg-slate-100 text-slate-600",
 };
 
+// #6958: per-type labels for the recent-violations breakdown. Unknown types
+// render their raw value.
+const violationTypeLabelKeys: Record<string, string> = {
+  unauthorized: "policies:software.complianceDashboard.violationTypes.unauthorized",
+  missing: "policies:software.complianceDashboard.violationTypes.missing",
+  outdated: "policies:software.complianceDashboard.violationTypes.outdated",
+  not_running: "policies:software.complianceDashboard.violationTypes.not_running",
+  service_unverified:
+    "policies:software.complianceDashboard.violationTypes.service_unverified",
+};
+
+const violationTypeBadgeStyles: Record<string, string> = {
+  not_running: "bg-red-100 text-red-700",
+  service_unverified: "bg-muted text-muted-foreground",
+};
+
+type ViolationTypeGroup = { type: string; count: number; serviceName?: string };
+
+function groupViolationsByType(
+  violations: ViolationRow["compliance"]["violations"],
+): ViolationTypeGroup[] {
+  if (!Array.isArray(violations)) return [];
+  const groups = new Map<string, ViolationTypeGroup>();
+  for (const violation of violations) {
+    const type = typeof violation?.type === "string" ? violation.type : "unknown";
+    const group = groups.get(type) ?? { type, count: 0 };
+    group.count += 1;
+    if (!group.serviceName && violation.service?.name) {
+      group.serviceName = violation.service.name;
+    }
+    groups.set(type, group);
+  }
+  return Array.from(groups.values());
+}
+
 function installStatusBadgeClass(status: string): string {
   return installStatusBadgeStyles[status] ?? installStatusBadgeStyles.failed;
 }
@@ -133,10 +192,27 @@ function parsePolicyMode(
     ? value
     : null;
 }
+const COVERAGE_HASH_KEY = "coverage";
+
+/** The selected coverage state from `#coverage=<state>`, composing with any other hash pairs. */
+function parseCoverageHash(hash: string): CoverageState | null {
+  const value = new URLSearchParams(hash).get(COVERAGE_HASH_KEY);
+  return isCoverageState(value) ? value : null;
+}
+
+function writeCoverageHash(state: CoverageState | null): void {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  if (state) params.set(COVERAGE_HASH_KEY, state);
+  else params.delete(COVERAGE_HASH_KEY);
+  seedRouterHistoryState();
+  window.location.hash = params.toString();
+}
+
 export default function ComplianceDashboard({
   prefill,
 }: ComplianceDashboardProps = {}) {
   useTranslation("policies");
+  const { t: tSecurity } = useTranslation("security");
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [overview, setOverview] = useState<ComplianceOverview>({
     total: 0,
@@ -149,6 +225,8 @@ export default function ComplianceDashboard({
   const [error, setError] = useState<string | null>(null);
   const [modalMode, setModalMode] = useState<ModalMode>("closed");
   const [selectedPolicy, setSelectedPolicy] = useState<Policy | null>(null);
+  // Bumped for every prefilled create so a second prefill re-mounts the form.
+  const [prefillNonce, setPrefillNonce] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   // Catalog items for PolicyForm's per-rule catalog-link picker (#5509).
   // Fetched on its own rather than inside refresh()'s Promise.all: a catalog
@@ -199,6 +277,57 @@ export default function ComplianceDashboard({
   // creators may own a policy partner-wide.
   const currentOrgId = useOrgStore((s) => s.currentOrgId);
   const { isPartnerScope, defaultOwnerScope } = useDefaultOwnerScope();
+  // Security agent coverage (read-only). Own fetch: a failure only omits the strip.
+  const [coverageSummary, setCoverageSummary] = useState<
+    CoverageVendorSummary[]
+  >([]);
+  const [coverageRows, setCoverageRows] = useState<CoverageRow[]>([]);
+  const [coverageTotal, setCoverageTotal] = useState(0);
+  const [coverageFilter, setCoverageFilter] = useHashState<CoverageState | null>(
+    null,
+    parseCoverageHash,
+  );
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetchSecurityAgentCoverage({
+          orgId: currentOrgId,
+          // Server-side filter: a client-side filter over one page would show a
+          // near-empty table for a state whose rows fall past the page limit.
+          states: coverageFilter ? [coverageFilter] : undefined,
+          limit: 200,
+        });
+        if (cancelled) return;
+        // The API computes the summary over all states regardless of the filter.
+        setCoverageSummary(res.summary);
+        setCoverageRows(res.data);
+        setCoverageTotal(res.pagination.total);
+      } catch (err) {
+        if (cancelled) return;
+        console.error(
+          "[ComplianceDashboard] security agent coverage failed:",
+          err,
+        );
+        setCoverageSummary([]);
+        setCoverageRows([]);
+        setCoverageTotal(0);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentOrgId, coverageFilter]);
+  const coverageCounts = totalCounts(coverageSummary);
+  const hasCoverage =
+    coverageRows.length > 0 ||
+    COVERAGE_STATES.some((st) => coverageCounts[st] > 0);
+  const visibleCoverageRows = coverageRows;
+  const toggleCoverageFilter = (state: CoverageState) => {
+    const next = coverageFilter === state ? null : state;
+    setCoverageFilter(next);
+    writeCoverageHash(next);
+  };
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -270,10 +399,11 @@ export default function ComplianceDashboard({
         isActive: true,
         enforceMode: false,
       });
+      setPrefillNonce((n) => n + 1);
       setModalMode("create");
       // Clean up the URL
       if (typeof window !== "undefined")
-        window.history.replaceState({}, "", window.location.pathname);
+        replaceUrl(window.location.pathname);
     }
   }, [prefill]);
   const handleCreate = () => {
@@ -581,6 +711,86 @@ export default function ComplianceDashboard({
         </div>
       </div>
 
+      {hasCoverage && (
+        <div
+          className="rounded-lg border bg-card"
+          data-testid="compliance-security-agent-coverage"
+        >
+          <div className="border-b px-4 py-3">
+            <h2 className="font-semibold">
+              {i18n.t("policies:software.complianceDashboard.securityAgentCoverage")}
+            </h2>
+          </div>
+          <div className="flex flex-wrap gap-2 px-4 py-3">
+            {COVERAGE_STATES.map((state) => (
+              <button
+                key={state}
+                type="button"
+                data-testid={`coverage-chip-${state}`}
+                aria-pressed={coverageFilter === state}
+                onClick={() => toggleCoverageFilter(state)}
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm hover:bg-muted/40 ${coverageFilter === state ? "border-primary bg-primary/10" : ""}`}
+              >
+                <span>{coverageStateLabel(tSecurity, state)}</span>
+                <span className="font-semibold">{coverageCounts[state]}</span>
+              </button>
+            ))}
+          </div>
+          {coverageTotal > visibleCoverageRows.length && (
+            <p
+              className="border-t px-4 py-2 text-xs text-muted-foreground"
+              data-testid="coverage-rows-note"
+            >
+              {i18n.t("policies:software.complianceDashboard.coverageRowsNote", {
+                shown: visibleCoverageRows.length,
+                total: coverageTotal,
+              })}
+            </p>
+          )}
+          {visibleCoverageRows.length > 0 && (
+            <div className="overflow-x-auto border-t">
+              <table className="min-w-full text-sm">
+                <thead className="bg-muted/30 text-left text-xs uppercase tracking-wide text-muted-foreground">
+                  <tr>
+                    <th className="px-4 py-2">
+                      {i18n.t("policies:software.complianceDashboard.coverageDevice")}
+                    </th>
+                    <th className="px-4 py-2">
+                      {i18n.t("policies:software.complianceDashboard.coverageVendor")}
+                    </th>
+                    <th className="px-4 py-2">{i18n.t("common:labels.status")}</th>
+                    <th className="px-4 py-2">
+                      {i18n.t("policies:software.complianceDashboard.coverageReason")}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleCoverageRows.map((row) => (
+                    <tr
+                      key={row.id}
+                      className="border-t"
+                      data-testid="coverage-row"
+                    >
+                      <td className="px-4 py-2">
+                        {row.deviceName ??
+                          i18n.t("policies:software.complianceDashboard.vendorOnlyAgent")}
+                      </td>
+                      <td className="px-4 py-2">{vendorLabel(row.vendor)}</td>
+                      <td className="px-4 py-2">
+                        <SecurityAgentCoverageStateBadge state={row.state} />
+                      </td>
+                      <td className="px-4 py-2 text-muted-foreground">
+                        {coverageReasonLabel(tSecurity, row.reasonCode)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="rounded-lg border bg-card">
         <div className="border-b px-4 py-3">
           <h2 className="font-semibold">
@@ -614,6 +824,21 @@ export default function ComplianceDashboard({
                         >
                           {i18n.t("policies:software.complianceDashboard.autoInstallArmed")}
                         </span>
+                      )}
+                      {policy.managedByLinkId && (
+                        <a
+                          href="/configuration-policies"
+                          data-testid="software-policy-managed-badge"
+                          className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary hover:bg-primary/20"
+                          title={i18n.t(
+                            "policies:software.complianceDashboard.managedByConfigPolicyHint",
+                          )}
+                        >
+                          <Layers className="h-3 w-3" />
+                          {i18n.t(
+                            "policies:software.complianceDashboard.managedByConfigPolicy",
+                          )}
+                        </a>
                       )}
                       {policy.orgId === null && (
                         <span
@@ -667,7 +892,7 @@ export default function ComplianceDashboard({
                         de: "Prüfung", es: "auditoría") — audit mode means
                         report, never change.
                       */}
-                      {policy.mode !== "audit" && (
+                      {policy.mode !== "audit" && !policy.managedByLinkId && (
                         <button
                           type="button"
                           data-testid={`policy-remediate-${policy.id}`}
@@ -680,6 +905,8 @@ export default function ComplianceDashboard({
                           )}
                         </button>
                       )}
+                      {!policy.managedByLinkId && (
+                        <>
                       <button
                         type="button"
                         onClick={() => handleEdit(policy)}
@@ -698,6 +925,8 @@ export default function ComplianceDashboard({
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -741,16 +970,52 @@ export default function ComplianceDashboard({
               <div>
                 <p className="font-medium">{row.device.hostname}</p>
                 <p className="text-xs text-muted-foreground">
-                  {Array.isArray(row.compliance.violations)
-                    ? row.compliance.violations.length
-                    : 0}{" "}
-                  {i18n.t("policies:software.complianceDashboard.violationS")}
+                  {i18n.t("policies:software.complianceDashboard.violationCount", {
+                    count: Array.isArray(row.compliance.violations)
+                      ? row.compliance.violations.length
+                      : 0,
+                  })}
                 </p>
+                {groupViolationsByType(row.compliance.violations).length > 0 && (
+                  <div
+                    className="mt-1 flex flex-wrap gap-1"
+                    data-testid={`violation-types-${row.device.id}`}
+                  >
+                    {groupViolationsByType(row.compliance.violations).map((group) => {
+                      const labelKey = violationTypeLabelKeys[group.type];
+                      const label = labelKey
+                        ? i18n.t(/* i18n-dynamic */ labelKey)
+                        : group.type;
+                      return (
+                        <span
+                          key={group.type}
+                          data-testid={`violation-type-${group.type}`}
+                          title={
+                            group.serviceName
+                              ? i18n.t(
+                                  "policies:software.complianceDashboard.violationTypes.serviceTitle",
+                                  { name: group.serviceName },
+                                )
+                              : undefined
+                          }
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                            violationTypeBadgeStyles[group.type] ??
+                            "bg-amber-100 text-amber-700"
+                          }`}
+                        >
+                          {group.count > 1 ? `${label} ×${group.count}` : label}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               <div className="text-xs text-muted-foreground">
-                {i18n.t("policies:software.complianceDashboard.remediation")}
-                {row.compliance.remediationStatus ??
-                  i18n.t("policies:software.complianceDashboard.none")}
+                {i18n.t("policies:software.complianceDashboard.remediation", {
+                  value:
+                    row.compliance.remediationStatus ??
+                    i18n.t("policies:software.complianceDashboard.none"),
+                })}
               </div>
               {row.compliance.installRemediationStatus &&
                 row.compliance.installRemediationStatus !== "none" && (
@@ -803,8 +1068,9 @@ export default function ComplianceDashboard({
                   </div>
                 )}
               <div className="text-xs text-muted-foreground">
-                {i18n.t("policies:software.complianceDashboard.checked")}
-                {formatDateTime(row.compliance.lastChecked)}
+                {i18n.t("policies:software.complianceDashboard.checked", {
+                  date: formatDateTime(row.compliance.lastChecked),
+                })}
               </div>
             </div>
           ))}
@@ -835,13 +1101,22 @@ export default function ComplianceDashboard({
             </div>
             <div className="overflow-y-auto px-6 py-4">
               <PolicyForm
-                key={selectedPolicy?.id ?? "create"}
+                key={
+                  modalMode === "create"
+                    ? `create-${prefillNonce}`
+                    : (selectedPolicy?.id ?? "create")
+                }
                 onSubmit={handleFormSubmit}
                 onCancel={closeModal}
                 defaultValues={
                   modalMode === "edit" && selectedPolicy
                     ? policyToFormDefaults(selectedPolicy)
-                    : { ownerScope: defaultOwnerScope }
+                    : modalMode === "create" && selectedPolicy
+                      ? {
+                          ...policyToFormDefaults(selectedPolicy),
+                          ownerScope: defaultOwnerScope,
+                        }
+                      : { ownerScope: defaultOwnerScope }
                 }
                 submitLabel={
                   modalMode === "create"

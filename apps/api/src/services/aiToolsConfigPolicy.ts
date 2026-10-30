@@ -4,20 +4,27 @@ import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination'
 import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES, isRetiredConfigFeatureType, ORG_SCOPED_ONLY_FEATURE_TYPES, type ConfigFeatureType } from '@breeze/shared/constants';
 import { configurationPolicies, configPolicyFeatureLinks, configPolicyAssignments, automationPolicyCompliance } from '../db/schema';
 import { eq, and, desc, isNull, isNotNull, inArray, notInArray, SQL } from 'drizzle-orm';
-import { hasSatisfiedMfa, type AuthContext } from '../middleware/auth';
+import type { AuthContext } from '../middleware/auth';
+import { mfaGatedToolError } from './aiToolMfaGate';
 import type { AiTool } from './aiTools';
 import {
   complianceInlineSettingsSchema,
   maintenanceInlineSettingsSchema,
   onedriveHelperInlineSettingsSchema,
+  securityAgentsInlineSettingsSchema,
+  systemProtectionInlineSettingsSchema,
   warrantyInlineSettingsSchema,
 } from '@breeze/shared/validators';
+import { checkSecurityAgentsLinkWrite, SecurityAgentsLinkWriteError } from './securityAgents/securityAgentsLinkWrite';
+import { checkSecurityRuleSetsWrite } from '../routes/configurationPolicies/securityRuleSetGate';
+import { AI_AUTO_INSTALL_REFUSAL_MESSAGE } from './aiToolsSoftwarePolicyAudit';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
 import { deviceScopeCondition } from './aiToolsSiteScope';
 import { describeFirstZodIssue } from '../lib/zodIssues';
 import { INLINE_SETTINGS_EXAMPLES } from './aiToolsConfigPolicyExamples';
 import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { describeMaintenanceSchedule } from './maintenanceWindowProjection';
 import {
   resolveEffectiveConfig,
   previewEffectiveConfig,
@@ -48,31 +55,13 @@ import {
   buildComplianceSummary,
 } from '../routes/policyManagement/helpers';
 
-const MFA_REQUIRED_ERROR = JSON.stringify({ error: 'MFA required' });
-
-/**
- * Match the HTTP `requireMfa()` boundary for config-policy mutations reached
- * through AI or MCP instead of a Hono route: a human session must carry the
- * live MFA claim before it can change what takes effect across a fleet.
- *
- * `ai_agent` principals are EXEMPT, deliberately. `requireMfa()` rejects them
- * (middleware/auth.ts) because HTTP is not an agent's channel at all — not
- * because an agent failed an MFA check. An agent never has, and never could
- * have, a session MFA claim, so deriving its authorization from one would
- * permanently disable the grantable `config_policies` agent capability
- * (agentToolCatalog.ts) rather than gate it. An approved agent run's
- * authorization is the UPSTREAM Tier-3 approval enforced in aiGuardrails; the
- * maintenance-link machine-principal check below exempts `ai_agent` for exactly
- * the same reason (RMM-QA-176 D9.3).
- *
- * API-key and OAuth MCP callers carry `token: {}` (mcpServer.ts) and so are
- * denied while `ENABLE_2FA` is on, and retain the product-wide
- * `ENABLE_2FA=false` behavior through `hasSatisfiedMfa`.
- */
-function configPolicyMutationMfaError(auth: AuthContext): string | null {
-  if (auth.principal?.kind === 'ai_agent') return null;
-  return hasSatisfiedMfa(auth) ? null : MFA_REQUIRED_ERROR;
-}
+// Config-policy mutations reached through AI or MCP match the HTTP
+// `requireMfa()` boundary: a human session must carry the live MFA claim before
+// it can change what takes effect across a fleet. Which (tool, action) pairs are
+// gated, who is exempt (ai_agent principals) and the coded refusal all live in
+// services/aiToolMfaGate.ts, which the MCP catalog also reads (#8340) — so the
+// handlers below call `mfaGatedToolError` with their own tool name rather than
+// deciding locally.
 
 /**
  * Feature types whose inline settings are validated here, in the handler, rather
@@ -110,7 +99,34 @@ export const VALIDATED_INLINE_SETTINGS: Record<string, { schema: { safeParse: (r
   // stored JSONB keeps whatever UI-only keys (description, remediation) the
   // caller sent, exactly as the HTTP route stores it.
   compliance: { schema: complianceInlineSettingsSchema, normalize: false },
+  // #4754: strict schema, so an AI-guessed key (e.g. onFailure) is named in the
+  // error instead of surfacing as the generic tool error. Normalized so the
+  // JSONB stores the default-filled object, matching the HTTP route.
+  system_protection: { schema: systemProtectionInlineSettingsSchema, normalize: true },
+  // #6960: strict, so a guessed key (or a pasted secret) is named in the error.
+  // Arming (enabled:true) and featurePolicyId are refused earlier, by
+  // securityAgentsToolRefusal.
+  security_agents: { schema: securityAgentsInlineSettingsSchema, normalize: true },
 };
+
+/**
+ * #6960: an assistant never arms installs. Runs the shared security_agents
+ * link-write check with arming NOT authorized, ahead of schema validation, and
+ * maps the arming refusal to the same message every other AI install path uses.
+ * Returns a tool result string, or null when the write may proceed.
+ */
+function securityAgentsToolRefusal(featurePolicyId: unknown, inlineSettings: unknown): string | null {
+  const check = checkSecurityAgentsLinkWrite({
+    featurePolicyId: featurePolicyId === undefined ? undefined : (featurePolicyId as string | null),
+    inlineSettings,
+    armAuthorized: false,
+  });
+  if (check.ok) return null;
+  if (check.refusal.body.code === 'security_agents_execute_required') {
+    return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+  }
+  return JSON.stringify({ error: check.refusal.body.error, code: check.refusal.body.code });
+}
 
 /**
  * Refuses an assistant-authored automation action that asks to run a script
@@ -169,6 +185,13 @@ function rejectElevatedAutomationActions(raw: unknown): string | null {
  * carries no driver or schema detail.
  */
 function warrantyConsentRefusal(err: unknown): string | null {
+  // #6960: the service backstop's refusal is a fixed, coded message; left to
+  // safeHandler it would reach the model as the generic tool error.
+  if (err instanceof SecurityAgentsLinkWriteError) {
+    return err.code === 'security_agents_execute_required'
+      ? JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE })
+      : JSON.stringify({ error: err.message, code: err.code });
+  }
   if (!(err instanceof WarrantyConsentError)) return null;
   return JSON.stringify({
     error: `${err.message} Ask a user to switch it on from the policy's Warranty tab, where they accept HP's licence themselves.`,
@@ -226,10 +249,10 @@ export const MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED =
 
 /** Per-feature inline settings reference, returned on demand by describe. */
 export const POLICY_FEATURE_INLINE_SETTINGS_REFERENCE: Readonly<Record<ConfigFeatureType, string>> = {
-  patch: `{ sources: ["os","third_party"], autoApprove: true, autoApproveSeverities: ["critical","important"], scheduleFrequency: "daily"|"weekly"|"monthly", scheduleTime: "02:00", scheduleDayOfWeek?: "tue", scheduleDayOfMonth?: 1, rebootPolicy: "never"|"if_required"|"always"|"maintenance_window" } can also use featurePolicyId → existing update ring UUID (for approval deferral), combined with inlineSettings for schedule/reboot`,
-  maintenance: `{ recurrence: "once"|"daily"|"weekly"|"monthly", windowStart?: "naive ISO-8601 local datetime for once (e.g. 2026-03-15T02:00) | HH:MM local time of day for daily/weekly/monthly (omit or null = 00:00). Never pass a Z-suffixed or offset-bearing instant for a recurring cadence — it is rejected and the window falls back to midnight.", durationHours: 1-72, timezone: "America/New_York", suppressAlerts: true, suppressPatching: true, suppressAutomations: false, suppressScripts: false, notifyBeforeMinutes?: 15, notifyOnStart: true, notifyOnEnd: true }`,
+  patch: `{ sources: ["os","third_party"], scheduleFrequency: "daily"|"weekly"|"monthly", scheduleTime: "02:00", scheduleDayOfWeek?: "tue", scheduleDayOfMonth?: 1, rebootPolicy: "never"|"if_required"|"always"|"maintenance_window" } for schedule/reboot only; set featurePolicyId → existing update ring UUID to attach approval behaviour. Approval (auto-approve severities, deferral) and per-app block/pin rules live on the linked Update Ring (manage_update_rings), not on the policy.`,
+  maintenance: `{ recurrence: "once"|"daily"|"weekly"|"monthly", windowStart?: "naive ISO-8601 local datetime for once (e.g. 2026-03-15T02:00) | HH:MM local time of day for daily/weekly/monthly (omitted, "" or null = 00:00; a blank windowStart never means the window is off). Never pass a Z-suffixed or offset-bearing instant for a recurring cadence — it is rejected and the window falls back to midnight.", durationHours: 1-72, timezone: "America/New_York", suppressAlerts: true, suppressPatching: true, suppressAutomations: false, suppressScripts: false, rebootIfPending: false, notifyBeforeMinutes?: 15, notifyOnStart: true, notifyOnEnd: true }. The day is fixed: weekly opens every Sunday and monthly on the 1st, at windowStart in timezone. There is no day-of-week or day-of-month field, so a window cannot be moved to another day. rebootIfPending: true reboots (after the usual reboot warning) Windows and Linux devices that report a pending reboot while the window is open. The check runs every 10 minutes and only reaches devices that are online during the window, so a laptop that is off or asleep then is not rebooted. macOS never reports a pending reboot. get_effective_configuration with includeSettings returns the resolved schedule (day, start time, next window) as effectiveSchedule.`,
   automation: `{ items: [{ name, enabled: true, triggerType: "schedule"|"event"|"manual", cronExpression?: "0 2 * * *", timezone?: "America/New_York", eventType?: "device.offline"|"alert.triggered"|"compliance.failed"|"patch.available", actions: [{ type: "run_script"|"send_notification"|"create_alert"|"execute_command", scriptId?|channelId?|severity?|message?|command? }], onFailure: "stop"|"continue"|"notify" }] }`,
-  event_log: `{ retentionDays: 30, maxEventsPerCycle: 100, collectCategories: ["security","hardware","application","system"], minimumLevel: "info"|"warning"|"error"|"critical", collectionIntervalMinutes: 15, rateLimitPerHour: 12000 }`,
+  event_log: `{ retentionDays: 30, maxEventsPerCycle: 100, collectCategories: ["security","hardware","application","system"], minimumLevel: "info"|"warning"|"error"|"critical", collectionIntervalMinutes: 15, rateLimitPerHour: 12000, applicationProviders: [] /* up to 20 extra Application-log Warning/Information providers; only the winning policy applies */ }`,
   compliance: `{ items: [{ name, enforcementLevel?: "monitor"|"warn"|"enforce" (default "monitor"; enforce also runs the rule's remediation), checkIntervalMinutes?: 60, rules: 1-50 of [ { type: "required_software", softwareName: "Contoso Agent" (case-insensitive name match against installed software), softwareVersion?: "7.0", versionOperator?: "any"|"eq"|"gte"|"gt"|"lte" (omit or "any" = presence only; any other operator REQUIRES softwareVersion; "gt" is evaluated as >=) } | { type: "prohibited_software", prohibitedName } | { type: "disk_space_minimum", minGb: number (minimum FREE space in GB), diskPath?: "C:" (default: every disk) } | { type: "os_version", osType?: "windows"|"macos"|"linux"|"any" (default "any"), minOsVersion?: "10.0.19045" } | { type: "registry_check", registryPath, registryValueName, registryExpectedValue? (omit = the value only has to exist) } | { type: "config_check", configFilePath, configKey, configExpectedValue? } ] }] }. Each rule may also carry description? and remediation?. A failing rule marks the device non-compliant (see configuration_policy_compliance). enforcementLevel "warn" and "enforce" also raise an alert per device (medium / high) that auto-resolves once the device is compliant again; "monitor" only reports. To be alerted when an app is missing or removed, use a required_software rule with enforcementLevel "warn", or a software_presence monitor (manage_monitor_definitions, condition { name, presence: "not_installed" }).`,
   security: `{ realTimeProtection: true, behavioralMonitoring: true, cloudLookup: true, scheduledScans: true, scanHour: "2", scanMinute: "0", scanDayOfWeek: "*", scanDayOfMonth: "*", autoQuarantine: true, notifyUser: true, blockUntrustedUsb: false, exclusions: [] }`,
   backup: `{ schedule: { frequency: "daily"|"weekly"|"monthly", time: "02:00", dayOfWeek?: 2 (0=Sunday..6=Saturday), dayOfMonth?: 1 (1..28), timezone?: "UTC" }, retention: { preset: "standard"|"extended"|"compliance"|"custom", retentionDays?: 30, maxVersions?: 5 }, paths: [], targets: { paths: [], excludes: [] }, backupMode: "file"|"hyperv"|"mssql"|"system_image", destinationConfigId?: "UUID" }. featurePolicyId → backup PROFILE UUID (manage_backup_profiles — "what to protect"), combined with inlineSettings { schedule, retention, destinationConfigId? } (destination omitted = the device org's default destination). Legacy links with featurePolicyId → backup config UUID still work. Partner-wide policies may link partner-wide profiles; their destination always resolves per device org. Compression, encryption and notification flags are not persisted by configuration-policy backup settings.`,
@@ -239,7 +262,7 @@ export const POLICY_FEATURE_INLINE_SETTINGS_REFERENCE: Readonly<Record<ConfigFea
   pam: `inlineSettings {uacInterceptionEnabled: boolean} — Windows UAC elevation prompt capture (default false / opt-in: capture is OFF when no policy assigns this feature). PAM rules/approvals are managed separately in the /pam console, not via config policies.`,
   vulnerability: `inlineSettings {enabled: boolean} — per-device CVE correlation / vulnerability scanning (default false / opt-in: devices with no policy are NOT scanned). Findings appear in the /vulnerabilities console; correlation runs daily.`,
   device_lifecycle: `inlineSettings {purgeRemovedAfterDays: number|null} — permanently delete removed devices N days after removal (1..3650); null/absent = keep forever. Purge is IRREVERSIBLE: it destroys the device record and all of its history. A daily job applies it; devices whose agent uninstall is still queued are skipped until it completes. Closest level wins, so an org-level link with null opts that org out of a partner-wide window.`,
-  remote_access: `{ webrtcDesktop: true, vncRelay: false, remoteTools: true, clipboardHostToViewer: true, clipboardViewerToHost: true, enableProxy: false, defaultAllowedPorts: [80,443], autoEnableProxy: false, maxConcurrentTunnels: 5, idleTimeoutMinutes: 5, maxSessionDurationHours: 8 (whole hours, 1..12 — remote desktop sessions are hard-capped at 12h and "unlimited"/0 is rejected), sessionPromptMode?: "off"|"notify"|"consent", consentUnavailableBehavior?: "proceed"|"block", notifyOnSessionEnd?: true, showActiveIndicator?: true, technicianIdentityLevel?: "name_email"|"name"|"generic" } — all fields optional; updates MERGE over the currently stored settings, so send only the fields to change. Unknown keys are stripped, never applied — use exactly these key names.`,
+  remote_access: `{ webrtcDesktop: true, vncRelay: false, remoteTools: true, clipboardHostToViewer: true, clipboardViewerToHost: true, enableProxy: false, defaultAllowedPorts: [80,443], autoEnableProxy: false, maxConcurrentTunnels: 5, idleTimeoutMinutes: 5, maxSessionDurationHours: 8 (whole hours, 1..12 — remote desktop sessions are hard-capped at 12h and "unlimited"/0 is rejected), sessionPromptMode?: "off"|"notify"|"consent", consentUnavailableBehavior?: "proceed"|"block", notifyOnSessionEnd?: true, showActiveIndicator?: true, technicianIdentityLevel?: "name_email"|"name"|"generic", allowUserEndSession?: true (the person at the device may end the session from the on-screen indicator, after a confirmation; default true) } — all fields optional; updates MERGE over the currently stored settings, so send only the fields to change. Unknown keys are stripped, never applied — use exactly these key names.`,
   onedrive_helper: `{ silentAccountConfig?, filesOnDemand?, kfmSilentOptIn?, kfmFolders? (Desktop/Documents/Pictures), kfmBlockOptOut?, tenantAssociationId?, restartOnChange?, libraries?: [{ libraryId, displayName, targetingMode (everyone|graph_group|local_ad_group), groupId?, groupName?, siteUrl? }] }`,
   software_policy: `Link-only: featurePolicyId → existing software policy UUID; no inlineSettings.`,
   peripheral_control: `Link-only: featurePolicyId → existing peripheral policy UUID; no inlineSettings.`,
@@ -247,6 +270,8 @@ export const POLICY_FEATURE_INLINE_SETTINGS_REFERENCE: Readonly<Record<ConfigFea
   hardware_monitoring: `{ enabled: true, pollIntervalMinutes: 10, diskHealthIntervalMinutes: 60 } — inline-only RAID and disk-health collection settings. All fields are optional; these are the defaults. enabled is boolean; pollIntervalMinutes is an integer in 5..60; diskHealthIntervalMinutes is an integer in 15..1440. Collection is enabled without a policy link. Attach hardware monitors separately for alerts.`,
   time_sync: `{ enforceNtp: false, ntpServers: [], pollIntervalMinutes: 60, timezone: { expected: 'site', pinnedTimezone: null, autoFix: false } } — inline-only domain-aware Windows time settings. Up to 5 NTP hosts, no flags or ports; at least one host when enforceNtp is true. pollIntervalMinutes is an integer in 15..1440. A pinned IANA timezone must have a Windows mapping and overrides the site timezone. Workgroup, Entra-only and forest-root PDC devices use manual peers; members, DCs and other PDCs use the domain hierarchy. Unknown roles are skipped. GPO wins. autoFix defaults to false.`,
   workload_inventory: `{ enabled: false, dockerEnabled: true, podmanEnabled: true, hypervEnabled: true, proxmoxEnabled: true, intervalMinutes: 60 } — inline-only workload inventory settings. enabled defaults to false (opt-in): runtimes are always detected, but containers and VMs are listed only when enabled is true and the runtime's own flag is true. Turning a runtime off deletes its listed workloads. intervalMinutes is an integer in 15..1440. Collection is read-only.`,
+  security_agents: `{ version: 1, agents: [{ vendor: "huntress"|"sentinelone"|"controld"|"nextdns", enabled: boolean, platforms?: ["windows"|"macos"|"linux"] }] } — inline-only third-party security agent selection. Strict: no keys, tokens or other fields (per-customer keys come from the vendor integration). Each vendor at most once; agents: [] opts the assigned devices out. No featurePolicyId. This tool cannot enable a vendor (enabling installs software, which needs a person with devices.execute); it can only list vendors as disabled.`,
+  system_protection: `{ beforePatching: true, beforeScripts: false, beforeSoftwareInstall: false, labelPrefix: 'Breeze' } — inline-only Windows System Restore checkpoint toggles. Strict: unknown keys are rejected, so there is no onFailure/abort setting. beforePatching defaults to true (matches existing agent behaviour); the other two default to false (opt-in). labelPrefix is 1..64 characters with no control characters. A checkpoint is best-effort and not a backup: Windows may throttle or later remove it.`,
 };
 
 const LINK_ONLY_FEATURE_TYPES = new Set<ConfigFeatureType>(['software_policy', 'peripheral_control']);
@@ -280,12 +305,23 @@ function shapeEffectiveConfig(
     if (opts.featureType && featureType !== opts.featureType) continue;
     // `featureType` repeats the map key, and the inheritedFrom* pair is null
     // unless the link came from a parent policy — both dropped when redundant.
-    const { inlineSettings, featureType: _key, inheritedFromPolicyId, inheritedFromPolicyName, ...rest } = feature;
+    const { inlineSettings, featureType: _key, inheritedFromPolicyId, inheritedFromPolicyName, sourceTargetId, ...rest } = feature;
     const inherited = inheritedFromPolicyId ? { inheritedFromPolicyId, inheritedFromPolicyName } : {};
     const hasInlineSettings = inlineSettings !== null && inlineSettings !== undefined
       && !(typeof inlineSettings === 'object' && Object.keys(inlineSettings as object).length === 0);
+    // The compact default page drops sourceTargetId: inheritanceChain carries
+    // the (level, target, policy) triple for every winning assignment, and one
+    // id per feature type is what kept the page from fitting the chat budget.
+    // #10397: the stored maintenance settings cannot say which day a window
+    // opens (weekly = Sunday, monthly = the 1st) and a blank windowStart means
+    // midnight, not "never". Ship the schedule the evaluator runs beside them.
+    // Described from the same inlineSettings blob shown next to it, so the two
+    // can never contradict each other on the page.
+    const effectiveSchedule = opts.includeSettings && featureType === 'maintenance'
+      ? describeMaintenanceSchedule(inlineSettings)
+      : null;
     features[featureType] = opts.includeSettings
-      ? { ...rest, ...inherited, inlineSettings }
+      ? { ...rest, sourceTargetId, ...inherited, inlineSettings, ...(effectiveSchedule ? { effectiveSchedule } : {}) }
       : { ...rest, ...inherited, hasInlineSettings };
   }
   const inheritanceChain = opts.featureType
@@ -482,7 +518,7 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
       },
     },
     handler: safeHandler('apply_configuration_policy', async (input, auth) => {
-      const mfaError = configPolicyMutationMfaError(auth);
+      const mfaError = mfaGatedToolError('apply_configuration_policy', undefined, auth);
       if (mfaError) return mfaError;
 
       // Dual-axis reader so a partner-scoped caller can reach a partner-OWNED
@@ -594,7 +630,7 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
       },
     },
     handler: safeHandler('remove_configuration_policy_assignment', async (input, auth) => {
-      const mfaError = configPolicyMutationMfaError(auth);
+      const mfaError = mfaGatedToolError('remove_configuration_policy_assignment', undefined, auth);
       if (mfaError) return mfaError;
 
       // Verify the assignment belongs to a policy the caller can see. The
@@ -703,7 +739,7 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
       },
     },
     handler: safeHandler('manage_configuration_policy', async (input, auth) => {
-      const mfaError = configPolicyMutationMfaError(auth);
+      const mfaError = mfaGatedToolError('manage_configuration_policy', input.action as string | undefined, auth);
       if (mfaError) return mfaError;
 
       if (!canMutateOrgWideGovernance(auth)) {
@@ -1039,10 +1075,8 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
       const configPolicyId = input.configPolicyId as string;
       if (!configPolicyId) return JSON.stringify({ error: 'configPolicyId is required' });
 
-      if (action === 'add' || action === 'update' || action === 'remove') {
-        const mfaError = configPolicyMutationMfaError(auth);
-        if (mfaError) return mfaError;
-      }
+      const mfaError = mfaGatedToolError('manage_policy_feature_link', action, auth);
+      if (mfaError) return mfaError;
 
       // Reads (list) are not gated by the site-ceiling — only add/update/remove.
       if (action !== 'list' && !canMutateOrgWideGovernance(auth)) {
@@ -1131,10 +1165,21 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
           });
         }
 
+        if (featureType === 'security_agents') {
+          const refusal = securityAgentsToolRefusal(input.featurePolicyId ?? null, input.inlineSettings ?? null);
+          if (refusal) return refusal;
+        }
+
         let inlineSettings: unknown = input.inlineSettings;
         const validated = validateInlineSettingsForFeature(featureType, inlineSettings);
         if ('error' in validated) return JSON.stringify({ error: validated.error });
         inlineSettings = validated.value;
+
+        // #6263 W03: same ruleSetIds gate as the HTTP route (featureLinks.ts).
+        if (featureType === 'security') {
+          const ruleSets = await checkSecurityRuleSetsWrite({ orgId: policy.orgId, partnerId: policy.partnerId }, inlineSettings);
+          if (!ruleSets.ok) return JSON.stringify(ruleSets.body);
+        }
 
         // addFeatureLink returns null (instead of throwing) on a duplicate —
         // see the comment on its onConflictDoNothing insert in
@@ -1167,6 +1212,11 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
         const featureLinkId = input.featureLinkId as string | undefined;
         if (!featureLinkId) return JSON.stringify({ error: 'featureLinkId is required for update' });
 
+        if (existingFeatureType === 'security_agents') {
+          const refusal = securityAgentsToolRefusal(input.featurePolicyId, input.inlineSettings);
+          if (refusal) return refusal;
+        }
+
         const updates: { featurePolicyId?: string | null; inlineSettings?: unknown } = {};
         if (input.featurePolicyId !== undefined) updates.featurePolicyId = input.featurePolicyId as string | null;
         if (input.inlineSettings !== undefined) {
@@ -1180,6 +1230,10 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
           const validated = validateInlineSettingsForFeature(existingFeatureType, inlineSettings);
           if ('error' in validated) return JSON.stringify({ error: validated.error });
           inlineSettings = validated.value;
+          if (existingFeatureType === 'security') {
+            const ruleSets = await checkSecurityRuleSetsWrite({ orgId: policy.orgId, partnerId: policy.partnerId }, inlineSettings);
+            if (!ruleSets.ok) return JSON.stringify(ruleSets.body);
+          }
           updates.inlineSettings = inlineSettings;
         }
 

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useId, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { MASKED_SECRET, isMaskedSecret } from '@/lib/redactedSecret';
@@ -15,6 +15,8 @@ type Props = {
   maxLength?: number;
   /** Rendered under the field (e.g. a "managed by partner" note). */
   children?: ReactNode;
+  /** Rendered beside the label, outside it (e.g. an inheritance badge). */
+  labelAddon?: ReactNode;
 };
 
 /**
@@ -32,8 +34,12 @@ export default function SavedSecretInput({
   disabled,
   maxLength,
   children,
+  labelAddon,
 }: Props) {
   const { t } = useTranslation('settings');
+  // Generated, not derived from testId: this field renders on partner and org
+  // pages alike, and the label must name exactly this one input.
+  const inputId = useId();
   const [hasSaved, setHasSaved] = useState(() => isMaskedSecret(value));
   useEffect(() => {
     if (isMaskedSecret(value)) setHasSaved(true);
@@ -48,9 +54,17 @@ export default function SavedSecretInput({
 
   return (
     <div className="space-y-2">
-      <label className="text-sm font-medium">{label}</label>
+      {labelAddon ? (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <label htmlFor={inputId} className="text-sm font-medium">{label}</label>
+          {labelAddon}
+        </div>
+      ) : (
+        <label htmlFor={inputId} className="text-sm font-medium">{label}</label>
+      )}
       <div className={`flex gap-2 ${disabled ? 'opacity-60' : ''}`}>
         <input
+          id={inputId}
           type="password"
           autoComplete="new-password"
           data-testid={testId}

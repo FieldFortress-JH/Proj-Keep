@@ -96,13 +96,12 @@ describe('PatchTab', () => {
     expect(screen.queryByTestId('auto-approve-deferral')).toBeNull();
   });
 
-  it('keeps the Approval Ring link, Installation Schedule, and Application Rules', async () => {
+  it('keeps the Approval Ring link and Installation Schedule', async () => {
     render(<PatchTab {...baseProps} />);
     expect(await screen.findByText('Approval Ring')).toBeInTheDocument();
     expect(screen.getByText('No ring (manual approvals only)')).toBeInTheDocument();
     expect(screen.getByText('Installation Schedule')).toBeInTheDocument();
     expect(screen.getByText('Reboot Policy')).toBeInTheDocument();
-    expect(screen.getByText('Application Rules')).toBeInTheDocument();
   });
 
   // #2609: schedule fields rendered <label> with no htmlFor/id association, so
@@ -136,55 +135,123 @@ describe('PatchTab', () => {
     expect(payload.featurePolicyId).toBe('ring-1');
   });
 
-  // The auto-approve/sources fields are no longer editable, but existing stored
-  // values must survive a save untouched (back-compat with the deprecated fallback).
-  it('preserves stored auto-approve and sources fields in the save payload', async () => {
+  // #8187: approval and application rules live on the Update Ring. The tab
+  // must never send them (since #8188 the API strips them from any write).
+  const LEGACY_APPROVAL_KEYS = ['apps', 'autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays'];
+  const STORED_LEGACY_INLINE = {
+    sources: ['third_party'],
+    autoApprove: true,
+    autoApproveSeverities: ['critical'],
+    autoApproveDeferralDays: 3,
+    apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', displayName: 'Firefox', action: 'block' }],
+  };
+
+  it('saves without any approval or application-rule keys, even when the link stores them', async () => {
     render(
       <PatchTab
         {...baseProps}
-        existingLink={{
-          id: 'link-1',
-          featureType: 'patch',
-          featurePolicyId: null,
-          inlineSettings: { sources: ['third_party'], autoApprove: true, autoApproveSeverities: ['critical'] },
-        }}
+        existingLink={{ id: 'link-1', featureType: 'patch', featurePolicyId: null, inlineSettings: STORED_LEGACY_INLINE }}
       />
     );
     fireEvent.click(await screen.findByRole('button', { name: /save/i }));
     await waitFor(() => expect(saveMock).toHaveBeenCalled());
     const [, payload] = saveMock.mock.calls[0];
-    expect(payload.inlineSettings.autoApprove).toBe(true);
-    expect(payload.inlineSettings.autoApproveSeverities).toEqual(['critical']);
+    for (const key of LEGACY_APPROVAL_KEYS) expect(payload.inlineSettings).not.toHaveProperty(key);
     expect(payload.inlineSettings.sources).toEqual(['third_party']);
   });
 
-  it('blocks save when a pinned app rule has no version, then proceeds once fixed', async () => {
+  it('Override does not copy approval or application-rule keys from the parent', async () => {
     render(
       <PatchTab
         {...baseProps}
-        existingLink={{
-          id: 'link-1',
-          featureType: 'patch',
-          featurePolicyId: null,
-          inlineSettings: {
-            sources: ['os'],
-            apps: [{ source: 'third_party', packageId: 'A.B', action: 'pin', pinnedVersion: '' }],
-          },
-        }}
+        parentLink={{ id: 'parent-link', featureType: 'patch', featurePolicyId: null, inlineSettings: STORED_LEGACY_INLINE }}
       />
     );
+    fireEvent.click(await screen.findByRole('button', { name: /override/i }));
+    await waitFor(() => expect(saveMock).toHaveBeenCalled());
+    const [linkId, payload] = saveMock.mock.calls[0];
+    expect(linkId).toBeNull();
+    for (const key of LEGACY_APPROVAL_KEYS) expect(payload.inlineSettings).not.toHaveProperty(key);
+  });
 
-    fireEvent.click(await screen.findByRole('button', { name: /save/i }));
+  it('no longer renders the application-rules editor', async () => {
+    render(
+      <PatchTab
+        {...baseProps}
+        existingLink={{ id: 'link-1', featureType: 'patch', featurePolicyId: null, inlineSettings: STORED_LEGACY_INLINE }}
+      />
+    );
+    await screen.findByText('Approval Ring');
+    expect(screen.queryByText('Application Rules')).toBeNull();
+    expect(screen.queryByTestId('app-rules-add')).toBeNull();
+  });
 
-    expect(saveMock).not.toHaveBeenCalled();
-    // Inline hint from the app-rules section plus the error banner.
-    expect(screen.getAllByText('Pinned applications need a version.').length).toBe(2);
+  // #9565: the dropdown rendered "[2] Broad — Production (7d hold)" — an
+  // unexplained bracketed rollout order and a label unlike the ring's name
+  // everywhere else. Options are now the ring's name; the order and hold are
+  // spelled out for the selected ring below the select.
+  it('labels ring options with the ring name only and explains order and hold for the selection', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        data: [
+          { id: 'ring-2', name: 'Broad — Production', ringOrder: 2, deferralDays: 7, gracePeriodHours: 4 },
+        ],
+      }),
+    } as unknown as Response);
 
-    fireEvent.change(screen.getByTestId('app-rule-pin-version-third_party|a.b'), {
-      target: { value: '1.2.3' },
-    });
+    render(<PatchTab {...baseProps} />);
+    const option = await screen.findByRole('option', { name: 'Broad — Production' });
+    expect(option.textContent).toBe('Broad — Production');
+    expect(screen.queryByTestId('approval-ring-details')).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId('approval-ring-select'), { target: { value: 'ring-2' } });
+    const details = screen.getByTestId('approval-ring-details');
+    expect(details).toHaveTextContent(/rollout order 2/i);
+    expect(details).toHaveTextContent(/7-day hold/i);
+  });
+
+  it('says the linked ring owns approval, or that approval is manual without one', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        data: [{ id: 'ring-1', name: 'Pilot', ringOrder: 1, deferralDays: 0, gracePeriodHours: 4 }],
+      }),
+    } as unknown as Response);
+    render(<PatchTab {...baseProps} />);
+    const hint = await screen.findByTestId('patch-ring-owns-approval-hint');
+    expect(hint).toHaveTextContent('No ring linked — patches install only after manual approval.');
+
+    fireEvent.change(screen.getByTestId('approval-ring-select'), { target: { value: 'ring-1' } });
+    expect(screen.getByTestId('patch-ring-owns-approval-hint')).toHaveTextContent(
+      'Auto-approval and application rules are set on the linked Update Ring.',
+    );
+  });
+
+  it('shows a repair prompt for a link whose ring is no longer available, and lets a ring be chosen', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        data: [{ id: 'ring-1', name: 'Pilot', ringOrder: 1, deferralDays: 0, gracePeriodHours: 4 }],
+      }),
+    } as unknown as Response);
+    render(
+      <PatchTab
+        {...baseProps}
+        existingLink={{ id: 'link-1', featureType: 'patch', featurePolicyId: 'gone-ring', inlineSettings: STORED_LEGACY_INLINE }}
+      />
+    );
+    const prompt = await screen.findByTestId('patch-ring-invalid');
+    expect(prompt).toHaveTextContent('The linked Update Ring is no longer available');
+
+    fireEvent.change(screen.getByTestId('approval-ring-select'), { target: { value: 'ring-1' } });
+    expect(screen.queryByTestId('patch-ring-invalid')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(saveMock).toHaveBeenCalled());
+    expect(saveMock.mock.calls[0][1].featurePolicyId).toBe('ring-1');
   });
 
   // #1872: sole-patch-source enforcement toggle.
@@ -449,6 +516,26 @@ describe('PatchTab', () => {
       expect(postCall?.[0]).toBe('/update-rings');
     });
 
+    // #9565: the inline "New ring" editor defaults the rollout order to one
+    // past the highest existing ring, like the /patches page.
+    it('defaults a new ring to the next rollout order after the loaded rings', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({
+          data: [
+            { id: 'ring-1', name: 'Pilot', enabled: true, ringOrder: 1, deferralDays: 0, gracePeriodHours: 4 },
+            { id: 'ring-3', name: 'Broad', enabled: true, ringOrder: 3, deferralDays: 7, gracePeriodHours: 4 },
+          ],
+        }),
+      } as unknown as Response);
+
+      render(<PatchTab {...baseProps} />);
+      await screen.findByRole('option', { name: 'Pilot' });
+      fireEvent.click(screen.getByRole('button', { name: /new ring/i }));
+      expect((screen.getByLabelText(/rollout order/i) as HTMLInputElement).value).toBe('4');
+    });
+
     it('surfaces an error when inline ring create fails', async () => {
       fetchMock.mockImplementation((_url: any, opts: any) => {
         if (opts?.method === 'POST') {
@@ -463,6 +550,196 @@ describe('PatchTab', () => {
       fireEvent.click(screen.getByRole('button', { name: /create ring/i }));
 
       expect(await screen.findByText('Failed to create update ring')).toBeInTheDocument();
+    });
+
+    it('does not call a just-created ring unavailable when the ring refetch fails', async () => {
+      let gets = 0;
+      fetchMock.mockImplementation((_url: any, opts: any) => {
+        if (opts?.method === 'POST') {
+          return Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ data: { id: 'ring-9' } }) } as unknown as Response);
+        }
+        gets += 1;
+        if (gets > 1) return Promise.resolve({ ok: false, status: 503, json: vi.fn() } as unknown as Response);
+        return Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ data: [] }) } as unknown as Response);
+      });
+
+      render(<PatchTab {...baseProps} />);
+      fireEvent.click(await screen.findByRole('button', { name: /new ring/i }));
+      fireEvent.change(screen.getByPlaceholderText('e.g. Pilot, Broad'), { target: { value: 'Broad' } });
+      fireEvent.click(screen.getByRole('button', { name: /create ring/i }));
+
+      expect(await screen.findByText('Failed to load update rings')).toBeInTheDocument();
+      expect(screen.queryByTestId('patch-ring-invalid')).toBeNull();
+    });
+
+    it("surfaces the server's reason when an inline ring save is rejected", async () => {
+      fetchMock.mockImplementation((_url: any, opts: any) => {
+        if (opts?.method === 'POST') {
+          return Promise.resolve({
+            ok: false,
+            status: 400,
+            json: vi.fn().mockResolvedValue({ error: 'Duplicate application rule: third_party|mozilla.firefox' }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ data: [] }) } as unknown as Response);
+      });
+
+      render(<PatchTab {...baseProps} />);
+      fireEvent.click(await screen.findByRole('button', { name: /new ring/i }));
+      fireEvent.change(screen.getByPlaceholderText('e.g. Pilot, Broad'), { target: { value: 'Broad' } });
+      fireEvent.click(screen.getByRole('button', { name: /create ring/i }));
+
+      expect(await screen.findByText('Duplicate application rule: third_party|mozilla.firefox')).toBeInTheDocument();
+    });
+
+    it("carries the edited ring's application rules in the inline ring save", async () => {
+      const ring = {
+        id: 'ring-1', name: 'Pilot', enabled: true, ringOrder: 1, deferralDays: 0, gracePeriodHours: 4,
+        appRules: [{ source: 'third_party', packageId: 'Mozilla.Firefox', displayName: 'Firefox', action: 'block' }],
+      };
+      fetchMock.mockImplementation((_url: any, opts: any) => {
+        if (opts?.method === 'PATCH') {
+          return Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ data: ring }) } as unknown as Response);
+        }
+        return Promise.resolve({ ok: true, status: 200, json: vi.fn().mockResolvedValue({ data: [ring] }) } as unknown as Response);
+      });
+
+      render(
+        <PatchTab
+          {...baseProps}
+          existingLink={{ id: 'link-1', featureType: 'patch', featurePolicyId: 'ring-1', inlineSettings: { sources: ['os'] } }}
+        />
+      );
+      fireEvent.click(await screen.findByTestId('patch-edit-ring'));
+      expect(await screen.findByText('Firefox')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /save ring|save changes/i }));
+
+      await waitFor(() => expect(fetchMock.mock.calls.some(([, o]: any) => o?.method === 'PATCH')).toBe(true));
+      const patchCall = fetchMock.mock.calls.find(([, o]: any) => o?.method === 'PATCH');
+      expect(JSON.parse((patchCall![1] as any).body).appRules).toEqual([
+        expect.objectContaining({ packageId: 'Mozilla.Firefox', action: 'block' }),
+      ]);
+    });
+  });
+
+  // #8030: custom restart-prompt text. Blank keeps the agent's built-in copy.
+  describe('restart-prompt text', () => {
+    it('renders empty title, body and button fields by default and saves them as null', async () => {
+      render(<PatchTab {...baseProps} />);
+      expect(await screen.findByTestId('patch-reboot-prompt-title')).toHaveValue('');
+      expect(screen.getByTestId('patch-reboot-prompt-body')).toHaveValue('');
+      expect(screen.getByTestId('patch-reboot-prompt-button')).toHaveValue('');
+
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      await waitFor(() => expect(saveMock).toHaveBeenCalled());
+      const [, payload] = saveMock.mock.calls[0];
+      expect(payload.inlineSettings.rebootPromptTitle).toBeNull();
+      expect(payload.inlineSettings.rebootPromptBody).toBeNull();
+      expect(payload.inlineSettings.rebootPromptButton).toBeNull();
+    });
+
+    it('persists custom text in the save payload', async () => {
+      render(<PatchTab {...baseProps} />);
+      fireEvent.change(await screen.findByTestId('patch-reboot-prompt-title'), { target: { value: 'Neustart' } });
+      fireEvent.change(screen.getByTestId('patch-reboot-prompt-body'), {
+        target: { value: 'Neustart in {{countdown}}.' },
+      });
+      fireEvent.change(screen.getByTestId('patch-reboot-prompt-button'), { target: { value: 'Jetzt' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+      await waitFor(() => expect(saveMock).toHaveBeenCalled());
+      const [, payload] = saveMock.mock.calls[0];
+      expect(payload.inlineSettings.rebootPromptTitle).toBe('Neustart');
+      expect(payload.inlineSettings.rebootPromptBody).toBe('Neustart in {{countdown}}.');
+      expect(payload.inlineSettings.rebootPromptButton).toBe('Jetzt');
+    });
+
+    it('hydrates the fields from stored values', async () => {
+      render(
+        <PatchTab
+          {...baseProps}
+          existingLink={{
+            id: 'link-1',
+            featureType: 'patch',
+            featurePolicyId: null,
+            inlineSettings: { sources: ['os'], rebootPromptTitle: 'Titel', rebootPromptBody: null },
+          }}
+        />
+      );
+      expect(await screen.findByTestId('patch-reboot-prompt-title')).toHaveValue('Titel');
+      expect(screen.getByTestId('patch-reboot-prompt-body')).toHaveValue('');
+    });
+
+    it('blocks save on markup or an unknown placeholder, then proceeds once fixed', async () => {
+      render(<PatchTab {...baseProps} />);
+      const body = await screen.findByTestId('patch-reboot-prompt-body');
+      fireEvent.change(body, { target: { value: 'Restart in {{countdwon}}' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      expect(await screen.findByTestId('patch-reboot-prompt-error')).toBeInTheDocument();
+      expect(saveMock).not.toHaveBeenCalled();
+
+      fireEvent.change(body, { target: { value: 'Restart in {{countdown}}' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      await waitFor(() => expect(saveMock).toHaveBeenCalled());
+    });
+
+    it('shows the prompt error once, inline, when the fields are visible', async () => {
+      render(<PatchTab {...baseProps} />);
+      fireEvent.change(await screen.findByTestId('patch-reboot-prompt-title'), { target: { value: '<b>x</b>' } });
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      expect(await screen.findByTestId('patch-reboot-prompt-error')).toBeInTheDocument();
+      expect(screen.getAllByText(/must be plain text/i)).toHaveLength(1);
+    });
+
+    it('still blocks a save with invalid hidden text under the never policy, via the banner', async () => {
+      render(
+        <PatchTab
+          {...baseProps}
+          existingLink={{
+            id: 'link-1',
+            featureType: 'patch',
+            featurePolicyId: null,
+            inlineSettings: { sources: ['os'], rebootPolicy: 'never', rebootPromptTitle: '<b>x</b>' },
+          }}
+        />
+      );
+      await screen.findByText('Approval Ring');
+      fireEvent.click(screen.getByRole('button', { name: /save/i }));
+      expect(await screen.findByText(/must be plain text/i)).toBeInTheDocument();
+      expect(screen.queryByTestId('patch-reboot-prompt-error')).toBeNull();
+      expect(saveMock).not.toHaveBeenCalled();
+    });
+
+    it('hides the prompt-text fields when the reboot policy is never', async () => {
+      render(
+        <PatchTab
+          {...baseProps}
+          existingLink={{
+            id: 'link-1',
+            featureType: 'patch',
+            featurePolicyId: null,
+            inlineSettings: { sources: ['os'], rebootPolicy: 'never' },
+          }}
+        />
+      );
+      await screen.findByText('Approval Ring');
+      expect(screen.queryByTestId('patch-reboot-prompt-title')).toBeNull();
+      expect(screen.queryByTestId('reboot-prompt-preview')).toBeNull();
+    });
+
+    // #10190 W05: the card preview follows the fields as they are edited.
+    it('previews the restart card from the fields being edited', async () => {
+      render(<PatchTab {...baseProps} />);
+      const preview = await screen.findByTestId('reboot-prompt-preview');
+      expect(preview).toBeInTheDocument();
+      expect(screen.getByTestId('reboot-preview-restart-now')).toHaveTextContent('Restart now');
+      expect(screen.queryByTestId('reboot-preview-postpone')).toBeNull();
+
+      fireEvent.change(screen.getByTestId('patch-reboot-prompt-button'), { target: { value: 'Restart right away' } });
+      expect(screen.getByTestId('reboot-preview-restart-now')).toHaveTextContent('Restart right away');
+
+      fireEvent.click(screen.getByTestId('patch-reboot-allow-deferral-toggle'));
+      expect(screen.getByTestId('reboot-preview-postpone')).toHaveTextContent(/^Postpone until /);
     });
   });
 });

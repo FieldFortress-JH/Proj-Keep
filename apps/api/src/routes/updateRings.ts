@@ -5,21 +5,32 @@ import { and, eq, sql, desc, asc, inArray, type SQL } from 'drizzle-orm';
 import { db } from '../db';
 import {
   patchPolicies,
-  patchApprovals,
   patchJobs,
   patches,
   devicePatches,
 } from '../db/schema';
 import { resolveRingDeviceCountsWithWarnings, resolveRingDeviceIdsWithWarnings } from './updateRingsHelpers';
+import { getRingLinkedPolicies, linkedPolicyPayload } from './updateRingLinkedPolicies';
 import { getPagination, inferPatchOs } from './patches/helpers';
 import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
+import {
+  manualDecisionScope,
+  resolveLatestManualDecisions,
+  selectRingScopedApprovalRows,
+} from '../services/patchManualDecisions';
 import { PERMISSIONS } from '../services/permissions';
 import {
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
   canManagePartnerWidePolicies,
 } from '../services/partnerWideAccess';
-import { ringAutoApproveSchema, mergeRingAutoApproveWrite } from '@breeze/shared/validators';
+import {
+  ringAutoApproveSchema,
+  ringAppRulesSchema,
+  ringFeatureUpdatesSchema,
+  DEFAULT_RING_FEATURE_UPDATES,
+  mergeRingAutoApproveWrite,
+} from '@breeze/shared/validators';
 
 // Typed default for a ring's autoApprove JSONB (#1317). A freshly created or
 // auto-provisioned ring auto-approves nothing until an operator opts in.
@@ -126,6 +137,10 @@ const createRingSchema = z.object({
   // Ring-level auto-approval gate (#1317). Typed shape replaces the old
   // free-form record so the ring owns approval rules with validated severities.
   autoApprove: ringAutoApproveSchema.optional(),
+  // Per-app block/pin rules (#8184). Omitted on update leaves the column alone.
+  appRules: ringAppRulesSchema.optional(),
+  // Windows feature-release policy; omitted on create = block.
+  featureUpdates: ringFeatureUpdatesSchema.optional(),
   targets: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -142,6 +157,10 @@ const updateRingSchema = z.object({
   categoryRules: z.array(categoryRuleSchema).optional(),
   // Ring-level auto-approval gate (#1317). See createRingSchema.
   autoApprove: ringAutoApproveSchema.optional(),
+  // Per-app block/pin rules (#8184). Omitted on update leaves the column alone.
+  appRules: ringAppRulesSchema.optional(),
+  // Windows feature-release policy; omitted on update leaves the column alone.
+  featureUpdates: ringFeatureUpdatesSchema.optional(),
   targets: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -206,6 +225,7 @@ updateRingRoutes.get(
         categoryRules: patchPolicies.categoryRules,
         // Read-only until W02 adds a writer (#8184).
         appRules: patchPolicies.appRules,
+        featureUpdates: patchPolicies.featureUpdates,
         targets: patchPolicies.targets,
         createdAt: patchPolicies.createdAt,
         updatedAt: patchPolicies.updatedAt,
@@ -267,6 +287,8 @@ updateRingRoutes.post(
           ? mergeRingAutoApproveWrite(data.autoApprove, undefined)
           : DEFAULT_RING_AUTO_APPROVE,
         categoryRules: data.categoryRules ?? [],
+        appRules: data.appRules ?? [],
+        featureUpdates: data.featureUpdates ?? DEFAULT_RING_FEATURE_UPDATES,
         targets: data.targets ?? {},
         createdBy: auth.user.id,
       })
@@ -306,19 +328,18 @@ updateRingRoutes.get(
       return c.json({ error: 'Access denied' }, 403);
     }
 
-    // Get approval counts for this ring
-    const approvalCounts = await db
-      .select({
-        status: patchApprovals.status,
-        count: sql<number>`count(*)`,
-      })
-      .from(patchApprovals)
-      .where(and(eq(patchApprovals.partnerId, ring.partnerId), eq(patchApprovals.ringId, id)))
-      .groupBy(patchApprovals.status);
-
+    // Approval counts for this ring. Partner-wide (ring_id NULL) rows apply to
+    // every ring, so resolve latest-wins exactly like the evaluator (#9633).
+    const approvalRows = await selectRingScopedApprovalRows(ring.partnerId, id);
+    const { approved, declined } = resolveLatestManualDecisions(approvalRows, { ringId: id });
     const approvalSummary: Record<string, number> = {};
-    for (const row of approvalCounts) {
-      approvalSummary[row.status] = Number(row.count);
+    if (approved.size > 0) approvalSummary.approved = approved.size;
+    if (declined.size > 0) approvalSummary.rejected = declined.size;
+    // Non-decision statuses (pending/deferred) are ring-specific only.
+    for (const row of approvalRows) {
+      if (row.ringId !== id || row.status === 'approved' || row.status === 'rejected') continue;
+      if (approved.has(row.patchId) || declined.has(row.patchId)) continue;
+      approvalSummary[row.status] = (approvalSummary[row.status] ?? 0) + 1;
     }
 
     // Get recent jobs for this ring
@@ -392,7 +413,15 @@ updateRingRoutes.patch(
       updateFields.autoApprove = mergeRingAutoApproveWrite(data.autoApprove, existing.autoApprove);
     }
     if (data.categoryRules !== undefined) updateFields.categoryRules = data.categoryRules;
+    if (data.appRules !== undefined) updateFields.appRules = data.appRules;
+    if (data.featureUpdates !== undefined) updateFields.featureUpdates = data.featureUpdates;
     if (data.targets !== undefined) updateFields.targets = data.targets;
+
+    // Disabling a ring fails closed for every policy linked to it (#8909):
+    // report who is affected. Read before the write so a lookup failure leaves
+    // the ring untouched. The caller is a full-partner admin (gate above), so
+    // RLS does not narrow the count.
+    const linked = data.enabled === false ? await getRingLinkedPolicies(id) : null;
 
     const [updated] = await db
       .update(patchPolicies)
@@ -405,10 +434,14 @@ updateRingRoutes.patch(
       action: 'update_ring.update',
       resourceType: 'update_ring',
       resourceId: id,
-      details: { partnerId: existing.partnerId, changes: Object.keys(data) },
+      details: {
+        partnerId: existing.partnerId,
+        changes: Object.keys(data),
+        ...(linked ? { linkedPolicyCount: linked.length, linkedPolicyIds: linked.map((p) => p.id) } : {}),
+      },
     });
 
-    return c.json(updated);
+    return c.json(linked ? { ...updated, ...linkedPolicyPayload(linked) } : updated);
   }
 );
 
@@ -437,6 +470,9 @@ updateRingRoutes.delete(
     const deleteDenial = partnerWideRingWriteDenial(c, auth);
     if (deleteDenial) return deleteDenial.response;
 
+    // Read before the write so a lookup failure is a clean 500 with the ring untouched.
+    const linked = await getRingLinkedPolicies(id);
+
     await db
       .update(patchPolicies)
       .set({ enabled: false, updatedAt: new Date() })
@@ -448,10 +484,43 @@ updateRingRoutes.delete(
       resourceType: 'update_ring',
       resourceId: id,
       resourceName: existing.name,
-      details: { partnerId: existing.partnerId },
+      details: {
+        partnerId: existing.partnerId,
+        linkedPolicyCount: linked.length,
+        linkedPolicyIds: linked.map((p) => p.id),
+      },
     });
 
-    return c.json({ success: true });
+    return c.json({ success: true, ...linkedPolicyPayload(linked) });
+  }
+);
+
+// GET /update-rings/:id/linked-policies — policies a delete/disable would strand.
+// Full-partner admins only: RLS narrows org-policy visibility for restricted
+// partner users, which would silently undercount (#8909).
+updateRingRoutes.get(
+  '/:id/linked-policies',
+  requireScope('partner', 'system'),
+  requireUpdateRingRead,
+  zValidator('param', ringIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const [ring] = await db
+      .select({ id: patchPolicies.id, partnerId: patchPolicies.partnerId })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!ring) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== ring.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+    const denial = partnerWideRingWriteDenial(c, auth);
+    if (denial) return denial.response;
+
+    return c.json(linkedPolicyPayload(await getRingLinkedPolicies(id)));
   }
 );
 
@@ -496,28 +565,61 @@ updateRingRoutes.get(
     // already used below for approval-status scoping — rather than the flat
     // per-row overlay fragment used where a query already joins one device's
     // `device_patches` row directly.
+    //
+    // A ring with no devices yet (#9930) has no device reports of its own, so
+    // it reads no device-reported severity/category at all: the trusted
+    // shared classification still shows, and everything else stays 'unknown'
+    // (Unrated). This is deliberate. It must not borrow the partner fleet's
+    // reports (that is not evidence about this ring), and it must not emit
+    // `device_id IN (NULL)`, which only matched nothing by accident.
     const { deviceIds: ringDeviceIds } = await resolveRingDeviceIdsWithWarnings(id);
-    const ringDeviceIdListSql = ringDeviceIds.length > 0
-      ? sql`(${sql.join(ringDeviceIds.map((deviceId) => sql`${deviceId}`), sql`, `)})`
-      : sql`(NULL)`;
-    const effectiveSeveritySql = sql<string>`COALESCE(NULLIF(${patches.severity}::text, 'unknown'), (
-      SELECT "device_patches"."reported_severity"::text
-      FROM "device_patches"
-      WHERE "device_patches"."patch_id" = "patches"."id"
-        AND "device_patches"."device_id" IN ${ringDeviceIdListSql}
-        AND "device_patches"."reported_severity" IS NOT NULL
-      ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST
-      LIMIT 1
-    ), 'unknown')::patch_severity`;
-    const effectiveCategorySql = sql<string | null>`COALESCE(${patches.category}, (
-      SELECT "device_patches"."reported_category"
-      FROM "device_patches"
-      WHERE "device_patches"."patch_id" = "patches"."id"
-        AND "device_patches"."device_id" IN ${ringDeviceIdListSql}
-        AND "device_patches"."reported_category" IS NOT NULL
-      ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST
-      LIMIT 1
-    ))`;
+    const ringHasDevices = ringDeviceIds.length > 0;
+    const ringDeviceIdListSql = sql`(${sql.join(ringDeviceIds.map((deviceId) => sql`${deviceId}`), sql`, `)})`;
+    const deviceReportedSeveritySql = ringHasDevices
+      ? sql`(
+        SELECT "device_patches"."reported_severity"::text
+        FROM "device_patches"
+        WHERE "device_patches"."patch_id" = "patches"."id"
+          AND "device_patches"."device_id" IN ${ringDeviceIdListSql}
+          AND "device_patches"."reported_severity" IS NOT NULL
+        ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST, "device_patches"."id" DESC
+        LIMIT 1
+      )`
+      : sql`NULL::text`;
+    const effectiveSeveritySql = sql<string>`COALESCE(NULLIF(${patches.severity}::text, 'unknown'), ${deviceReportedSeveritySql}, 'unknown')::patch_severity`;
+    // Provenance of the severity shown above (#9387): the reported_severity_source
+    // of the very row the fallback picked — same predicate, same ORDER BY with
+    // the same unique tiebreaker, so the two subqueries cannot land on
+    // different rows. NULL when the trusted shared classification supplied the
+    // value (it is not a device report) or nothing was reported. 'derived'
+    // drives the "derived" marker in the web.
+    const deviceReportedSeveritySourceSql = ringHasDevices
+      ? sql`(
+        SELECT "device_patches"."reported_severity_source"
+        FROM "device_patches"
+        WHERE "device_patches"."patch_id" = "patches"."id"
+          AND "device_patches"."device_id" IN ${ringDeviceIdListSql}
+          AND "device_patches"."reported_severity" IS NOT NULL
+        ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST, "device_patches"."id" DESC
+        LIMIT 1
+      )`
+      : sql`NULL`;
+    const effectiveSeveritySourceSql = sql<string | null>`CASE
+      WHEN NULLIF(${patches.severity}::text, 'unknown') IS NOT NULL THEN NULL
+      ELSE ${deviceReportedSeveritySourceSql}
+    END`;
+    const deviceReportedCategorySql = ringHasDevices
+      ? sql`(
+        SELECT "device_patches"."reported_category"
+        FROM "device_patches"
+        WHERE "device_patches"."patch_id" = "patches"."id"
+          AND "device_patches"."device_id" IN ${ringDeviceIdListSql}
+          AND "device_patches"."reported_category" IS NOT NULL
+        ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST
+        LIMIT 1
+      )`
+      : sql`NULL::text`;
+    const effectiveCategorySql = sql<string | null>`COALESCE(${patches.category}, ${deviceReportedCategorySql})`;
 
     // Mirror GET /patches (patches/list.ts): track the source predicate
     // separately so the per-source counts ignore the source filter and the
@@ -538,7 +640,12 @@ updateRingRoutes.get(
         title: patches.title,
         description: patches.description,
         source: patches.source,
+        // Catalog identity — the web's PatchList shows version/externalId as
+        // the disambiguator when titles collide (#9533, #9930), same as GET /patches.
+        externalId: patches.externalId,
+        version: patches.version,
         severity: effectiveSeveritySql,
+        severitySource: effectiveSeveritySourceSql,
         category: effectiveCategorySql,
         osTypes: patches.osTypes,
         // Same device-derived OS hint as GET /patches (list.ts): the most
@@ -593,26 +700,21 @@ updateRingRoutes.get(
     };
     for (const row of sourceCounts) counts[row.source] = Number(row.count);
 
-    // Get ring-scoped approval statuses
+    // Ring + partner-wide approvals, resolved latest-wins like the evaluator
+    // (#9633). approvalScope says whether the winning decision is this ring's
+    // own row or the partner-wide one.
     const patchIdsInPage = patchList.map((p) => p.id);
-    let ringApprovals: Record<string, string> = {};
+    const ringDecisions = new Map<string, { status: 'approved' | 'rejected'; scope: 'ring' | 'partner' }>();
 
     if (patchIdsInPage.length > 0) {
-      const approvals = await db
-        .select({
-          patchId: patchApprovals.patchId,
-          status: patchApprovals.status,
-        })
-        .from(patchApprovals)
-        .where(
-          and(
-            eq(patchApprovals.partnerId, ring.partnerId),
-            eq(patchApprovals.ringId, id),
-            inArray(patchApprovals.patchId, patchIdsInPage)
-          )
-        );
-
-      ringApprovals = Object.fromEntries(approvals.map((a) => [a.patchId, a.status]));
+      const approvals = await selectRingScopedApprovalRows(ring.partnerId, id, patchIdsInPage);
+      const { approved, declined } = resolveLatestManualDecisions(approvals, { ringId: id });
+      for (const patchId of declined) {
+        ringDecisions.set(patchId, { status: 'rejected', scope: manualDecisionScope(approvals, id, patchId, 'rejected') });
+      }
+      for (const patchId of approved) {
+        ringDecisions.set(patchId, { status: 'approved', scope: manualDecisionScope(approvals, id, patchId, 'approved') });
+      }
     }
 
     const data = patchList.map((patch) => ({
@@ -620,7 +722,8 @@ updateRingRoutes.get(
       // Derived scalar `os` — same field GET /patches returns; the web's
       // normalizePatch reads this to render the OS column (#2215).
       os: inferPatchOs(patch.osTypes, patch.source, patch.inferredOs),
-      approvalStatus: ringApprovals[patch.id] || 'pending',
+      approvalStatus: ringDecisions.get(patch.id)?.status ?? 'pending',
+      approvalScope: ringDecisions.get(patch.id)?.scope ?? null,
     }));
 
     return c.json({
@@ -671,19 +774,9 @@ updateRingRoutes.get(
       });
     }
 
-    // Get ring-approved patch IDs (partner-scoped)
-    const approvedPatches = await db
-      .select({ patchId: patchApprovals.patchId })
-      .from(patchApprovals)
-      .where(
-        and(
-          eq(patchApprovals.partnerId, ring.partnerId),
-          eq(patchApprovals.ringId, id),
-          eq(patchApprovals.status, 'approved')
-        )
-      );
-
-    const approvedPatchIds = approvedPatches.map((a) => a.patchId);
+    // Ring-approved patch IDs: ring + partner-wide rows, latest-wins (#9633).
+    const approvalRows = await selectRingScopedApprovalRows(ring.partnerId, id);
+    const approvedPatchIds = [...resolveLatestManualDecisions(approvalRows, { ringId: id }).approved];
 
     if (approvedPatchIds.length === 0) {
       return c.json({

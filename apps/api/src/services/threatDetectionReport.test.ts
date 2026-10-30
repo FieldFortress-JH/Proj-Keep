@@ -137,6 +137,22 @@ describe('generateThreatDetectionReport', () => {
     expect(res0Generated(s)).toBe('2026-09-30T05:18:00.000Z');
   });
 
+  it.each([
+    ['last_7_days', '2026-10-14'],
+    ['last_90_days', '2026-07-23'],
+  ])('honours a %s dateRange preset on an ad-hoc run (#9562)', async (preset, expectedStart) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'));
+    try {
+      queueSelects(ORG_ROW, [], [{ ...ACTIVE_INTEGRATION[0]!, createdAt: new Date('2026-01-01T00:00:00.000Z') }], [], [], [], [], [], []);
+      const s = summaryOf(await generateThreatDetectionReport(ORG_ID, { dateRange: { preset } }, authority()));
+      expect(s.coverage?.periodStart).toBe(expectedStart);
+      expect(s.coverage?.periodEnd).toBe('2026-10-21');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('states the actual coverage window when the integration synced mid-period', async () => {
     queueSelects(
       ORG_ROW,
@@ -283,15 +299,17 @@ describe('generateThreatDetectionReport', () => {
     queueSelects(ORG_ROW, [], ACTIVE_INTEGRATION, [], [], [], [], [], []);
     await generateThreatDetectionReport(ORG_ID, {}, authority('restricted', [SITE_A]), PERIOD_SEP);
     // org, devices, integration, agents, window metrics, unattributable count,
-    // rows, carried-in, earliest
-    expect(whereCalls).toHaveLength(9);
+    // rows, carried-in, earliest, then the two EDR coverage queries (#8164)
+    expect(whereCalls).toHaveLength(11);
     // Every branch except the org lookup, the integration lookup and the
     // unattributable COUNT filters by site itself — including the device count
     // that runs before the source check. The count query is deliberately not
     // site-scoped: it exists to count the rows the site predicate drops, so
     // applying that predicate to it would make it report 0 forever.
     const siteScopedBranches = whereCalls.filter((_, i) => i !== 0 && i !== 2 && i !== 5);
-    expect(siteScopedBranches).toHaveLength(6);
+    // 6 Huntress-path branches + the two EDR coverage branches (#8164), which
+    // push their own site predicate too.
+    expect(siteScopedBranches).toHaveLength(8);
     siteScopedBranches.forEach((call, index) => {
       expect(containsValue(call, SITE_A), `site-scoped branch ${index + 1} lost its filter`).toBe(true);
     });
@@ -367,7 +385,8 @@ describe('generateThreatDetectionReport', () => {
       await generateThreatDetectionReport(ORG_ID, { includeCarriedIn: false }, authority(), PERIOD_SEP),
     );
     expect(s.incidents?.carriedIn).toBeNull();
-    expect(whereCalls).toHaveLength(7);
+    // 7 pre-existing queries + the two EDR coverage queries (#8164)
+    expect(whereCalls).toHaveLength(9);
   });
 
   // STALE_SYNC_MS is 48h, deliberately not 24h, so one missed nightly run does

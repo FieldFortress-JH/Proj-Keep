@@ -11,6 +11,7 @@ import { hasPermission } from '@/lib/permissions';
 import { FilterSelect } from '../shared/FilterSelect';
 import type { Permission } from '@/stores/auth';
 import { ConfirmDialog } from '@/components/shared/ConfirmDialog';
+import type { RestorePointBadgeOutcome } from '../restorePoints/RestorePointBadge';
 export type { ExecutionStatus } from '@breeze/shared';
 type ScriptsT = TFunction<'scripts'>;
 
@@ -55,6 +56,10 @@ export type ScriptExecution = {
   // marker. Only present once the execution-detail endpoint has been fetched
   // (the list endpoint omits it, same as stdout/stderr).
   customFieldResult?: ScriptCustomFieldWriteResult | null;
+  // #4759 W08 — the newest System Restore ledger row for this execution, from
+  // GET /scripts/executions/:id only (the list endpoint omits it). NULL/absent
+  // when Breeze never asked. status 'requested' means the device has not reported.
+  restorePoint?: RestorePointBadgeOutcome | null;
   // #4885 — the runtime values this execution was submitted with. Both
   // GET /scripts/:id/executions and GET /scripts/executions/:id already
   // return `script_executions.parameters` on the wire; this was simply never
@@ -71,6 +76,10 @@ export type ScriptExecution = {
   // "too late" / "stop failed" copy once the execution reaches a terminal
   // status. Absent/null means no cancel was ever requested.
   cancelState?: CancelState | null;
+  // #9563 — the device's own status (devices.status), from both execution read
+  // endpoints. Lets a `queued` run say "device offline" only when the device
+  // really is offline, rather than whenever no agent session took the command.
+  deviceStatus?: string | null;
 };
 
 type ExecutionHistoryProps = {
@@ -409,7 +418,7 @@ export default function ExecutionHistory({
                           'h-3 w-3',
                           (execution.status === 'running' || execution.status === 'cancelling') && 'animate-spin'
                         )} />
-                        {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(execution.status, execution.cancelState)}`)}
+                        {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(execution.status, execution.cancelState, execution.deviceStatus)}`)}
                       </span>
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground">

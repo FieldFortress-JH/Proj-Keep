@@ -7,14 +7,35 @@ import { BILLABLE_DEVICE_ROLES } from './deviceRoles';
 // (#3205 W03); an oversize value reached Postgres as a raw 22003 -> 500.
 // String-length, not Number(), so no float rounding decides a boundary.
 // Sibling validators already bound money (quotes.ts:8, catalog.ts:15).
-const money = z.string()
-  .regex(/^\d+(\.\d{1,2})?$/, 'must be a 2-decimal money string')
-  .refine((v) => v.split('.')[0]!.length <= 10, 'must be at most 10 digits before the decimal point');
+// Exported (#10293) so the web contract editor checks the SAME grammar inline
+// instead of re-copying the regex and the digit cap.
+export const CONTRACT_DECIMAL_RE = /^\d+(\.\d{1,2})?$/;
+export const CONTRACT_DECIMAL_MAX_INTEGER_DIGITS = 10;
+const withinIntegerDigits = (v: string): boolean => v.split('.')[0]!.length <= CONTRACT_DECIMAL_MAX_INTEGER_DIGITS;
+const decimal = (formatMessage: string) => z.string()
+  .regex(CONTRACT_DECIMAL_RE, formatMessage)
+  .refine(withinIntegerDigits, `must be at most ${CONTRACT_DECIMAL_MAX_INTEGER_DIGITS} digits before the decimal point`);
+const money = decimal('must be a 2-decimal money string');
+// #10293: same numeric(12,2) grammar as money, but a quantity is not money, so
+// the 400 a client sees names what is actually wrong.
+const quantity = decimal('must be a number with up to 2 decimals');
+
+export type ContractQuantityIssue = 'required' | 'format' | 'tooLarge';
+
+/** Why a contract quantity string would fail `manualQuantity` validation, or
+ *  null when the server would accept it. `required` (blank) is split from
+ *  `format` so a form can say "Enter a quantity" rather than "invalid". */
+export function contractQuantityIssue(value: string): ContractQuantityIssue | null {
+  if (value.trim() === '') return 'required';
+  if (!CONTRACT_DECIMAL_RE.test(value)) return 'format';
+  if (!withinIntegerDigits(value)) return 'tooLarge';
+  return null;
+}
 
 const INT32_MAX = 2_147_483_647;  // sort_order is int4
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD');
 
-export const CONTRACT_LINE_TYPES = ['flat', 'per_device', 'per_device_role', 'per_device_group', 'per_seat', 'manual'] as const;
+export const CONTRACT_LINE_TYPES = ['flat', 'per_device', 'per_device_role', 'per_device_group', 'per_seat', 'manual', 'hour_block'] as const;
 export type ContractLineType = typeof CONTRACT_LINE_TYPES[number];
 
 // #3205 W04 (#4607): what happens to the units above included_quantity.
@@ -34,8 +55,10 @@ export const ROLLOVER_POLICIES = ['none', 'carry_forward'] as const;
 export type RolloverPolicy = typeof ROLLOVER_POLICIES[number];
 
 /** Line types that accept an allowance (#4607). The DB twin is the type list in
- *  contract_lines_allowance_chk. #4547's hour_block joins this set. */
-export const ALLOWANCE_LINE_TYPES = ['per_device', 'per_device_role', 'per_device_group', 'per_seat'] as const;
+ *  contract_lines_allowance_chk. `hour_block` (#4547) is in this set: its included
+ *  hours live in `included_quantity`, its extra-hours price in `overage_unit_price`,
+ *  and it is the only member exempt from the whole-number rule below. */
+export const ALLOWANCE_LINE_TYPES = ['per_device', 'per_device_role', 'per_device_group', 'per_seat', 'hour_block'] as const;
 const ALLOWANCE_LINE_TYPE_SET: ReadonlySet<string> = new Set(ALLOWANCE_LINE_TYPES);
 
 /** Read layers use null for not-applicable, write layers omit the key (see the
@@ -62,6 +85,14 @@ export interface ContractLineShape {
   includedQuantity?: string | null;
   overageMode?: OverageMode | null;
   overageUnitPrice?: string | null;
+  // #4547 W03: block-hours columns. NULL together on every non-block type
+  // (contract_lines_hour_block_chk ELSE branch). Typed `string | null`, not
+  // RolloverPolicy, so a Drizzle `text` row is assignable; the invariant table
+  // checks membership. hour_block_first_period_start and hour_block_retired_at
+  // are deliberately NOT here: they are server-stamped and never client input.
+  rolloverPolicy?: string | null;
+  rolloverCapHours?: string | null;
+  hourBlockAlertPct?: number | null;
 }
 
 /** A persisted site-scopable line whose referenced site was deleted. The
@@ -94,7 +125,8 @@ export interface ContractLineInvariantIssue {
  *
  * NOT a transcription of the DB CHECKs. Three rules here have NO database
  * counterpart (duplicate roles — `<@` is containment, not set equality;
- * manualQuantity — there is no CHECK on the column at all; siteId on
+ * manualQuantity only on manual lines — contract_lines_manual_quantity_chk
+ * (#9664) enforces only the other half, a manual line's quantity; siteId on
  * flat/manual/per_seat — W02's CHECK covers per_device_group only), and two DB
  * rules are not expressible here (role-set membership, 1-D array shape). Both
  * sides are load-bearing; see the asymmetry matrix in the spec.
@@ -106,10 +138,11 @@ export function contractLineInvariantIssues(
   const isManual = l.lineType === 'manual';
   const isRoleLine = l.lineType === 'per_device_role';
   const isGroupLine = l.lineType === 'per_device_group';
+  const isBlock = l.lineType === 'hour_block';
 
   if (isManual && !present(l.manualQuantity)) {
     issues.push({ path: 'manualQuantity', message: 'manualQuantity is required for manual lines' });
-  } else if (!isManual && opts.mode === 'persisted' && present(l.manualQuantity)) {
+  } else if (!isManual && (opts.mode === 'persisted' || isBlock) && present(l.manualQuantity)) {
     // create TOLERATES this: the add writer nulls the column on every other
     // type (contractService.ts:904), so rejecting it would change add behaviour.
     issues.push({ path: 'manualQuantity', message: 'manualQuantity is only valid on manual lines' });
@@ -180,15 +213,52 @@ export function contractLineInvariantIssues(
   if (present(l.includedQuantity) && !(Number(l.includedQuantity) > 0)) {
     issues.push({ path: 'includedQuantity', message: 'includedQuantity must be greater than 0' });
   }
-  // You cannot include 25.5 devices or 25.5 seats. (#4547 scopes this rule when
-  // hour_block joins ALLOWANCE_LINE_TYPES — hours are fractional.)
-  if (present(l.includedQuantity) && !Number.isInteger(Number(l.includedQuantity))) {
+  // You cannot include 25.5 devices or 25.5 seats. Hours are fractional.
+  if (!isBlock && present(l.includedQuantity) && !Number.isInteger(Number(l.includedQuantity))) {
     issues.push({ path: 'includedQuantity', message: 'includedQuantity must be a whole number of devices or seats' });
   }
   // A price is present iff it is actually charged. A rate parked on a 'flag'
   // line reads as a charge on the detail page and in the tenant export.
   if (present(l.overageUnitPrice) !== (l.overageMode === 'bill')) {
     issues.push({ path: 'overageUnitPrice', message: "overageUnitPrice is required for overageMode 'bill' and not allowed for 'flag'" });
+  }
+
+  // ---- #4547 W03: hour_block -------------------------------------------------
+  // Twin of contract_lines_hour_block_chk (index C2). IDENTICAL IN BOTH MODES.
+  // site / roles / group / manualQuantity are already rejected for a block by
+  // the rules above (it is in neither SITE_SCOPABLE_LINE_TYPES, nor a role nor a
+  // group line, and manualQuantity is rejected explicitly).
+  if (isBlock) {
+    if (!present(l.includedQuantity)) {
+      issues.push({ path: 'includedQuantity', message: 'includedQuantity (hours per period) is required on hour_block lines' });
+    }
+    // Open Decision 10 (A): 'bill' only. A 'flag' block would silently absorb unlimited hours.
+    if (l.overageMode !== 'bill') {
+      issues.push({ path: 'overageMode', message: "hour_block lines must use overageMode 'bill'" });
+    }
+    if (!present(l.rolloverPolicy)) {
+      issues.push({ path: 'rolloverPolicy', message: 'rolloverPolicy is required on hour_block lines' });
+    } else if (!(ROLLOVER_POLICIES as readonly string[]).includes(l.rolloverPolicy as string)) {
+      issues.push({ path: 'rolloverPolicy', message: "rolloverPolicy must be 'none' or 'carry_forward'" });
+    }
+    if (present(l.rolloverCapHours)) {
+      if (l.rolloverPolicy !== 'carry_forward') {
+        issues.push({ path: 'rolloverCapHours', message: "rolloverCapHours is only valid with rolloverPolicy 'carry_forward'" });
+      }
+      if (!(Number(l.rolloverCapHours) > 0)) {
+        issues.push({ path: 'rolloverCapHours', message: 'rolloverCapHours must be greater than 0' });
+      }
+    }
+    if (present(l.hourBlockAlertPct)) {
+      const pct = l.hourBlockAlertPct as number;
+      if (!Number.isInteger(pct) || pct < 1 || pct > 100) {
+        issues.push({ path: 'hourBlockAlertPct', message: 'hourBlockAlertPct must be a whole number from 1 to 100' });
+      }
+    }
+  } else {
+    if (present(l.rolloverPolicy)) issues.push({ path: 'rolloverPolicy', message: 'rolloverPolicy is only valid on hour_block lines' });
+    if (present(l.rolloverCapHours)) issues.push({ path: 'rolloverCapHours', message: 'rolloverCapHours is only valid on hour_block lines' });
+    if (present(l.hourBlockAlertPct)) issues.push({ path: 'hourBlockAlertPct', message: 'hourBlockAlertPct is only valid on hour_block lines' });
   }
 
   return issues;
@@ -204,7 +274,7 @@ export const contractLineInputSchema = z.object({
   unitPrice: money.optional(),
   taxable: z.boolean().optional(),
   catalogItemId: z.string().guid().optional(),
-  manualQuantity: money.optional(),
+  manualQuantity: quantity.optional(),
   siteId: z.string().guid().optional(),
   // #3205: the SET of roles a per_device_role line bills. 'unknown' is not a
   // rate; the DB CHECK (contract_lines_device_roles_chk) enforces the same list.
@@ -215,6 +285,12 @@ export const contractLineInputSchema = z.object({
   includedQuantity: money.optional(),
   overageMode: z.enum(OVERAGE_MODES).optional(),
   overageUnitPrice: money.optional(),
+  // #4547 W03: block hours. The server-stamped hour_block_first_period_start /
+  // hour_block_retired_at are NOT fields here (non-strict object: a client-sent
+  // value is stripped, never persisted).
+  rolloverPolicy: z.enum(ROLLOVER_POLICIES).optional(),
+  rolloverCapHours: money.optional(),
+  hourBlockAlertPct: z.number().int().min(1).max(100).optional(),
   // #3205 W02: the device group a per_device_group line bills. Dynamic groups
   // are evaluated live at estimate/invoice time. No siteId on this type — the
   // group's own site narrows it (contract_lines_device_group_chk).
@@ -259,7 +335,7 @@ export const updateContractLineSchema = z.object({
   taxable: z.boolean().optional(),
   catalogItemId: z.string().guid().nullable().optional(),
   refreshCatalogPrice: z.boolean().optional(),      // default false
-  manualQuantity: money.optional(),
+  manualQuantity: quantity.optional(),
   // null clears the site narrowing on a per_device / per_device_role line.
   siteId: z.string().guid().nullable().optional(),
   deviceRoles: z.array(z.enum(BILLABLE_DEVICE_ROLES)).min(1).optional(),
@@ -273,6 +349,13 @@ export const updateContractLineSchema = z.object({
   includedQuantity: money.nullable().optional(),
   overageMode: z.enum(OVERAGE_MODES).nullable().optional(),
   overageUnitPrice: money.nullable().optional(),
+  // #4547 W03: the three patchable block fields. Nullable only where clearing
+  // leaves a valid row (a cap, an alert); the policy is required on a block, so
+  // it has no null. hour_block_first_period_start / hour_block_retired_at stay
+  // out: this schema is .strict(), so naming them is a 400, never a silent drop.
+  rolloverPolicy: z.enum(ROLLOVER_POLICIES).optional(),
+  rolloverCapHours: money.nullable().optional(),
+  hourBlockAlertPct: z.number().int().min(1).max(100).nullable().optional(),
   sortOrder: z.number().int().min(0).max(INT32_MAX).optional(),
 }).strict().refine(
   (p) => Object.keys(p).length > 0,
@@ -358,6 +441,11 @@ export function mergeContractLinePatch(
     includedQuantity: patchHasKey(patch, 'includedQuantity') ? (patch.includedQuantity ?? null) : current.includedQuantity,
     overageMode: patchHasKey(patch, 'overageMode') ? (patch.overageMode ?? null) : current.overageMode,
     overageUnitPrice: patchHasKey(patch, 'overageUnitPrice') ? (patch.overageUnitPrice ?? null) : current.overageUnitPrice,
+    // #4547 W03: policy is never cleared (no null in the patch schema); the cap
+    // and the alert are tri-state like the allowance columns above.
+    rolloverPolicy: patch.rolloverPolicy ?? current.rolloverPolicy,
+    rolloverCapHours: patchHasKey(patch, 'rolloverCapHours') ? (patch.rolloverCapHours ?? null) : current.rolloverCapHours,
+    hourBlockAlertPct: patchHasKey(patch, 'hourBlockAlertPct') ? (patch.hourBlockAlertPct ?? null) : current.hourBlockAlertPct,
   };
 }
 

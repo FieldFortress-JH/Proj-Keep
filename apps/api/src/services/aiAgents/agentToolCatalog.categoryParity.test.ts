@@ -97,12 +97,9 @@ const TOOL_CAPABILITY_NOT_YET_IN_TIER_CONFIG: readonly string[] = [
   'apply_cis_remediation',
   'assign_security_training',
   'collect_evidence',
-  'configure_backup_sla',
-  'configure_vault',
   'create_incident',
   'delete_tenant',
   'execute_containment',
-  'execute_dr_plan',
   // W03 execution plane (#5711) — a new capability-only tool; tierConfig.ts
   // has not been swept to add a workspace/export display category yet.
   'export_dataset',
@@ -111,6 +108,11 @@ const TOOL_CAPABILITY_NOT_YET_IN_TIER_CONFIG: readonly string[] = [
   'get_cis_device_report',
   'get_contract',
   'get_device_vulnerabilities',
+  // EDR provider framework (#8164/#8166): same gap as get_huntress_incidents.
+  // (edr_endpoint_action / sync_edr_data have tierConfig rows since #8167 W03 PR-B.)
+  'get_edr_status',
+  'list_edr_detections',
+  'get_huntress_agents', // #10393 Tier-1 read, same gap as its Huntress siblings
   'get_huntress_incidents',
   'get_huntress_status',
   'get_invite_funnel',
@@ -120,7 +122,6 @@ const TOOL_CAPABILITY_NOT_YET_IN_TIER_CONFIG: readonly string[] = [
   'get_s1_threats',
   'get_service_monitoring_status',
   'get_vulnerability_report',
-  'instant_boot_vm',
   'list_contracts',
   // Service deliverables W02 (#5573): same content gap as the contracts family
   // above — the AI Risk page has no deliverables/key-dates copy yet, and
@@ -144,42 +145,26 @@ const TOOL_CAPABILITY_NOT_YET_IN_TIER_CONFIG: readonly string[] = [
   'm365_query_sites',
   'm365_query_users',
   'manage_backup_configs',
-  'manage_backup_profiles',
   'manage_browser_policy',
-  'manage_catalog',
-  'manage_contracts',
   'manage_deliverables',
-  'manage_dr_plan',
-  'manage_hyperv_checkpoints',
-  'manage_hyperv_vm',
   'manage_invoices',
   'manage_key_dates',
   'manage_organizations',
   'manage_peripheral_policies',
   'manage_peripheral_policy',
   'manage_policy_feature_link',
-  'manage_quotes',
   'manage_service_monitors',
   'manage_software_policies',
   'manage_update_rings',
   'remediate_sensitive_data',
   'remediate_vulnerability',
   'request_elevation',
-  'restore_as_vm',
-  'restore_c2c_items',
-  'restore_hyperv_vm',
-  'restore_mssql_database',
   'revoke_elevation',
   's1_isolate_device',
   's1_threat_action',
   'search_catalog',
   'search_documentation',
   'sync_huntress_data',
-  'trigger_c2c_sync',
-  'trigger_hyperv_backup',
-  'trigger_mssql_backup',
-  'trigger_vault_sync',
-  'verify_mssql_backup',
   // W04 execution plane (#5715) — the four sandbox-workspace tools share
   // `export_dataset`'s situation: the risk page copy is W05's surface work,
   // so each entry here is a follow-up owed, not a design choice.
@@ -222,7 +207,9 @@ const CATEGORY_CAPABILITY_PAIRS: Record<ToolCategory, AgentCapabilityId[]> = {
   'Files, Disk & Registry': ['files_disk', 'scripts_commands'],
   'Logs & Audit': ['alerts_monitoring', 'automations_reports', 'endpoint_agent'],
   'Services & Processes': ['services_startup', 'scripts_commands'],
-  'Scripts & Automation': ['scripts_commands', 'author_scripts'],
+  // automations_reports: Tool Catalog W03 flow tools (#5218) — flows are automations, read and
+  // drafted with automations.read/write, shown with the other scripting tools.
+  'Scripts & Automation': ['scripts_commands', 'author_scripts', 'automations_reports'],
   'Configuration Policies': ['config_policies'],
   'Fleet Operations': [
     'automations_reports',
@@ -234,6 +221,8 @@ const CATEGORY_CAPABILITY_PAIRS: Record<ToolCategory, AgentCapabilityId[]> = {
   'Remote Access & Control': ['remote_access', 'scripts_commands'],
   Integrations: ['endpoint_agent', 'tenancy'],
   Ticketing: ['tickets'],
+  // W02 (#6756): quotes and the billing price book, TOOL_CAPABILITY 'business'.
+  Billing: ['business'],
   // A-W05 (D13a): read_artifact is TOOL_CAPABILITY 'workspace' (same bucket
   // export_dataset uses — CAPABILITY_DOMAINS.workspace covers the `ai`
   // domain) but displays under 'AI Governance' beside list_ai_agents: it

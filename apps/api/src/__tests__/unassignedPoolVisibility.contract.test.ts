@@ -148,6 +148,9 @@ const EPHEMERAL_ONLY: Record<string, string> = {
   'services/portal/hardwareHealthReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/hardwareInventoryReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/performanceReadModel.ts': 'portal users belong to one customer org, never a holding org',
+  'services/portal/softwareInventoryReadModel.ts': 'portal users belong to one customer org, never a holding org',
+  'services/portal/patchDetailReadModel.ts': 'portal users belong to one customer org, never a holding org',
+  'services/portal/vulnerabilityDetailReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/securityReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/portal/backupReadModel.ts': 'portal users belong to one customer org, never a holding org',
   'services/quickSupportOrg.ts': 'the Quick Support helpers themselves',
@@ -165,8 +168,16 @@ const EPHEMERAL_ONLY: Record<string, string> = {
   'services/topology/originEligibility.ts': 'pinned to the calling technician\'s org and site',
 };
 
-/** Pinned: every file with an ephemeral-device filter, all buckets together. */
-const EPHEMERAL_DISCOVERED_FILES = 72;
+/**
+ * Pinned: every file with an ephemeral-device filter, all buckets together.
+ * 76 → 74 (#9611): routes/patches/compliance.ts and
+ * jobs/patchComplianceReportWorker.ts now take their device population from
+ * techFacingDeviceConditions() in services/deviceStats.ts, which stays in this
+ * scan with the ephemeral filter and notParkedDeviceCondition() side by side.
+ * 74 → 75 (#6263 W05): services/securityScanSweepTargets.ts, the IOC sweep
+ * target selector (a FANOUT_MODULES entry, parked guard beside the filter).
+ */
+const EPHEMERAL_DISCOVERED_FILES = 75;
 
 describe('contract: device counts and listings leave parked devices out', () => {
   const found = DEVICE_FILES

@@ -14,10 +14,12 @@ import { PORTAL_ACCOUNT_DISABLED_PAGE } from './accountStatus';
 export const PORTAL_PROTECTED_PREFIXES = [
   '/devices',
   '/tickets',
+  '/approvals',
   '/assets',
   '/profile',
   '/quotes',
   '/invoices',
+  '/agreements',
   '/payment-methods',
   '/dashboard',
   '/security',

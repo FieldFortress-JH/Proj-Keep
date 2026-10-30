@@ -18,6 +18,8 @@
  * reaches `JSON.stringify(response)` for a task/operation DTO — same
  * "impossible by construction" contract as `AI_AGENT_RUN_LEAK_TRIPWIRE_KEYS`.
  */
+
+import type { WispProvenanceDto } from './wispProvenance';
 export const AI_OPERATOR_TASK_LEAK_TRIPWIRE_KEYS = [
   'checkpoint', 'criteria', 'args', 'toolInput', 'toolOutput', 'result',
 ] as const;
@@ -65,7 +67,7 @@ export const AI_OPERATOR_TASK_OUTCOMES = [
 export type AiOperatorTaskOutcome = (typeof AI_OPERATOR_TASK_OUTCOMES)[number];
 
 export const AI_OPERATOR_TARGET_DETACH_REASONS = [
-  'device_moved', 'device_deleted', 'org_merged', 'scope_invalidated',
+  'device_moved', 'device_deleted', 'org_merged', 'scope_invalidated', 'device_reinstalled',
 ] as const;
 export type AiOperatorTargetDetachReason = (typeof AI_OPERATOR_TARGET_DETACH_REASONS)[number];
 
@@ -190,6 +192,8 @@ export interface AiOperatorTaskRunLinkDto {
 export interface AiOperatorTaskListItemDto {
   schemaVersion: typeof AI_OPERATOR_TASK_DTO_SCHEMA_VERSION;
   id: string;
+  /** W07 "Wisp for <user>" provenance; null for a task not admitted under a grant. */
+  wisp: WispProvenanceDto | null;
   orgId: string;
   // Non-null: unlike `ai_agent_runs.agent_id` (a live FK resolved via LEFT
   // JOIN, with the dual-ownership partner-wide visibility gap that route's
@@ -238,6 +242,20 @@ export interface AiOperatorTaskDto extends AiOperatorTaskListItemDto {
   targets: AiOperatorTaskTargetRowDto[];
   steps: AiOperatorTaskStepDto[];
   events: AiOperatorTaskEventDto[];
+  /**
+   * W06 R1b: every plan revision proposed for this task, `superseded` ones
+   * included, ordered by `planRevision`, each with its frozen effects in
+   * ordinal order. OPTIONAL so callers built before it keep compiling; the
+   * detail route always sends it (`[]` when nothing was proposed).
+   */
+  plan?: AiOperatorPlanApprovalDto[];
+  /**
+   * W07 R2a: every account an `identity_onboarding` task created or resolved,
+   * one per provider, with its temporary credential's STATE (never the
+   * credential). OPTIONAL for the same reason as `plan`; the detail route
+   * always sends it, `[]` for every other recipe.
+   */
+  accounts?: CreatedAccountView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -399,4 +417,100 @@ export interface AiOperatorTaskEventDto {
   targetId: string | null;
   detail: string | null;
   createdAt: string;
+}
+
+/**
+ * `ai_operator_plan_approvals.state` (Recipe Library spec §5.4).
+ *
+ * `superseded` is NOT a variant of `rejected`: nobody refused this plan, the
+ * plan itself stopped existing when `ai_operator_tasks.revision` moved. Keeping
+ * them apart is what lets the task page say "the plan changed, re-approve"
+ * instead of "an approver said no", and it is the state the release-time
+ * membership check refuses on (spec §6.4: "Any change … bumps `revision`,
+ * supersedes the approval, and requires a new one").
+ */
+export const AI_OPERATOR_PLAN_APPROVAL_STATES = Object.freeze([
+  'pending', 'approved', 'rejected', 'expired', 'superseded',
+] as const);
+export type AiOperatorPlanApprovalState = (typeof AI_OPERATOR_PLAN_APPROVAL_STATES)[number];
+
+/**
+ * Per-effect replay classification (spec §6.6).
+ *
+ *  - `idempotent`           — the write may be re-sent safely (group remove,
+ *                             license remove, disable, revoke sessions).
+ *  - `idempotent_by_probe`  — safe only because the pre-probe observes the end
+ *                             state first (forwarding, auto-reply).
+ *  - `non_idempotent`       — NEVER auto-retried (create user, reset password).
+ *                             An unknown outcome hands the task off.
+ */
+export const AI_OPERATOR_EFFECT_IDEMPOTENCY_CLASSES = Object.freeze([
+  'idempotent', 'idempotent_by_probe', 'non_idempotent',
+] as const);
+export type AiOperatorEffectIdempotencyClass =
+  (typeof AI_OPERATOR_EFFECT_IDEMPOTENCY_CLASSES)[number];
+
+/** One approved effect, as the approval card and the task page render it. */
+export interface AiOperatorPlanEffectDto {
+  ordinal: number;
+  toolName: string;
+  provider: 'breeze' | 'm365' | 'google';
+  /** Frozen display label for the target, never re-resolved. */
+  targetLabel: string;
+  /** Frozen UPN / primary email at approval time, display only. Null for a
+   *  `breeze` effect, which names a device row rather than a provider account. */
+  principalLabel: string | null;
+  /** Bounded human-readable rendering the approver actually signed off on. */
+  rendering: string;
+  idempotencyClass: AiOperatorEffectIdempotencyClass;
+  /** Set once the effect has an operation; null while the plan is pending. */
+  operationState: 'pending' | 'succeeded' | 'failed' | 'unknown' | 'superseded' | null;
+  /** True when the pre-write probe already observed the end state (§6.6). */
+  noop: boolean;
+}
+
+export interface AiOperatorPlanApprovalDto {
+  id: string;
+  taskId: string;
+  planRevision: number;
+  effectSetDigest: string;
+  effectCount: number;
+  /** Null only while a `pending` approval is not yet linked to its intent (the column's own rule). */
+  intentId: string | null;
+  state: AiOperatorPlanApprovalState;
+  approvedByUserId: string | null;
+  approvedAt: string | null;
+  supersededByRevision: number | null;
+  createdAt: string;
+  effects: AiOperatorPlanEffectDto[];
+}
+
+// ---------------------------------------------------------------------------
+// Created accounts — W07 R2a (identity_onboarding, D-R2-6).
+//
+// Mirrors `CREDENTIAL_STATES` / `CreatedAccountView` in
+// `apps/api/src/services/aiOperator/credentialHandover.ts`; the detail route
+// checks the API value against this type with `satisfies`, and the route
+// test pins the two state lists equal.
+// ---------------------------------------------------------------------------
+
+export const AI_OPERATOR_CREDENTIAL_STATES = Object.freeze([
+  'available', 'revealed', 'expired', 'unretrievable', 'not_applicable',
+] as const);
+export type CredentialState = (typeof AI_OPERATOR_CREDENTIAL_STATES)[number];
+
+export interface CreatedAccountView {
+  provider: 'm365' | 'google';
+  /** The frozen UPN / primary email. DISPLAY ONLY. */
+  principalLabel: string;
+  /** The immutable Entra object id / Google user id. */
+  externalId: string;
+  credentialState: CredentialState;
+  /** The intent whose sealed result holds the credential. Null when `not_applicable`. */
+  intentId: string | null;
+  /** Who may reveal it (the create approval's approver). Null unless `available`. */
+  revealableByUserId: string | null;
+  revealableByName: string | null;
+  /** When the reveal window closes. Null unless `available`. */
+  revealExpiresAt: string | null;
 }

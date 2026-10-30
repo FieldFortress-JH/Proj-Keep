@@ -267,7 +267,8 @@ const createBreezeMcpServer = vi.hoisted(() =>
 // #7427: the names the REAL SDK server declares. Default (set in the
 // top-level beforeEach) is the whole `aiTools` registry, i.e. "every exposure
 // name is declared"; a test narrows it to model the real
-// KNOWN_MISSING_TOOL_TIERS gap (registry tools with no `tool()` declaration).
+// gap of registry tools with no `tool()` declaration (historically #3300's
+// KNOWN_MISSING_TOOL_TIERS, emptied in full-control W04 #6758).
 const listChatSurfaceToolNames = vi.hoisted(() => vi.fn<() => string[]>());
 vi.mock('../aiAgentSdkTools', () => ({
   createBreezeMcpServer,
@@ -527,6 +528,7 @@ function seedRows(options: {
   servedFundingSource?: 'platform' | 'partner_key' | null;
   servedFailoverHop?: number | null;
   servedFailoverCause?: string | null;
+  servedFailoverFromOfferingId?: string | null;
 } = {}) {
   const effective = options.effective ?? policy();
   const deviceId = options.deviceId === undefined ? DEVICE_ID : options.deviceId;
@@ -555,6 +557,7 @@ function seedRows(options: {
     servedFundingSource: options.servedFundingSource ?? null,
     servedFailoverHop: options.servedFailoverHop ?? null,
     servedFailoverCause: options.servedFailoverCause ?? null,
+    servedFailoverFromOfferingId: options.servedFailoverFromOfferingId ?? null,
   }]];
   dbMockState.rowQueues.ai_agents = [[{
     id: AGENT_ID,
@@ -3588,8 +3591,8 @@ describe('verdict profile in the run loop (P2-1)', () => {
   });
 
   // #7427: `fullRunToolExposure` walks the `aiTools` registry, which carries
-  // tools the SDK server never declares (KNOWN_MISSING_TOOL_TIERS —
-  // manage_tags, manage_tickets, …). Passing one as `onlyTools` makes
+  // tools the SDK server may not declare (historically #3300's
+  // KNOWN_MISSING_TOOL_TIERS, emptied in W04 #6758). Passing one as `onlyTools` makes
   // `createBreezeMcpServer` throw outside production and log an error on
   // every full run in production. Exposure — `onlyTools` AND `allowedTools` —
   // must be the floor intersected with what the server actually declares.
@@ -4075,6 +4078,85 @@ describe('W09 run failover', () => {
     expect(reserveKeys()).toEqual([[`ai-agent-run:${RUN_ID}:hop:1`, 'partner_key']]);
     expect(prepareSdkChild.mock.calls.map((c) => (c[1] as { key: string }).key)).toEqual([`agent-run:${RUN_ID}:1`]);
     expect(recordServedHop).not.toHaveBeenCalled();
+  });
+
+  it('#7787: a run admitted on the fallback (primary cooling) keeps hop 0\'s key and its ledger row carries the admission\'s failover provenance', async () => {
+    // Admission resolved the platform fallback 'h' because primary 'p' was cooling,
+    // and stamped that provenance on the run (served = admitted).
+    seedRows({
+      admittedOfferingId: 'h', fundingSource: 'platform',
+      servedOfferingId: 'h', servedFundingSource: 'platform', servedFailoverHop: 2, servedFailoverCause: 'cooldown',
+      servedFailoverFromOfferingId: 'p',
+    });
+    // The run loop re-resolves exactly the admitted offering: the resolver reports no failover of its own.
+    resolveModel.mockResolvedValueOnce(makeResolvedModel('platform', {
+      surface: 'ai_agents', role: 'analysis', offering: { id: 'h', displayName: 'H' }, failover: null, failoverRemaining: [],
+    }));
+    scriptQueries([[successResult()]]);
+    await executeAgentRun(RUN_ID);
+
+    expect(resolveModel).toHaveBeenCalledWith(expect.objectContaining({ requested: { offeringId: 'h', origin: 'policy' } }));
+    expect(resolveModel.mock.calls[0]![0]).not.toHaveProperty('failoverOrigin');
+    // Provenance only: the reservation stays on hop 0's key (amounts untouched), no stale-hop sweep, no new hop recorded.
+    expect(reserveKeys()).toEqual([[`ai-agent-run:${RUN_ID}`, 'platform']]);
+    expect(markStaleHopReservations).not.toHaveBeenCalled();
+    expect(recordServedHop).not.toHaveBeenCalled();
+    // The ledger row records what chat records for the same situation.
+    expect(settles().map((s) => s.binding.failover)).toEqual([{ fromOfferingId: 'p', hop: 2, cause: 'cooldown' }]);
+    expect(finalTransition()!.to).toBe('completed');
+  });
+
+  it('#7787: a run-start re-resolution that moves again records ITS provenance, not admission\'s', async () => {
+    seedRows({
+      admittedOfferingId: 'h', fundingSource: 'platform',
+      servedOfferingId: 'h', servedFundingSource: 'platform', servedFailoverHop: 2, servedFailoverCause: 'cooldown',
+      servedFailoverFromOfferingId: 'p',
+    });
+    // 'h' went ineligible while queued: the resolver walked to 'g' on the same funding.
+    resolveModel.mockResolvedValueOnce(makeResolvedModel('platform', {
+      surface: 'ai_agents', role: 'analysis', offering: { id: 'g', displayName: 'G' },
+      failover: { fromOfferingId: 'h', hop: 1, cause: 'ineligible' }, failoverRemaining: [],
+    }));
+    scriptQueries([[successResult()]]);
+    await executeAgentRun(RUN_ID);
+    expect(reserveKeys()).toEqual([[`ai-agent-run:${RUN_ID}`, 'platform']]);
+    expect(settles().map((s) => s.binding.failover)).toEqual([{ fromOfferingId: 'h', hop: 1, cause: 'ineligible' }]);
+  });
+
+  it('#7787: a run admitted on the fallback that then fails over opens hop 1 on its own key; hop 1 carries its own provenance', async () => {
+    seedRows({
+      admittedOfferingId: 'h', fundingSource: 'platform',
+      servedOfferingId: 'h', servedFundingSource: 'platform', servedFailoverHop: 2, servedFailoverCause: 'cooldown',
+      servedFailoverFromOfferingId: 'p',
+    });
+    resolveModel.mockResolvedValueOnce(makeResolvedModel('platform', {
+      surface: 'ai_agents', role: 'analysis', offering: { id: 'h', displayName: 'H' }, failover: null, failoverRemaining: ['k'],
+    }));
+    nextAgentHop.mockResolvedValueOnce({ ok: true, resolved: backup({ failover: { fromOfferingId: 'h', hop: 1, cause: 'overloaded' } }) });
+    scriptQueries([
+      [retry(1), retry(2)],     // hop 0 on 'h': aborted
+      [successResult()],        // hop 1 on 'k' serves
+    ]);
+    await executeAgentRun(RUN_ID);
+    expect(nextAgentHop).toHaveBeenCalledWith(expect.objectContaining({
+      tried: ['h'], hop: 1, origin: { offeringId: 'h', funding: 'platform', connectionId: null },
+    }));
+    expect(reserveKeys()).toEqual([
+      [`ai-agent-run:${RUN_ID}`, 'platform'],
+      [`ai-agent-run:${RUN_ID}:hop:1`, 'partner_key'],
+    ]);
+    expect(settles().map((s) => [s.binding.offeringId, s.binding.failover])).toEqual([
+      ['h', { fromOfferingId: 'p', hop: 2, cause: 'cooldown' }],
+      ['k', { fromOfferingId: 'h', hop: 1, cause: 'overloaded' }],
+    ]);
+  });
+
+  it('#7787: a run admitted on its primary records no failover on its ledger row', async () => {
+    seedRows({ admittedOfferingId: 'p', fundingSource: 'platform' });
+    resolveModel.mockResolvedValueOnce({ ...primary(), failoverRemaining: [] });
+    scriptQueries([[successResult()]]);
+    await executeAgentRun(RUN_ID);
+    expect(settles().map((s) => s.binding.failover ?? null)).toEqual([null]);
   });
 
   it('a queued run whose admitted offering went ineligible may cross funding only via a configured failover that is admitted', async () => {

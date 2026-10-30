@@ -29,7 +29,13 @@ vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
   useAuthStore: Object.assign(
     (selector: (state: { updateUser: () => void }) => unknown) => selector({ updateUser: vi.fn() }),
-    { getState: () => ({ updateUser: vi.fn(), sessionGeneration: 0, commitReissuedSessionIfCurrent: vi.fn(() => true) }) },
+    { getState: () => ({
+      updateUser: vi.fn(),
+      sessionGeneration: 0,
+      commitMfaEnrollmentIfCurrent: vi.fn(() => true),
+      commitMfaDisableIfCurrent: vi.fn(() => true),
+      commitReissuedSessionIfCurrent: vi.fn(() => true),
+    }) },
   ),
 }));
 
@@ -48,6 +54,12 @@ vi.mock('./ApproverDevicesSection', () => ({
 // it doesn't consume from this file's fetchWithAuth mocks. Its own behavior is
 // covered by TicketPushoverSettings.test.tsx.
 vi.mock('./TicketPushoverSettings', () => ({
+  default: () => null,
+}));
+
+// EmailNotificationSettings fetches /users/me/email-preferences on mount; stub it so
+// it doesn't consume from this file's fetchWithAuth mocks (covered by its own test).
+vi.mock('./EmailNotificationSettings', () => ({
   default: () => null,
 }));
 

@@ -24,7 +24,8 @@
         "perDeviceRole": "Per device role",
         "perDeviceGroup": "Per device group",
         "perSeat": "Per seat",
-        "manual": "Manual quantity"
+        "manual": "Manual quantity",
+        "hourBlock": "Block hours"
       },
       "dynamicGroup": "dynamic",
       "deletedGroup": "{{name}} (deleted group)",
@@ -54,7 +55,8 @@
         "auto": "auto",
         "groupDeleted": "group deleted",
         "siteDeleted": "site deleted",
-        "siteDeletedNamed": "site deleted: {{name}}"
+        "siteDeletedNamed": "site deleted: {{name}}",
+        "manualQuantityMissing": "quantity missing"
       },
       "lineScope": {
         "site": "Site: {{name}}"
@@ -70,7 +72,7 @@
         "autoIssue": "Auto-issue",
         "renewal": "Renewal",
         "estimatedPerPeriod": "Est. / period",
-        "notes": "Notes",
+        "notes": "Internal notes",
         "invoiceNote": "Invoice note"
       },
       "values": {
@@ -135,7 +137,14 @@
         "flaggedOverage": "{{count}} line(s) are over their included quantity and were not billed: {{names}}",
         "uncoveredDevices": "Invoice generated, but {{count}} device(s) are not billed by any line on this contract: {{breakdown}}",
         "priceBookGaps": "{{count}} catalog line(s) billed at the contract snapshot — no {{currency}} price in the catalog: {{lines}}",
-        "draftDeleted": "Draft deleted"
+        "draftDeleted": "Draft deleted",
+        "skipped": {
+          "already_billed": "No invoice generated — this billing period has already been billed.",
+          "not_due": "No invoice generated — this contract is not due for billing yet.",
+          "renewal_pending": "No invoice generated — this contract is past its end date and waiting on its renewal.",
+          "expired": "No invoice generated — this contract has expired.",
+          "unknown": "No invoice was generated for this contract."
+        }
       },
       "cancelConfirm": {
         "title": "Cancel this contract?",
@@ -220,8 +229,8 @@
       },
       "content": {
         "title": "Content",
-        "notesOptional": "Notes (optional, added to the Notes block on generated invoices)",
-        "termsOptional": "Invoice note (optional, added to the Notes block on generated invoices)",
+        "notesOptional": "Internal notes (never shown to the customer)",
+        "termsOptional": "Invoice note (optional, printed on every generated invoice)",
         "termsPlaceholder": "e.g. Net 30. Auto-renews unless cancelled 30 days prior."
       },
       "lines": {
@@ -254,6 +263,8 @@
         "descriptionPlaceholder": "e.g. Workstation management",
         "unitPrice": "Unit price",
         "quantity": "Quantity",
+        "quantityInvalid": "Enter a quantity (up to 2 decimals).",
+        "quantityTooLarge": "Quantity is too large (at most 10 digits before the decimal point).",
         "siteOptional": "Site (optional — scopes the device count)",
         "allSites": "All sites",
         "linkCatalogItemOptional": "Link catalog item (optional)",
@@ -588,6 +599,94 @@
       "warnings": {
         "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Agreement bodies support headings, bold, italic, underline, lists and links."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Hours included per period",
+        "extraRate": "Price per extra hour",
+        "rolloverMode": "Unused hours at period end",
+        "rolloverExpire": "Expire",
+        "rolloverCarry": "Carry forward",
+        "carryCap": "Carry-forward limit in hours (blank for no limit)",
+        "alertPct": "Alert at % of block used (optional)",
+        "required": "Enter the included hours and the price per extra hour.",
+        "firstPeriod": "Hours count from the first billing period still to be invoiced; on a draft contract this is set when it is activated. Earlier time bills as usual.",
+        "midPeriodEdit": "Changes apply to the current open period ({{start}} – {{end}}) at its close.",
+        "midPeriodEditNoDates": "Changes apply to the current open period at its close.",
+        "onlyOne": "This organization already has an active block. Retire it before adding another."
+      },
+      "row": {
+        "perPeriod": "{{hours}} hours per period",
+        "retiredBadge": "Retired",
+        "startsOn": "Counts from {{date}}"
+      },
+      "errors": {
+        "exists": "This organization already has an active block-hours line. Retire it first, then add the new one.",
+        "locked": "That field can't be changed on a block-hours line."
+      },
+      "retire": {
+        "title": "Retire block hours",
+        "message": "\"{{description}}\" has billing history, so it is retired instead of deleted. No new periods; already-billed periods still settle. Its closed periods stay on the contract.",
+        "confirm": "Retire block",
+        "toast": "Block hours retired"
+      },
+      "detail": {
+        "title": "Block hours",
+        "usage": "{{used}} of {{included}} hours used · {{remaining}} remaining · period ends {{end}}",
+        "carried": "Includes {{hours}} hours carried forward.",
+        "unapproved": "{{hours}} hours of this time are not yet approved.",
+        "foreign": "{{hours}} hours were logged in another currency; they still draw down the block.",
+        "over": "{{hours}} hours over the block → {{amount}} at period close",
+        "advanceNote": "Overage bills on the following invoice.",
+        "arrearsNote": "Overage bills on this period's invoice.",
+        "lateEntry": "{{hours}} hours were entered after their period closed and bill separately.",
+        "startsLater": "Block starts {{date}}.",
+        "extraRate": "Extra hours: {{rate}} each",
+        "loadFailed": "Block usage couldn't be loaded."
+      },
+      "history": {
+        "title": "Closed block periods",
+        "empty": "No block period has closed yet.",
+        "included": "Included",
+        "carriedIn": "Carried in",
+        "used": "Used",
+        "over": "Over",
+        "carriedOut": "Carried out",
+        "loadMore": "Load more",
+        "invoiceRemoved": "Overage invoice removed — hours not billed"
+      }
+    },
+    "relatedNotice": {
+      "title_one": "This organization has {{count}} other contract",
+      "title_other": "This organization has {{count}} other contracts",
+      "overlapWarning": "Another contract here bills on the same schedule over overlapping dates. Activating both bills the customer for both.",
+      "sameCadence": "Same schedule, overlapping dates",
+      "perPeriod": "{{amount}} per period",
+      "estimateUnavailable": "Per-period estimate unavailable",
+      "deliverables_one": "{{count}} deliverable",
+      "deliverables_other": "{{count}} deliverables",
+      "signedAgreements_one": "{{count}} signed agreement",
+      "signedAgreements_other": "{{count}} signed agreements",
+      "activateConfirm": {
+        "title": "Activate alongside another contract?",
+        "message": "This organization already has a contract that bills on the same schedule over overlapping dates. Activating this one bills the customer for both.",
+        "confirm": "Activate anyway"
+      },
+      "adopt": {
+        "action": "Fold into this contract",
+        "title": "Fold “{{name}}” into this contract?",
+        "message": "Use this when “{{name}}” covers the same services as this contract, so the customer is not billed twice.",
+        "deliverables_one": "Its {{count}} deliverable moves here, with its history.",
+        "deliverables_other": "Its {{count}} deliverables move here, with their history.",
+        "agreements_one": "Its {{count}} signed agreement is re-linked to this contract.",
+        "agreements_other": "Its {{count}} signed agreements are re-linked to this contract.",
+        "noLines": "Its lines are not copied. This contract's lines and prices stay as they are.",
+        "deleted": "“{{name}}” is then deleted. This cannot be undone.",
+        "confirm": "Fold in and delete draft",
+        "success": "“{{name}}” was folded into this contract",
+        "error": "Could not fold the draft into this contract",
+        "collision": "These deliverable names already exist on this contract: {{names}}. Rename or remove them on one side, then try again."
+      }
     }
   },
   "agreements": {
@@ -613,7 +712,24 @@
       "viewContract": "View contract",
       "notLinked": "Not linked",
       "rowSubtitle": "Accepted with quote {{quoteNumber}} by {{signer}} on {{date}}",
-      "rowSubtitleNoQuote": "Signed by {{signer}} on {{date}}"
+      "rowSubtitleNoQuote": "Signed by {{signer}} on {{date}}",
+      "evidenceUnavailable": "Accepted via quote — acceptance evidence unavailable",
+      "recordSigned": "Record signed agreement",
+      "source": {
+        "quote": "via quote {{number}}",
+        "recorded": "recorded by MSP — {{method}}"
+      },
+      "fileType": {
+        "image": "scanned copy"
+      },
+      "sendForSignature": "Send for signature",
+      "filter": {
+        "pending": "Awaiting signature",
+        "signed": "Signed",
+        "closed": "Declined / voided / expired"
+      },
+      "downloadOriginal": "Original",
+      "certifiedUnavailable": "The certified copy couldn’t be produced for this agreement — the original file was downloaded instead."
     },
     "templateEditor": {
       "usage": "Used on {{quotes}} quotes · {{signed}} signed agreements",
@@ -627,7 +743,151 @@
       }
     },
     "contractPill": {
-      "under": "Under {{template}} v{{n}}"
+      "under": "Under {{template}} v{{n}}",
+      "fromQuote": "From quote {{number}}"
+    },
+    "recordSigned": {
+      "title": "Record signed agreement",
+      "organization": "Organization",
+      "organizationPlaceholder": "Select an organization",
+      "orgFallback": "this organization",
+      "template": "Agreement template",
+      "templatePlaceholder": "Select an agreement template",
+      "templatesError": "Couldn't load agreement templates.",
+      "orgsError": "Couldn't load organizations.",
+      "contractError": "Couldn't load this contract.",
+      "contractsError": "Couldn't load this organization's contracts. You can still record the agreement and link it to a contract later.",
+      "contract": "Contract (optional)",
+      "contractNone": "Not linked to a contract",
+      "method": "How it was agreed",
+      "reference": "Reference",
+      "referenceHelp": "Where a reviewer would find the signed agreement — a PO number, an email and date, or a ticket.",
+      "signerName": "Who agreed",
+      "signerEmail": "Their email (optional)",
+      "signedAt": "Date signed",
+      "file": "Signed copy (optional)",
+      "fileHelp": "PDF, PNG or JPEG, up to 10 MB. With a signed copy attached, that file is what gets filed.",
+      "fileTooLarge": "That file is larger than 10 MB.",
+      "fileWrongType": "Attach a PDF, PNG or JPEG file.",
+      "variables": "Agreement details",
+      "unresolved": "Provide a value for: {{names}}",
+      "consequence": "This files a signed agreement for {{org}}. It cannot be deleted afterwards.",
+      "submit": "Record signed agreement",
+      "success": "Signed agreement recorded.",
+      "error": "Couldn't record the signed agreement."
+    },
+    "requests": {
+      "columns": {
+        "template": "Template",
+        "organization": "Organization",
+        "recipients": "Recipients",
+        "sent": "Sent",
+        "expires": "Expires",
+        "status": "Status"
+      },
+      "status": {
+        "draft": "Draft",
+        "sent": "Awaiting signature",
+        "viewed": "Viewed",
+        "signed": "Signed",
+        "declined": "Declined",
+        "voided": "Voided",
+        "expired": "Expired"
+      },
+      "empty": {
+        "pending": {
+          "title": "Nothing awaiting signature",
+          "description": "Agreements you send for signature appear here until the customer signs."
+        },
+        "closed": {
+          "title": "No declined, voided or expired requests",
+          "description": "Requests that were declined, voided or ran past their expiry show up here."
+        }
+      },
+      "loadError": "Couldn’t load agreement requests.",
+      "recipientsMore": "+{{count}} more",
+      "notSent": "Not sent",
+      "declinedReason": "Declined: {{reason}}",
+      "voidedReason": "Voided: {{reason}}",
+      "copyLink": {
+        "label": "Copy link",
+        "success": "Signing link copied",
+        "error": "Couldn’t copy the signing link.",
+        "clipboardError": "Couldn’t copy to the clipboard. Signing link: {{link}}"
+      },
+      "void": {
+        "label": "Void",
+        "title": "Void this agreement request?",
+        "description": "The signing link stops working and the recipients can no longer sign this agreement.",
+        "reasonLabel": "Reason (optional)",
+        "confirm": "Void request",
+        "confirming": "Voiding…",
+        "success": "Agreement request voided.",
+        "error": "Couldn’t void the agreement request."
+      },
+      "deleteDraft": {
+        "label": "Delete draft",
+        "success": "Draft deleted.",
+        "error": "Couldn’t delete the draft."
+      },
+      "remind": {
+        "label": "Remind",
+        "success_one": "Reminder sent to {{count}} recipient",
+        "success_other": "Reminder sent to {{count}} recipients",
+        "error": "Couldn’t send the reminder.",
+        "notEmailed": {
+          "no_email_service": "Reminder recorded, but email isn’t configured. Copy the signing link and share it.",
+          "no_recipients": "Reminder recorded, but there were no recipients to email. Copy the signing link and share it.",
+          "send_failed": "Reminder recorded, but the email failed to deliver. Copy the signing link and share it."
+        }
+      },
+      "remindedCount_one": "Reminded {{count}} time",
+      "remindedCount_other": "Reminded {{count}} times"
+    },
+    "send": {
+      "title": "Send for signature",
+      "contract": "File against contract (optional)",
+      "contractsError": "Couldn’t load this organization’s contracts. You can still send the agreement and link it to a contract later.",
+      "recipients": "Recipients",
+      "recipientsHelp": "Email addresses, separated by commas or new lines. Prefilled from the organization’s billing contact.",
+      "recipientsRequired": "Add at least one recipient email.",
+      "recipientsInvalid": "These don’t look like email addresses: {{emails}}",
+      "recipientsTooMany": "At most 50 recipients.",
+      "cover": "Cover message (optional)",
+      "expiry": "Link expires on",
+      "expiryPast": "Choose an expiry date in the future.",
+      "expiryDefaultHint_one": "Default: {{count}} day, from Billing settings → Agreements.",
+      "expiryDefaultHint_other": "Default: {{count}} days, from Billing settings → Agreements.",
+      "autoReminderHint_one": "Automatic reminders go out every day, up to {{max}} in total.",
+      "autoReminderHint_other": "Automatic reminders go out every {{count}} days, up to {{max}} in total.",
+      "expiryDefaultUnavailable": "Couldn't load your default expiry from Billing settings, so the built-in default is shown.",
+      "label": "Label (optional)",
+      "createDraft": "Create draft & preview",
+      "creating": "Creating…",
+      "preview": {
+        "title": "Preview",
+        "loading": "Loading preview…",
+        "error": "Couldn’t load the preview.",
+        "uploaded": "This template is an uploaded document. The uploaded file is what the customer signs."
+      },
+      "unresolved": {
+        "title": "Fill in the missing values before sending"
+      },
+      "updatePreview": "Update preview",
+      "updating": "Updating…",
+      "submit": "Send",
+      "sending": "Sending…",
+      "createError": "Couldn’t create the draft.",
+      "updateError": "Couldn’t update the agreement.",
+      "sendError": "Couldn’t send the agreement.",
+      "discardError": "Couldn’t discard the draft — it is still listed under Awaiting signature, where you can delete it.",
+      "sent_one": "Agreement sent to {{count}} recipient",
+      "sent_other": "Agreement sent to {{count}} recipients",
+      "notEmailed": {
+        "no_email_service": "Sent, but email isn’t configured. Copy the signing link from Awaiting signature and share it.",
+        "no_recipients": "Sent, but there were no recipients to email. Copy the signing link from Awaiting signature and share it.",
+        "send_failed": "Sent, but the email failed to deliver. Copy the signing link from Awaiting signature and share it."
+      }
     }
   },
   "quotes": {
@@ -866,7 +1126,9 @@
         "uploadImage": "Could not upload the image.",
         "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line.",
         "sectionAddedListStale": "Section added, but the list could not refresh. Reload the page to see it.",
-        "lineAddedListStale": "Line added, but the list could not refresh. Reload the page to see it."
+        "lineAddedListStale": "Line added, but the list could not refresh. Reload the page to see it.",
+        "saveExpiry": "Could not save the expiry date.",
+        "saveIntroNotes": "Could not save the intro notes."
       },
       "image": {
         "alt": "Quote image",
@@ -1001,8 +1263,8 @@
         "title": "Footer line (every page)",
         "helper": "One short line printed at the bottom of every page — e.g. validity dates. Leave blank to use the default footer. Put fine print in Terms & Conditions, not here.",
         "placeholder": "Blank = use the default footer",
-        "inheritedPartner": "Using the partner invoice footer from Settings: “{{text}}”",
-        "inheritedBrand": "Using the brand kit footer text: “{{text}}”",
+        "inheritedPartner": "Using the partner document footer from Billing settings: “{{text}}”",
+        "inheritedBrand": "Using this organization's footer text from its Portal settings: “{{text}}”",
         "inheritedNone": "No default footer is set in Settings — the page footer will be empty.",
         "counter": "{{count}} / {{max}}"
       },
@@ -1034,6 +1296,7 @@
         "noPublishedVersion": "This template has no published version yet. Publish it before adding it to a quote.",
         "pinnedVersion": "Pinned to v{{version}}",
         "autoVariablesTitle": "Filled automatically from the quote",
+        "autoValueBlank": "Blank",
         "autoHint": "These values resolve from the quote when the proposal is sent.",
         "manualVariablesTitle": "Fill in for this proposal",
         "labelFieldLabel": "Section label",
@@ -1090,6 +1353,14 @@
       },
       "warnings": {
         "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Rich text supports headings, bold, italic, underline, lists and links."
+      },
+      "intro": {
+        "expiryLabel": "Valid until",
+        "expiryHelper": "Printed on the proposal. The customer can accept through the end of this day. Leave blank for no expiry.",
+        "expiryPast": "This date has passed — the customer cannot accept an expired proposal.",
+        "notesLabel": "Intro notes",
+        "notesHelper": "Printed above the first section of the proposal.",
+        "notesPlaceholder": "A short note to the customer, e.g. what this proposal covers."
       }
     },
     "actions": {
@@ -1214,8 +1485,10 @@
         "signerNameLabel": "Who agreed",
         "signerEmailLabel": "Their email (optional)",
         "consequenceInvoice": "An invoice for {{amount}} will be issued and numbered now.",
+        "consequenceInvoiceDraft": "A draft invoice will be created. It is not issued or numbered yet.",
         "consequenceContracts": "Recurring lines become draft contracts you activate later.",
         "consequenceEmail": "The invoice will be emailed to {{recipients}}.",
+        "consequenceEmailNotConfigured": "No email service is configured; the invoice will not be emailed. Share it from the invoice page.",
         "consequenceDraft": "This quote was never sent. The customer's first sight of it will be the invoice.",
         "submit": "Accept and issue invoice",
         "success": "Quote accepted. Invoice {{number}} issued.",
@@ -1230,7 +1503,15 @@
         "evidenceAttached": "Evidence attached.",
         "evidenceError": "The acceptance was recorded, but the evidence file could not be attached. Attach it from the quote page.",
         "consequenceEmailNoRecipient": "No recipient is recorded on this quote, so the invoice may not be emailed. Send it to the customer yourself if needed.",
-        "successNoRecipient": "Quote accepted. Invoice {{number}} issued. It may not have been emailed — no recipient is recorded on this quote."
+        "successNoRecipient": "Quote accepted. Invoice {{number}} issued. It may not have been emailed — no recipient is recorded on this quote.",
+        "successNoEmailService": "Quote accepted. Invoice {{number}} issued. It was not emailed — no email service is configured. Share it from the invoice page.",
+        "overlap": {
+          "title": "This organization already has a contract on the same schedule",
+          "body": "The acceptance created a new draft contract. Activating it as well as the existing one bills the customer for both. Review both before activating either.",
+          "newContract": "New draft from this quote",
+          "existingContract": "Existing contract",
+          "done": "Done"
+        }
       },
       "declineOnBehalf": {
         "button": "Decline on behalf",
@@ -1440,76 +1721,24 @@
     },
     "document": {
       "deviceSet": {
-        "badge": "Est.",
-        "estimate": "Estimated quantity — billed at the actual number of {{set}} each billing period.",
         "setDevices": "devices",
         "setSeats": "seats",
-        "setGroup": "devices in “{{name}}”",
-        "atSite": "{{set}} at {{site}}",
-        "allowanceBill": "Includes {{included}}; additional units billed at {{price}} each.",
-        "allowanceFlag": "Includes {{included}}; additional units are reported for review, not billed automatically."
+        "setGroup": "devices in “{{name}}”"
       },
       "additionalItems": "Additional items",
       "contract": {
-        "download": "Download agreement",
-        "previewTitle": "{{name}} agreement",
         "unavailable": "Agreement file unavailable",
         "versionFooter": "{{name}} — v{{version}}"
       },
-      "agreements": {
-        "heading": "Agreements",
-        "termsTitle": "Terms & Conditions",
-        "read": "Read",
-        "hide": "Hide",
-        "readTime": "~{{minutes}} min read",
-        "sectionsReadTime_one": "{{count}} section · ~{{minutes}} min read",
-        "sectionsReadTime_other": "{{count}} sections · ~{{minutes}} min read",
-        "pdfDocument": "PDF document",
-        "unavailable": "Unavailable",
-        "untitled": "Agreement"
-      },
-      "draft": "Draft",
-      "empty": "This proposal doesn’t have any content yet.",
-      "imageUnavailable": "Image unavailable",
-      "issued": "Issued",
-      "preparedFor": "Prepared for",
-      "taxId": "Tax ID: {{id}}",
-      "imageZoomAria": "View larger image",
       "preview": {
         "description": "This is what your customer sees on their proposal link.",
         "downloadPdf": "Download PDF",
-        "preparing": "Preparing…"
-      },
-      "pricing": "Pricing",
-      "pricingScrollAria": "Pricing — scroll sideways for more columns",
-      "proposal": "Proposal",
-      "proposalImageAlt": "Proposal image",
-      "recurrence": {
-        "annual": "Annual",
-        "monthly": "Monthly"
-      },
-      "table": {
-        "amount": "Amount",
-        "description": "Description",
-        "qty": "Qty",
-        "tax": "Tax",
-        "unitPrice": "Unit price"
-      },
-      "totals": {
-        "annualRecurring": "Annual recurring",
-        "depositDue": "Deposit due",
-        "depositDueNow": "Deposit due now",
-        "dueOnAcceptance": "Due on acceptance",
-        "firstPeriodSubtotal": "First period subtotal",
-        "firstPeriodTotal": "First-period total",
-        "monthlyRecurring": "Monthly recurring",
-        "recurringNote": "Accepting this proposal bills the one-time charges now. Recurring lines bill on their own schedule.",
-        "remainingBalance": "Remaining balance (due per terms)",
-        "subtotal": "Subtotal",
-        "tax": "Tax"
-      },
-      "unsupportedBlock": "This block type isn't supported by this viewer yet.",
-      "validUntil": "Valid until"
+        "preparing": "Preparing…",
+        "loading": "Loading the customer view…",
+        "loadError": "Could not load the customer view of this proposal.",
+        "retry": "Try again",
+        "signatureInert": "Your customer signs here"
+      }
     },
     "page": {
       "accessDenied": "You don't have permission to view quotes.",
@@ -1714,7 +1943,8 @@
       "saveNotes": "Could not save notes.",
       "saveTerms": "Could not save terms.",
       "updateLine": "Could not update line.",
-      "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line."
+      "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line.",
+      "saveLineDetail": "Couldn't update how time entries print"
     },
     "fields": {
       "descriptionOptional": "Description (optional)",
@@ -1781,6 +2011,35 @@
     "linesScrollAria": "Invoice lines — scroll sideways for more columns",
     "unsavedField": {
       "lines": "Line items"
+    },
+    "lineDetail": {
+      "default": "Billing default",
+      "grouping": "Layout",
+      "groupingDay": "Group by day",
+      "groupingEntry": "One row per entry",
+      "help": "Overrides your billing default for this draft only.",
+      "hide": "Hide",
+      "show": "Show",
+      "showDate": "Date worked",
+      "showNote": "Technician's note",
+      "showWorkedTime": "Worked vs billed time",
+      "title": "Time entry lines"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} lines will block Issue: their time entries were billed on another invoice. Remove them before issuing:",
+      "billedElsewhere_one": "{{count}} line will block Issue: its time entry was billed on another invoice. Remove it before issuing:",
+      "billedElsewhere_other": "{{count}} lines will block Issue: their time entries were billed on another invoice. Remove them before issuing:",
+      "button": "Refresh from time entries",
+      "drifted": "{{count}} lines left unchanged: their time entries' billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "drifted_one": "{{count}} line left unchanged: its time entry's billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "drifted_other": "{{count}} lines left unchanged: their time entries' billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "error": "Couldn't refresh from time entries",
+      "help": "Updates notes, dates worked and approval from the source time entries. Quantities, prices and descriptions you edited by hand never change.",
+      "running": "Refreshing…",
+      "skipped": "{{count}} lines skipped: their time entries were billed elsewhere, removed, or are no longer billable on this draft.",
+      "skipped_one": "{{count}} line skipped: its time entry was billed elsewhere, removed, or is no longer billable on this draft.",
+      "skipped_other": "{{count}} lines skipped: their time entries were billed elsewhere, removed, or are no longer billable on this draft.",
+      "summary": "Refreshed: {{refreshed}} · Already current: {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -1847,6 +2106,7 @@
       "title": "Send this invoice?",
       "message": "This emails the invoice to {{customer}} for {{amount}}."
     },
+    "sourceHeldForHourBlock": "Some time on this draft is held for this organization's block hours and will be billed when the block period closes. Remove those lines, then Issue.",
     "unsavedHint": "“{{field}}” has an unsaved change — Issue unlocks once it saves.",
     "unsavedTitle": "“{{field}}” has an unsaved change — Issue unlocks once it saves."
   },
@@ -1963,7 +2223,10 @@
       "syncingToProvider": "Syncing…",
       "providerSyncFailed": "{{provider}} sync failed",
       "reverseInProviderToo": "Reverse this in {{provider}} too",
-      "overpayment": "Amount is more than the balance due ({{balance}})."
+      "overpayment": "Amount is more than the balance due ({{balance}}).",
+      "fillLabel": "Fill amount",
+      "fillDeposit": "Deposit ({{amount}})",
+      "fillBalance": "Full balance ({{amount}})"
     },
     "requestPayment": {
       "invoiceSent": "Invoice sent",
@@ -1978,7 +2241,8 @@
       "paid": "Paid",
       "subtotal": "Subtotal",
       "tax": "Tax",
-      "total": "Total"
+      "total": "Total",
+      "depositDueNow": "Deposit due now"
     },
     "terms": "Terms & Conditions",
     "void": {
@@ -2022,35 +2286,16 @@
     }
   },
   "invoiceDocument": {
-    "billTo": "Bill to",
-    "documentType": "Invoice",
-    "due": "Due",
-    "empty": "This invoice doesn’t have any line items yet.",
-    "fallbackTitle": "Invoice",
-    "issued": "Issued",
     "preview": {
       "description": "This is what your customer sees on their invoice.",
       "downloadError": "Could not download the invoice PDF.",
       "downloadPdf": "Download PDF",
-      "preparing": "Preparing…"
+      "loadError": "Could not load the customer view of this invoice.",
+      "loading": "Loading the customer view…",
+      "preparing": "Preparing…",
+      "retry": "Try again"
     },
-    "table": {
-      "amount": "Amount",
-      "description": "Description",
-      "qty": "Qty",
-      "tax": "Tax",
-      "unitPrice": "Unit price"
-    },
-    "terms": "Terms & Conditions",
-    "ticketHeader": "Ticket #{{number}}",
-    "ticketWork": "Ticket work",
-    "totals": {
-      "amountDue": "Amount due",
-      "paid": "Paid",
-      "subtotal": "Subtotal",
-      "tax": "Tax",
-      "total": "Total"
-    }
+    "ticketHeader": "Ticket #{{number}}"
   },
   "invoiceWorkspace": {
     "backLabel": "Invoices",
@@ -2124,7 +2369,9 @@
       "sourceAria": "Invoice source",
       "title": "New invoice",
       "to": "To",
-      "working": "Working…"
+      "working": "Working…",
+      "heldForHourBlock_one": "{{count}} time entry ({{hours}} hours) is held for this organization's block hours and will be billed when the block period closes.",
+      "heldForHourBlock_other": "{{count}} time entries ({{hours}} hours) are held for this organization's block hours and will be billed when the block period closes."
     },
     "empty": {
       "description": "Assemble unbilled time and parts into a draft, or start a blank invoice.",
@@ -2191,6 +2438,7 @@
       "title": "Currency",
       "description": "New quotes, invoices, contracts, time entries and parts for this organization are stamped with this currency. Nothing that already exists is changed.",
       "label": "Billing currency",
+      "partnerDefault": "Not inherited: each organization keeps its own billing currency. The partner default ({{currency}}) only applies to organizations created from now on.",
       "loading": "Checking what a change to {{currency}} would affect…",
       "error": "The currency change summary could not be loaded.",
       "panelTitle": "Change the billing currency to {{currency}}?",
@@ -2246,6 +2494,21 @@
     }
   },
   "partnerBillingSettings": {
+    "agreements": {
+      "title": "Agreements",
+      "description": "Defaults for agreements you send for signature. Senders can still pick a different expiry on each request.",
+      "expiryDays": "Default link expiry (days)",
+      "expiryDaysHelp": "A new agreement request's signing link expires this many days after it is created, unless the sender picks another date.",
+      "expiryDaysInvalid": "Enter a whole number of days from {{min}} to {{max}}.",
+      "remindersEnabled": "Send automatic reminders",
+      "remindersHelp": "Emails the same signing link to the recipients again until the agreement is signed, declined, voided or expires.",
+      "intervalDays": "Remind every (days)",
+      "intervalDaysInvalid": "Enter a whole number of days from {{min}} to {{max}}.",
+      "maxReminders": "Stop after (reminders)",
+      "maxRemindersHelp": "Counts every reminder on the request, manual or automatic.",
+      "maxRemindersInvalid": "Enter a whole number from {{min}} to {{max}}.",
+      "readOnlyNoSend": "Changing agreement defaults requires permission to send agreements. You have view-only access."
+    },
     "company": {
       "addressInherited": "Same as company details",
       "addressLine1": "Address line 1",
@@ -2275,10 +2538,11 @@
       "autoEmailInvoiceHelp": "When a customer accepts a proposal, the issued invoice is emailed right away with a secure view & pay link — no sign-in needed.",
       "notifyOnBehalfAcceptance": "Email the customer when you record an acceptance on their behalf",
       "notifyOnBehalfAcceptanceHelp": "When someone on your team accepts a quote for a customer, the customer gets a short note saying who recorded it and when, with the invoice number if one was issued. They can reply if it's wrong. Off by default.",
-      "currencyCode": "Currency code",
+      "currencyCode": "Default currency for new organizations",
+      "currencyHelp": "New organizations start in this currency. Existing organizations keep their own — change one on that organization's Billing tab.",
       "defaultMarkup": "Default markup (%)",
       "defaultTaxRate": "Default tax rate (%)",
-      "description": "Currency, tax, numbering, and terms applied to new quotes and invoices across your customers.",
+      "description": "Defaults for quotes and invoices across your customers. An organization can override its own tax rate and payment terms. Its currency starts from the default currency here and is changed on that organization's Billing tab.",
       "deviceAppendix": "Include billed devices appendix on invoice PDFs",
       "deviceAppendixHelp": "Adds a page listing every device counted on each invoice line. Off by default; the choice is frozen when an invoice is issued.",
       "documentPageSize": "Page size",
@@ -2287,7 +2551,8 @@
       "documentTheme": "Document fonts",
       "documentThemeClassic": "Helvetica",
       "documentThemeCondensed": "Barlow Condensed + DM Sans",
-      "invoiceFooter": "Invoice footer",
+      "invoiceFooter": "Document footer",
+      "invoiceFooterHelp": "Printed at the bottom of every quote and invoice page. An organization's own footer text (its Portal settings) replaces this for that organization, and a quote's own footer line replaces both.",
       "invoiceFooterPlaceholder": "Payment instructions, thank-you note, etc.",
       "invoiceNumberPrefix": "Invoice number prefix",
       "markupHelp": "Default markup over distributor cost, used to pre-fill the sell price when importing catalog items. The resulting gross margin is shown as you import.",
@@ -2295,7 +2560,15 @@
       "prefixInvalid": "Enter a prefix of 1 to 12 characters.",
       "taxRateInvalid": "Enter a tax rate from 0 to 100.",
       "termsDaysInvalid": "Enter a whole number of days from 0 to 365.",
-      "title": "Billing defaults"
+      "title": "Billing defaults",
+      "lineDetailTitle": "Time entry lines on invoices",
+      "lineDetailHelp": "Choose what customers see for time entries. A draft invoice can override this; the choice is frozen when the invoice is issued.",
+      "lineShowDate": "Show the date worked",
+      "lineShowNote": "Show the technician's note",
+      "lineShowWorkedTime": "Show worked vs billed time",
+      "lineGrouping": "Layout",
+      "lineGroupingEntry": "One row per entry",
+      "lineGroupingDay": "Group by day"
     },
     "loadError": "Billing settings failed to load.",
     "loading": "Loading billing settings…",
@@ -2322,6 +2595,7 @@
   "partnerBillingSettingsTabs": {
     "defaults": "Defaults",
     "documents": "Documents",
+    "agreements": "Agreements",
     "connections": "Connections",
     "rates": "Rates",
     "payments": "Payments"
@@ -2398,7 +2672,7 @@
     "ai": {
       "column": "AI usage",
       "sectionTitle": "AI usage",
-      "sectionHelp": "How AI assistant usage by organizations on this billing profile is charged. Bill Breeze's cost plus a markup, or set a price per model.",
+      "sectionHelp": "How Breeze AI usage by organizations on this billing profile is charged. Bill Breeze's cost plus a markup, or set a price per model.",
       "coverage": "AI usage billing",
       "coverageBillable": "Billable",
       "coverageIncluded": "Included",
@@ -2554,7 +2828,6 @@
       "delivery_failed": "Notice delivery failed",
       "consent_required": "Payment authorization is missing. Request updated authorization."
     },
-    "noticeTemplate": "Invoice with automatic payment notice",
     "chargeFailed": "Could not start payment. Please try again.",
     "chargeResultUnknown": "We could not confirm what happened to this payment. Refreshing the invoice to show its current status.",
     "chargeStarted": "Payment attempt started",
@@ -2662,6 +2935,10 @@
       "confirm": "Confirm",
       "failed": "Verification failed. Try again.",
       "unavailable": "Unable to start verification"
+    },
+    "notEnabled": {
+      "title": "Automatic payments aren't enabled for your account",
+      "hint": "Automatic payments haven't been turned on yet. Ask your Breeze administrator to enable them, then come back to request enrollment from your clients."
     }
   },
   "reminders": {
@@ -2690,10 +2967,6 @@
     "saveFailed": "Could not save reminder settings",
     "loadFailed": "Could not load reminder settings",
     "retry": "Retry",
-    "loading": "Loading payment settings…",
-    "templates": {
-      "paymentReminder": "Payment reminder",
-      "paymentOverdue": "Overdue payment reminder"
-    }
+    "loading": "Loading payment settings…"
   }
 }

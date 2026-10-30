@@ -10,6 +10,7 @@ import {
   Contact,
   Copy,
   Check,
+  Cloud,
   CreditCard,
   Fingerprint,
   Globe,
@@ -33,8 +34,10 @@ import OrgDefaultsEditor from './OrgDefaultsEditor';
 import type { PinnableVersions, AgentVersionPinsValue } from './AgentVersionPinSelectors';
 import OrgNotificationSettings from './OrgNotificationSettings';
 import OrgSecuritySettings from './OrgSecuritySettings';
+import { CallerVerificationPolicyForm } from '../callerVerification/CallerVerificationPolicyForm';
 import OrgAiProcessingToggle from './OrgAiProcessingToggle';
 import OrgMlFeaturesCard from './OrgMlFeaturesCard';
+import OrgAiDataPolicyCard from './OrgAiDataPolicyCard';
 import { OrgApprovalSecurityTab } from './OrgApprovalSecurityTab';
 import OrgEventLogSettings from './OrgEventLogSettings';
 import OrgModelDefaultsCard from './aiModels/OrgModelDefaultsCard';
@@ -44,7 +47,7 @@ import type { AiApprovalSettings, ResolvedAiApprovalTimeout } from '@breeze/shar
 import OrgAuditRetentionSettings from './OrgAuditRetentionSettings';
 import OrgRemoteAccessSettings from './OrgRemoteAccessSettings';
 import { useOrgStore } from '../../stores/orgStore';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, waitForPendingRefresh } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { runAction, ActionError } from '@/lib/runAction';
 import { formatDate, formatTime as formatUserTime } from '@/lib/dateTimeFormat';
@@ -57,7 +60,7 @@ import { usePageItemName } from '../layout/usePageItemName';
 type TabKey =
   | 'general' | 'contacts' | 'branding' | 'portal' | 'notifications' | 'security'
   | 'approval-security' | 'ai' | 'event-logs' | 'audit-retention' | 'remote-access' | 'ticketing' | 'contracts' | 'billing' | 'pax8'
-  | 'extensions';
+  | 'extensions' | 'cloud-tenants';
 
 // Grouped sidebar definition — same anatomy as PartnerSettingsPage (shared
 // SettingsSectionNav). Hashes are the section keys (already kebab-case).
@@ -74,6 +77,10 @@ const TAB_GROUPS: (Omit<SettingsNavGroup, 'items'> & { items: (SettingsNavGroup[
       // landing on General with a silently-ignored hash.
       { key: 'billing', hash: 'billing', label: 'orgSettingsPage.nav.billing', description: 'orgSettingsPage.nav.billingDescription', icon: CreditCard },
       { key: 'pax8', hash: 'pax8', label: 'orgSettingsPage.nav.pax8', description: 'orgSettingsPage.nav.pax8Description', icon: PackageOpen },
+      // Navigation only (#9318): no settings live here. Activating it switches
+      // the workspace to this org and opens /integrations#cloud-tenants — see
+      // the redirect effect below (same hand-off shape as contacts).
+      { key: 'cloud-tenants', hash: 'cloud-tenants', label: 'orgSettingsPage.nav.cloudTenants', description: 'orgSettingsPage.nav.cloudTenantsDescription', icon: Cloud },
       { key: 'extensions', hash: 'extensions', label: 'orgSettingsPage.nav.extensions', description: 'orgSettingsPage.nav.extensionsDescription', icon: Puzzle },
     ],
   },
@@ -149,22 +156,21 @@ type OrgDetails = {
   settings?: {
     branding?: {
       logoUrl?: string;
-      primaryColor?: string;
       secondaryColor?: string;
       theme?: 'light' | 'dark' | 'system';
-      // customCss deliberately absent (#5952) — it now lives in
-      // portal_branding, loaded/saved by OrgBrandingEditor via
-      // /orgs/organizations/:id/portal-settings, not here.
+      // customCss (#5952) and primaryColor (#9962) deliberately absent — they
+      // live in portal_branding, loaded/saved by OrgBrandingEditor via
+      // /orgs/organizations/:id/portal-settings, not here. A legacy stored
+      // branding.primaryColor is dropped on the next Branding save, which
+      // replaces the whole category.
       portalSubdomain?: string;
     };
     defaults?: {
       policyDefaults?: Record<string, string>;
       deviceGroup?: string;
-      alertThreshold?: string;
       autoEnrollment?: {
         enabled: boolean;
         requireApproval: boolean;
-        sendWelcome: boolean;
       };
       agentUpdatePolicy?: string;
       maintenanceWindow?: string;
@@ -351,6 +357,18 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
       void navigateTo(`/organizations/${effectiveOrgId}#billing`, { replace: true });
     } else if (activeTab === 'contacts') {
       void navigateTo(`/organizations/${effectiveOrgId}#contacts`, { replace: true });
+    } else if (activeTab === 'cloud-tenants') {
+      // The Integrations page configures the WORKSPACE org, so select this
+      // org first or the connection would land on whichever customer the
+      // header switcher happens to point at.
+      const store = useOrgStore.getState();
+      store.selectOrganization(effectiveOrgId);
+      store.recordRecentOrg(effectiveOrgId);
+      // Wait out an in-flight /auth/refresh before leaving (same guard
+      // applyOrgSwitch uses, #950), so the Integrations cards don't fetch under
+      // a stale session. applyOrgSwitch itself can't be used: its navigation is
+      // a push, which would leave a Back-button trap onto this redirecting tab.
+      void waitForPendingRefresh().then(() => navigateTo('/integrations#cloud-tenants', { replace: true }));
     }
   }, [activeTab, effectiveOrgId]);
 
@@ -496,6 +514,11 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         successMessage: t('orgSettingsPage.toasts.nameSaved'),
         errorFallback: t('orgSettingsPage.errors.saveName')
       });
+      // Header org switcher reads the global store; refresh so it shows the new name (#8371).
+      useOrgStore
+        .getState()
+        .fetchOrganizations()
+        .catch((storeErr: unknown) => console.warn('[OrgSettingsPage] org store refresh failed after rename', storeErr));
       await fetchOrgDetails();
     } catch (err) {
       // runAction already toasts non-401 ActionErrors; only surface unexpected errors.
@@ -670,6 +693,11 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                 onSaved={() => void fetchOrgDetails()}
               />
             </div>
+            {/* Caller verification (#6354): tighten-only override of the
+                partner baseline; self-saving, hidden unless the flag is on. */}
+            <div className="mt-4">
+              <CallerVerificationPolicyForm owner={{ ownerScope: 'organization', orgId: effectiveOrgId }} />
+            </div>
           </>
         );
       case 'approval-security':
@@ -701,6 +729,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
               settings={(orgDetails?.settings ?? {}) as Record<string, unknown>}
               onSaved={() => void fetchOrgDetails()}
             />
+            <OrgAiDataPolicyCard orgId={effectiveOrgId} />
           </>
         );
       case 'event-logs':
@@ -886,6 +915,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
             </section>
             <OrgDefaultsEditor
               organizationName={displayOrg.name}
+              organizationId={effectiveOrgId ?? undefined}
               defaults={orgDetails?.settings?.defaults}
               onDirty={handleDirty}
               // The editor now emits the shared `InheritableDefaultSettings`
@@ -904,7 +934,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
   };
 
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-6">
+    <div className="flex flex-col gap-6">
       {propOrgId && (
         <>
           <nav className="mb-1 flex items-center gap-1 text-xs text-muted-foreground">
@@ -922,7 +952,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
       )}
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">{t('orgSettingsPage.title')}</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t('orgSettingsPage.title')}</h1>
           <p className="text-sm text-muted-foreground">
             {t('orgSettingsPage.description', { organization: displayOrg.name })}
           </p>
@@ -1004,6 +1034,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
           activeKey={activeTab}
           onNavigate={key => switchTab(key as TabKey)}
           selectId="org-settings-section"
+          testIdPrefix="org-settings"
         />
 
         <div className="min-w-0 space-y-6">{renderContent()}</div>

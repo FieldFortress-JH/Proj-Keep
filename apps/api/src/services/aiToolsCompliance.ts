@@ -18,7 +18,8 @@ import {
   automationPolicyCompliance,
 } from '../db/schema';
 import { eq, and, desc, sql, inArray, SQL } from 'drizzle-orm';
-import { hasSatisfiedMfa, isAiAgentPrincipal, type AuthContext } from '../middleware/auth';
+import { hasSatisfiedMfa, type AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import type { AiTool } from './aiTools';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
 import { bumpApprovalGeneration } from './approvalGeneration';
@@ -31,13 +32,16 @@ import {
 } from './softwarePolicyExecutableRulesAuthorization';
 import { scheduleSoftwareComplianceCheck } from '../jobs/softwareComplianceWorker';
 import { scheduleSoftwareRemediation } from '../jobs/softwareRemediationWorker';
-import { evaluateSoftwarePolicyArming, normalizeSoftwarePolicyRules } from './softwarePolicyService';
+import { MAX_REMEDIATION_DEVICES } from './softwarePolicyRemediationPreview';
+import { cleanupSoftwarePolicyElevations, evaluateSoftwarePolicyArming, normalizeSoftwarePolicyRules } from './softwarePolicyService';
+import { willBeArmedForInstall } from './softwarePolicyAuthorization';
 import {
   auditSoftwarePolicyToolEvent,
   summarizeEnforcementChange,
   AI_AUTO_INSTALL_REFUSAL_MESSAGE,
   remediationOptionsArmsAutoInstall,
 } from './aiToolsSoftwarePolicyAudit';
+import { managedSoftwarePolicyRefusal } from './securityAgents/managedSoftwarePolicyGuard';
 import { canManagePartnerWidePolicies } from './partnerWideAccess';
 import { getPolicyWithOrgCheck } from '../routes/policyManagement/helpers';
 import {
@@ -84,12 +88,12 @@ async function assertAiCallerMayManageExecutableRules(
 ): Promise<string | null> {
   if (!willChangePamGovernedExecutableRules(stored, patch)) return null;
 
-  // An autonomous ai_agent run has no role and no pam.manage_policy grant of
+  // An autonomous ai_agent or flow run has no role and no pam.manage_policy grant of
   // its own; today it also fails the lookup below because its synthetic
   // principal id is never a row in organization_users, but that is
   // incidental to how getUserPermissions is implemented, not a guarantee.
   // Deny explicitly, matching requireOrgAccess / checkPermissionRequirements.
-  if (isAiAgentPrincipal(auth)) return EXECUTABLE_RULES_MANAGE_POLICY_DENIED_MESSAGE;
+  if (isAutomationPrincipal(auth)) return EXECUTABLE_RULES_MANAGE_POLICY_DENIED_MESSAGE;
 
   const perms = await getUserPermissions(auth.user.id, {
     partnerId: auth.partnerId || undefined,
@@ -115,6 +119,9 @@ export function registerComplianceTools(aiTools: Map<string, AiTool>): void {
   function registerTool(tool: AiTool): void {
     aiTools.set(tool.definition.name, tool);
   }
+
+/** Input keys a pure manage_software_policy deactivation may carry (W04 review). */
+const PURE_DEACTIVATION_KEYS: ReadonlySet<string> = new Set(['action', 'policyId', 'orgId', 'isActive']);
 
 // ============================================
 // get_software_compliance - Tier 1 (auto-execute)
@@ -417,6 +424,10 @@ registerTool({
         return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
       }
 
+      // #6960: a generated (security_agents) policy is owned by its config policy.
+      const managed = await managedSoftwarePolicyRefusal(existing);
+      if (managed) return JSON.stringify(managed);
+
       // #5480: this tool has no field to set rules.executable[] directly, but
       // it CAN switch `mode` on an existing policy that already carries
       // executable rules set earlier through the HTTP route — the same change
@@ -433,6 +444,30 @@ registerTool({
       // Contract-A D4: AI callers may never arm software installation.
       if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
         return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+      }
+
+      // QW10: gate the RESULTING (stored + input) state, as REST does. An update
+      // that omits remediationOptions would otherwise keep an install-armed
+      // policy armed while bumping approvalGeneration (re-approving it under
+      // the AI). Disarming is allowed, same as REST.
+      const resultingArmed = willBeArmedForInstall(existing, {
+        mode: typeof input.mode === 'string' ? input.mode : undefined,
+        enforceMode: typeof input.enforceMode === 'boolean' ? input.enforceMode : undefined,
+        remediationOptions: input.remediationOptions && typeof input.remediationOptions === 'object'
+          ? input.remediationOptions
+          : undefined,
+      });
+      // A PURE deactivation is protective — an inactive policy installs
+      // nothing — so the AI may switch an install-armed policy off (W04
+      // review). Only that: combined with any other field it could stage
+      // AI-authored rules or arming on an armed policy that a human's later
+      // re-activation would arm, so it is refused like any other update.
+      const pureDeactivation = existing.isActive === true && input.isActive === false
+        && Object.keys(input).every((key) => PURE_DEACTIVATION_KEYS.has(key));
+      if (resultingArmed && !pureDeactivation) {
+        return JSON.stringify({
+          error: 'This policy is armed for automatic install; the AI cannot change it. Edit it in the software policy page.',
+        });
       }
 
       const updates: Omit<Partial<typeof softwarePolicies.$inferInsert>, 'approvalGeneration'> & { approvalGeneration?: SQL } = {
@@ -464,11 +499,19 @@ registerTool({
         updates.rules = rules;
       }
 
-      const [updated] = await db
-        .update(softwarePolicies)
-        .set(updates)
-        .where(eq(softwarePolicies.id, existing.id))
-        .returning();
+      // Same transaction shape as REST PATCH: the write and the PAM elevation
+      // cleanup (W04-D15) commit or roll back together.
+      const [updated] = await db.transaction(async (tx) => {
+        const rows = await tx
+          .update(softwarePolicies)
+          .set(updates)
+          .where(eq(softwarePolicies.id, existing.id))
+          .returning();
+        if (existing.isActive && input.isActive === false) {
+          await cleanupSoftwarePolicyElevations(tx, existing.id);
+        }
+        return rows;
+      });
 
       let scheduleWarning: string | undefined;
       try {
@@ -524,6 +567,10 @@ registerTool({
         return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
       }
 
+      // #6960: a generated (security_agents) policy is owned by its config policy.
+      const managed = await managedSoftwarePolicyRefusal(existing);
+      if (managed) return JSON.stringify(managed);
+
       await db.transaction(async (tx) => {
         await tx
           .update(softwarePolicies)
@@ -535,6 +582,9 @@ registerTool({
             approvalGeneration: bumpApprovalGeneration(softwarePolicies.approvalGeneration),
           })
           .where(eq(softwarePolicies.id, existing.id));
+
+        // W04-D15: revoke elevations this policy minted, as REST DELETE does.
+        await cleanupSoftwarePolicyElevations(tx, existing.id);
 
         await tx
           .delete(softwareComplianceStatus)
@@ -594,6 +644,10 @@ registerTool({
     const [policy] = await db.select().from(softwarePolicies).where(and(...conditions)).limit(1);
     if (!policy) return JSON.stringify({ error: 'Policy not found or access denied' });
 
+    // #6960: never remediate a generated (security_agents) policy by hand.
+    const managed = await managedSoftwarePolicyRefusal(policy);
+    if (managed) return JSON.stringify(managed);
+
     // Arming gate (#3543, incident #3381). This tool used to refuse only
     // `mode === 'audit'`, so a detect-only policy — enforcement deliberately
     // left off by its owner — could still have fleet-wide uninstalls queued
@@ -628,6 +682,18 @@ registerTool({
     let deviceIds = Array.isArray(input.deviceIds)
       ? Array.from(new Set((input.deviceIds as string[]).filter((id) => typeof id === 'string' && id.length > 0)))
       : [];
+    let truncated = false;
+
+    // Mirror POST /software-policies/:id/remediate: an explicit list over the
+    // cap is refused (the route's zod .max()); the implicit set is truncated.
+    if (deviceIds.length > MAX_REMEDIATION_DEVICES) {
+      return JSON.stringify({
+        error: `Too many devices: remediation is limited to ${MAX_REMEDIATION_DEVICES} devices per request`,
+        policyId: policy.id,
+        requested: deviceIds.length,
+        maxDevices: MAX_REMEDIATION_DEVICES,
+      });
+    }
 
     if (deviceIds.length === 0) {
       const complianceConditions: SQL[] = [
@@ -665,13 +731,21 @@ registerTool({
       const remediationDeviceCondition = deviceScopeCondition(auth, softwareComplianceStatus.deviceId);
       if (remediationDeviceCondition) complianceConditions.push(remediationDeviceCondition);
 
+      // One row per device (a device can carry several violation rows), in a
+      // stable order, one past the cap so truncation is detectable: the model
+      // must be told when more violating devices remain (W04 review).
       const rows = await db
         .select({ deviceId: softwareComplianceStatus.deviceId })
         .from(softwareComplianceStatus)
         .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
-        .where(and(...complianceConditions));
+        .where(and(...complianceConditions))
+        .groupBy(softwareComplianceStatus.deviceId)
+        .orderBy(softwareComplianceStatus.deviceId)
+        .limit(MAX_REMEDIATION_DEVICES + 1);
 
-      deviceIds = Array.from(new Set(rows.map((row) => row.deviceId)));
+      const distinct = Array.from(new Set(rows.map((row) => row.deviceId)));
+      truncated = distinct.length > MAX_REMEDIATION_DEVICES;
+      deviceIds = distinct.slice(0, MAX_REMEDIATION_DEVICES);
     }
 
     if (deviceIds.length === 0) {
@@ -700,10 +774,14 @@ registerTool({
     });
 
     return JSON.stringify({
-      message: `Remediation scheduled for ${queued} device(s)`,
+      message: `Remediation scheduled for ${queued} device(s)`
+        + (truncated
+          ? `; more violating devices remain beyond the ${MAX_REMEDIATION_DEVICES}-device limit — run it again after this batch completes`
+          : ''),
       policyId: policy.id,
       queued,
       deviceIds,
+      ...(truncated ? { truncated: true, maxDevices: MAX_REMEDIATION_DEVICES } : {}),
     });
   },
 });

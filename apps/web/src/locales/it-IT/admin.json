@@ -121,7 +121,7 @@
     "orgConnectedAppsPage": {
       "title": "App connesse (a livello organizzazione)",
       "description": {
-        "prefix": "Assistenti AI e altri client MCP che gli utenti in",
+        "prefix": "Client AI che gli utenti in",
         "yourOrganization": "la tua organizzazione",
         "suffix": "hanno autorizzato. Blocca qualsiasi client per revocare immediatamente ogni concessione attiva."
       },
@@ -561,6 +561,61 @@
         "mfaRequired": "Attivare l'interruttore di emergenza IA richiede l'autenticazione a più fattori. Abilita l'MFA nelle impostazioni di sicurezza del tuo profilo, quindi riprova."
       }
     },
+    "wisp": {
+      "title": "Wisp",
+      "description": "Panoramica per partner delle autorizzazioni Wisp e dell'attività di oggi. Sola lettura.",
+      "refresh": "Aggiorna",
+      "retry": "Riprova",
+      "loading": "Caricamento...",
+      "empty": "Nessun partner ha ancora autorizzazioni Wisp",
+      "disabled": "Wisp non è abilitato in questa distribuzione (BREEZE_WISP_ENABLED).",
+      "errors": {
+        "load": "Impossibile caricare la panoramica di Wisp"
+      },
+      "platformAdmin": {
+        "title": "Solo per amministratori della piattaforma",
+        "description": "La panoramica di Wisp è disponibile per gli amministratori della piattaforma."
+      },
+      "table": {
+        "partner": "Partner",
+        "plan": "Piano",
+        "activeGrants": "Autorizzazioni attive",
+        "pausedGrants": "Autorizzazioni in pausa",
+        "assessmentsToday": "Controlli di oggi",
+        "specialistRequestsToday": "Richieste a specialisti di oggi",
+        "openConcerns": "Segnalazioni aperte",
+        "budgetExhaustedToday": "Autorizzazioni senza budget oggi"
+      },
+      "grants": {
+        "loading": "Caricamento autorizzazioni...",
+        "error": "Impossibile caricare le autorizzazioni",
+        "empty": "Questo partner non ha autorizzazioni",
+        "grantor": "Concedente",
+        "scope": "Ambito",
+        "status": "Stato",
+        "pausedReason": "Motivo della pausa",
+        "expires": "Scade",
+        "budget": "Budget (centesimi/giorno)",
+        "tickMinutes": "Intervallo (min)",
+        "assessmentsToday": "Controlli di oggi",
+        "partnerWide": "Intero partner"
+      },
+      "status": {
+        "active": "Attiva",
+        "paused": "In pausa",
+        "revoked": "Revocata",
+        "expired": "Scaduta"
+      },
+      "pausedReason": {
+        "budget_exhausted": "Budget esaurito",
+        "grantor_suspended": "Concedente sospeso",
+        "grantor_access_lost": "Il concedente ha perso l'accesso",
+        "factor_expired": "Fattore scaduto",
+        "entitlement_lost": "Diritto perso",
+        "user_paused": "Messa in pausa dall'utente",
+        "partner_disabled": "Partner disabilitato"
+      }
+    },
     "systemPage": {
       "title": "Sistema",
       "description": "Stato dell'intera installazione per gli amministratori di piattaforma. Questa pagina è di sola lettura.",
@@ -616,7 +671,55 @@
           "observability": "Osservabilità",
           "security-abuse": "Sicurezza e abusi",
           "integrations": "Integrazioni"
+        },
+        "probe": {
+          "checkNow": "Controlla ora",
+          "checking": "Controllo in corso…",
+          "failed": "Impossibile eseguire il controllo dell'executor.",
+          "notConfigured": "L'URL dell'executor non è impostato.",
+          "reachable": "Raggiungibile · {{ms}} ms",
+          "unreachable": "Non raggiungibile",
+          "route": "Percorso /v1/{{route}}: {{state}}",
+          "version": "Versione {{version}} ({{sha}})",
+          "versionMismatch": "La versione {{version}} ({{sha}}) differisce da questa API",
+          "versionUnavailable": "Versione non riportata (build precedente)",
+          "state": {
+            "present": "Presente",
+            "missing": "Mancante",
+            "unknown": "Sconosciuto"
+          }
         }
+      },
+      "connectionHealthJobs": {
+        "title": "Attività in background dello stato delle connessioni",
+        "description": "Mostra se le attività che monitorano lo stato delle connessioni sono in esecuzione. Verificato tramite heartbeat su Redis.",
+        "jobs": {
+          "reconcile": {
+            "label": "Riconciliatore di incidenti",
+            "description": "Apre e risolve gli incidenti di connessione ogni 15 minuti."
+          },
+          "digest": {
+            "label": "Email di riepilogo giornaliero",
+            "description": "Invia il riepilogo dello stato delle connessioni; viene eseguito ogni ora."
+          }
+        },
+        "state": {
+          "ok": "Regolare",
+          "stale": "Obsoleto",
+          "missing": "Nessun heartbeat",
+          "failing": "In errore"
+        },
+        "lastRun": "Ultima esecuzione {{relative}}",
+        "neverRun": "Nessun heartbeat registrato",
+        "kindsHeading": "Origini monitorate",
+        "lastOk": "Ultimo OK {{relative}}",
+        "neverOk": "Mai riuscito",
+        "failureStreak": "Errori consecutivi: {{count}}",
+        "redisUnavailable": "Impossibile leggere lo stato delle attività perché Redis non è disponibile. Questo non significa che le attività si siano fermate.",
+        "errors": {
+          "load": "Impossibile caricare lo stato delle attività."
+        },
+        "retry": "Riprova"
       }
     },
     "aiModels": {
@@ -743,6 +846,7 @@
       "agent.eventlogs.submit": "Log eventi segnalati",
       "agent.reliability.submit": "Affidabilità segnalata",
       "agent.command.result.submit": "Risultato comando inviato",
+      "agent.command.*": "Comando in coda: {command}",
       "agent.filesystem.threshold_scan.queued": "Scansione filesystem in coda",
       "agent.enroll": "Agent registrato",
       "api.fallback.post": "Inviato: {target}",
@@ -755,11 +859,14 @@
       "session_offer_submitted": "Offerta di sessione inviata",
       "session_consent_granted": "Consenso alla sessione remota concesso",
       "session_consent_denied": "Sessione remota rifiutata dall'utente",
+      "remote.session.ended_by_user": "Sessione remota terminata dall'utente",
       "session_consent_blocked_unanswered": "Sessione remota bloccata: richiesta di consenso senza risposta",
       "session_consent_blocked_unavailable": "Sessione remota bloccata: richiesta di consenso non disponibile",
       "session_consent_bypassed": "Sessione remota avviata senza risposta alla richiesta di consenso",
       "screen_access_consent_blocked": "Accesso allo schermo bloccato: il dispositivo richiede il consenso dell'utente",
       "device.wake_on_lan": "Wake-on-LAN inviato",
+      "device.recovery_key.reveal": "Chiave di ripristino mostrata",
+      "device.recovery_key.rotate": "Chiave di ripristino ruotata",
       "device.create": "Dispositivo aggiunto",
       "device.update": "Dispositivo aggiornato",
       "device.delete": "Dispositivo rimosso",
@@ -778,7 +885,23 @@
       "enrollment_key.revoke": "Chiave di registrazione revocata",
       "partner.settings.update": "Impostazioni partner aggiornate",
       "ai.message.send": "Messaggio IA inviato",
+      "backup.restore.create": "Ripristino avviato",
+      "backup.restore.cancel": "Ripristino annullato",
+      "backup.restore.unattested_override": "Ripristino di uno snapshot non verificato confermato",
       "ai.tool_approval.update": "Approvazione strumento IA aggiornata",
+      "ai.tool.*": "Strumento IA: {tool}",
+      "ai.session.create": "Avviata una conversazione con Breeze AI",
+      "ai.session.close": "Chiusa una conversazione con Breeze AI",
+      "ai.session.flag": "Contrassegnata una conversazione con Breeze AI",
+      "ai.session.unflag": "Contrassegno rimosso da una conversazione con Breeze AI",
+      "ai.message.interrupt": "Risposta IA interrotta",
+      "ai.command.executed": "L'IA ha eseguito un comando",
+      "ai.script.executed": "L'IA ha eseguito uno script",
+      "ai.external_tool.call": "L'IA ha chiamato uno strumento esterno",
+      "ai.plan_approval.update": "Approvazione del piano IA aggiornata",
+      "ai.plan.abort": "Piano IA annullato",
+      "ai.security.prompt_injection_detected": "IA: rilevata prompt injection",
+      "ai.budget.update": "Budget IA aggiornato",
       "mcp.initialize": "MCP: inizializza",
       "mcp.notifications.initialized": "MCP: notifiche inizializzate",
       "mcp.tools.list": "MCP: elenca strumenti",
@@ -786,6 +909,7 @@
       "mcp.resources.list": "MCP: elenca risorse",
       "terminal.session.summary": "Riepilogo sessione terminale",
       "script.run": "Script eseguito",
+      "script.execute": "Script eseguito sul dispositivo",
       "script.create": "Script creato",
       "script.update": "Script aggiornato",
       "script.delete": "Script eliminato",
@@ -869,6 +993,7 @@
       "changesSnapshot": "Snapshot modifiche",
       "before": "Prima",
       "after": "Dopo",
+      "noFieldChanges": "Nessuna modifica ai campi registrata per questa azione.",
       "userInfo": "Informazioni utente",
       "requestMetadata": "Metadati richiesta",
       "fields": {

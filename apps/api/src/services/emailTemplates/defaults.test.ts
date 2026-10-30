@@ -38,7 +38,7 @@ describe('email template defaults', () => {
 
   it('interpolates the shared subject template', () => {
     expect(defaultSubject('ticket_comment_notification', {
-      internalNumber: 'T-1',
+      ticketNumber: 'T-1',
       ticketSubject: 'Printer',
     })).toBe('[T-1] New reply: Printer');
     expect(defaultSubject('quote_send', {
@@ -53,7 +53,7 @@ describe('email template defaults', () => {
     expect(defaultSubject('ticket_autoresponse', { ticketSubject: 'Printer' }))
       .toBe('We received your request: Printer');
     expect(defaultSubject('ticket_autoresponse', {
-      internalNumber: null,
+      ticketNumber: null,
       ticketSubject: 'Printer',
       vars: { ticket_number: 'your request' },
     })).toBe('We received your request: Printer');
@@ -62,5 +62,19 @@ describe('email template defaults', () => {
   it('collapses an empty org name in the portal invite subject', () => {
     expect(defaultSubject('portal_invite', { vars: { org_name: '' } }))
       .toBe("You're invited to the support portal");
+  });
+
+  it('agreement_request_send (#9075 W2b): "you" wording without an org name, no validity line without an expiry', async () => {
+    const { defaultHtml: html, defaultPreheader, defaultFooter } = await import('./defaults');
+    const full = html('agreement_request_send', { org_name: 'Example Clinic', expiry_date: 'February 1, 2027' });
+    expect(full).toContain('has sent {{org_name}} an agreement');
+    expect(full).toContain('valid until <strong>{{expiry_date}}</strong>');
+    const bare = html('agreement_request_send', { org_name: ' ', expiry_date: '' });
+    expect(bare).toContain('has sent you an agreement');
+    expect(bare).not.toContain('{{expiry_date}}');
+    expect(defaultPreheader('agreement_request_send')).toBe('An agreement is ready for you to sign.');
+    expect(defaultFooter('agreement_request_send')).toBeUndefined();
+    expect(defaultSubject('agreement_request_send', { vars: { agreement_name: 'BAA\r\n2027', partner_name: 'Acme MSP' } }))
+      .toBe('Please sign: BAA 2027 from Acme MSP');
   });
 });

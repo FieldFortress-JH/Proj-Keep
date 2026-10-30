@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useHashState } from "@/lib/useHashState";
+import { parseThreatsHash } from "./threatsHash";
 import {
   AlertTriangle,
   Loader2,
@@ -27,6 +28,7 @@ import {
   DataCard,
   CardField,
 } from "../shared/ResponsiveTable";
+import { replaceUrl } from '../../lib/replaceUrl';
 type Threat = {
   id: string;
   deviceId: string;
@@ -81,9 +83,13 @@ export default function VulnerabilitiesPage() {
   // Adopted post-mount to avoid an SSR hydration mismatch (#2421).
   const [severity, setSeverity] = useHashState<string>(
     "",
-    (h) => h.match(/severity=(critical|high|medium|low)/)?.[1],
+    (h) => parseThreatsHash(h).severity || undefined,
   );
-  const [status, setStatus] = useState("");
+  // `#status=active` (dashboard "N active threats" link) seeds the status filter.
+  const [status, setStatus] = useHashState<string>(
+    "",
+    (h) => parseThreatsHash(h).status || undefined,
+  );
   const [category, setCategory] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
@@ -305,11 +311,7 @@ export default function VulnerabilitiesPage() {
             onChange={(e) => {
               const value = e.target.value;
               setSeverity(value);
-              window.history.replaceState(
-                null,
-                "",
-                value ? `#severity=${value}` : window.location.pathname,
-              );
+              replaceUrl(value ? `#severity=${value}` : window.location.pathname);
             }}
             className="h-10"
           >

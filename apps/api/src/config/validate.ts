@@ -1,4 +1,5 @@
 import { isIP } from 'net';
+import { parseCimdAllowedHosts } from '../oauth/cimdHosts';
 import { MAX_BOOTSTRAP_TOKEN_TTL_MINUTES } from '@breeze/shared';
 import { parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
 import { z } from 'zod';
@@ -12,6 +13,7 @@ import {
 } from '../services/releaseSource';
 import { EVENT_SUBSCRIBER_IDS, isSubscriberId } from '../services/eventSubscriberIds';
 import { parsePlayIntegrityServiceAccount } from '../services/attestation/playIntegrity';
+import { parseTunnelOriginConfig } from './tunnelOrigin';
 import {
   canonicalCfAccessTeamDomain,
   decodePartnerApiCursorSigningKey,
@@ -565,6 +567,19 @@ const envObjectSchema = z
     // FORCE_HTTPS is off, so this must not retroactively boot-refuse existing
     // deployments that don't force HTTPS.
     PUBLIC_API_URL: z.string().optional(),
+    // Network Proxy host mode (spec 2026-10-06 §2). Unset = path mode only.
+    // Validated in the superRefine below (shape + registrable-domain separation).
+    TUNNEL_ORIGIN_TEMPLATE: z.string().optional(),
+    TUNNEL_FRAME_ANCESTOR: z.string().optional(),
+    // Read by the tunnel-origin validator to derive the frame ancestor and to
+    // compare registrable domains; used unvalidated elsewhere.
+    PUBLIC_APP_URL: z.string().optional(),
+    DASHBOARD_URL: z.string().optional(),
+    PUBLIC_PORTAL_URL: z.string().optional(),
+    PUBLIC_WEB_URL: z.string().optional(),
+    PUBLIC_URL: z.string().optional(),
+    API_URL: z.string().optional(),
+    WEBAUTHN_ORIGIN: z.string().optional(),
     TRUST_PROXY_HEADERS: z.string().optional(),
     // Whether CF-Connecting-IP is trusted for client-IP resolution
     // (services/clientIp.ts). Boolean-ish; unset/empty means off. Format is
@@ -584,6 +599,15 @@ const envObjectSchema = z
       .string()
       .optional()
       .describe('Lifetime (minutes) of a newly issued installer bootstrap token when none is chosen. Default 10080 (7 days); values above 43200 (30 days) are clamped.'),
+    // Ticket import byte bucket (#8313 W1): read per charge through
+    // positiveIntEnv (services/migrationWindowLimits.ts), which falls back to
+    // the default on anything but a plain positive integer. Declared so
+    // collectWarnings() reports such a value once at boot; not boot-refused,
+    // like the other knobs of its family.
+    TICKET_IMPORT_MAX_BYTES_PER_HOUR: z
+      .string()
+      .optional()
+      .describe('Attachment bytes one migration window may download and store per hour. A plain positive integer; default 2147483648 (2 GiB), never below 10485760 (one file).'),
     MFA_RECOVERY_CODE_PEPPER: z.string().optional(),
     BREEZE_BOOTSTRAP_ADMIN_EMAIL: z.string().optional(),
     BREEZE_BOOTSTRAP_ADMIN_PASSWORD: z.string().optional(),
@@ -655,8 +679,10 @@ const envObjectSchema = z
       .string()
       .optional()
       .refine(
-        (v) => !v?.trim() || /^[1-9]\d{0,8}$/.test(v.trim()),
-        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer below 1,000,000,000',
+        (v) => !v?.trim() || (/^[1-9]\d{0,8}$/.test(v.trim()) && Number(v.trim()) <= 230),
+        // The window is the /enroll 429 Retry-After; W09 agents cap Retry-After
+        // at 300 s after x1.3 jitter (230 = AGENT_RETRY_AFTER_MAX_SECONDS, #9457).
+        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer of at most 230',
       ),
 
     // Controlled agent-fleet rollout (decouple registration from promotion).
@@ -674,6 +700,35 @@ const envObjectSchema = z
     // AGENT_AUTO_PROMOTE above — a typo must fail boot, not silently read as
     // "off" for an operator who believed they enabled auto-remediation.
     AGENT_EDITION_AUTO_MIGRATE_ENABLED: z.string().optional(),
+
+    // Stateless MCP 2026-07-28 era kill switch (B-W03 #6157). Default false;
+    // read per request by mcpStatelessEnabled() (services/mcpProtocol.ts).
+    // Validated here for boolean format only, same class as
+    // AGENT_AUTO_PROMOTE above.
+    MCP_STATELESS_ENABLED: z.string().optional(),
+
+    // Tier-3 over MCP via action intents (B-W04 #6158). Kill switch is boolean
+    // (services/mcpIntentConfig.ts mcpTier3IntentsEnabled()); the knobs are read per call through
+    // positiveIntEnv in config/env.ts. Validated here for format only.
+    MCP_TIER3_INTENTS_ENABLED: z.string().optional(),
+    MCP_INTENT_MAX_LIVE_PER_PRINCIPAL: z.string().optional(),
+    MCP_INTENT_CREATES_PER_HOUR: z.string().optional(),
+    MCP_INTENT_CREATES_PER_USER_PER_HOUR: z.string().optional(),
+    MCP_APPROVAL_WAIT_MS: z.string().optional(),
+    MCP_APPROVAL_WAITS_PER_PRINCIPAL: z.string().optional(),
+
+    // MCP Apps pilot (B-W05 #6159). Boolean kill switch, read per call by
+    // services/mcpAppsConfig.ts mcpAppsEnabled(). Validated here for format only.
+    MCP_APPS_ENABLED: z.string().optional(),
+
+    // MCP Tasks extension (B-W06 #6160). Boolean flag read per call by
+    // services/mcpIntentConfig.ts mcpTasksEnabled() (effective only with
+    // MCP_STATELESS_ENABLED); the three knobs are read per call there too.
+    // Validated here for format only.
+    MCP_TASKS_ENABLED: z.string().optional(),
+    MCP_TASK_PENDING_POLL_INTERVAL_MS: z.string().optional(),
+    MCP_TASK_POLL_INTERVAL_MS: z.string().optional(),
+    MCP_TASK_TTL_GRACE_MS: z.string().optional(),
 
     // Signup-abuse detection kill switch / opt-in (services/abuseSignals).
     // Defaults to IS_HOSTED; read at runtime by abuseSignalsEnabled() in
@@ -697,10 +752,36 @@ const envObjectSchema = z
     // AGENT_AUTO_PROMOTE above.
     BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED: z.string().optional(),
 
+    // Recipe Library W06. Gates the identity_offboarding recipe, read at
+    // runtime by aiOperatorIdentityOffboardingEnabled() in env.ts. Validated
+    // here for boolean format only. Default off; nothing enables it.
+    AI_OPERATOR_RECIPE_IDENTITY_OFFBOARDING_ENABLED: z.string().optional(),
+    // R2: gates identity_onboarding, read by aiOperatorIdentityOnboardingEnabled().
+    AI_OPERATOR_RECIPE_IDENTITY_ONBOARDING_ENABLED: z.string().optional(),
+
     // Task A7 (tool-catalog W1). Platform kill switch for tool sources, read
     // at runtime by toolSourcesEnabled() in env.ts. Validated here for
     // boolean format only, same class as AGENT_AUTO_PROMOTE above.
     TOOL_SOURCES_ENABLED: z.string().optional(),
+
+    // Tool Catalog W3 (#5218). Platform kill switch for Flows, read at runtime
+    // by flowsEnabled() in env.ts. Boolean-format validation only.
+    FLOWS_ENABLED: z.string().optional(),
+    // Tool catalog W04 (#5219): approval window of a parked Tier-3 flow step,
+    // in hours (flowApprovalTtlHours() in env.ts). Integer 1..168 when set.
+    FLOW_APPROVAL_TTL_HOURS: z.string().optional(),
+    // Task A8: running flow runs per flow owner (flowMaxRunningPerOwner(),
+    // integer 1..500) and the run-body retention window in days
+    // (flowRunRetentionDays(), integer 7..3650).
+    FLOW_MAX_RUNNING_PER_OWNER: z.string().optional(),
+    FLOW_RUN_RETENTION_DAYS: z.string().optional(),
+    // W05 (#5220): per-flow inbound webhook rate (flowWebhookRatePerMinute(),
+    // 1..6000), non-accepted delivery retention days
+    // (flowWebhookDeliveryRetentionDays(), 1..365) and the for-each parallel
+    // ceiling (flowForEachMaxParallel(), 1..10).
+    FLOW_WEBHOOK_RATE_PER_MINUTE: z.string().optional(),
+    FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS: z.string().optional(),
+    FLOW_FOREACH_MAX_PARALLEL: z.string().optional(),
 
     // Task A7. Sub-flag allowing a tool source to target private/loopback
     // egress — an SSRF vector on the hosted platform, so it's refused there
@@ -713,6 +794,10 @@ const envObjectSchema = z
     // format only — the production coupling rule is in the superRefine below.
     BREEZE_AI_WORKSPACE_ENABLED: z.string().optional(),
     BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: z.string().optional(),
+    // Wisp (Wisp design §10). Hosted-only sub-flag of BREEZE_AI_AGENTS_ENABLED,
+    // read at runtime by wispEnabled() in env.ts. Boolean format + the
+    // production IS_HOSTED coupling are checked in the superRefines below.
+    BREEZE_WISP_ENABLED: z.string().optional(),
     // 'vercel' | 'fake'. Resolved at runtime by resolveSandboxBackendName()
     // (services/workspace/sandboxBackend.ts), which refuses an unset value in
     // production; the superRefine below additionally refuses 'fake' there.
@@ -789,7 +874,7 @@ const envObjectSchema = z
     // with 3.5d once the split is actually exercised in prod topology).
     BREEZE_ROLE: z.string().optional(),
 
-    // M365 Tier-3 write-action AI tools (m365_disable_user, m365_reset_password)
+    // M365 Tier-3 write-action AI tools (the ten M365_HEADLESS_ACTIONS tools, e.g. m365_disable_user)
     // and the action-intents release worker's headless dispatch. Dark by
     // default. Read at runtime by writeActionRuntimeConfig.ts; declared here so
     // the format is guarded (a typo reads as OFF at the runtime flag parser,
@@ -827,6 +912,10 @@ const envObjectSchema = z
     OAUTH_DCR_ENABLED: z.string().optional(),
     OAUTH_DCR_REQUIRE_IAT: z.string().optional(),
     OAUTH_DCR_ALLOW_ANONYMOUS: z.string().optional(),
+    // CIMD (B-W03 #6157): boolean flag + optional host allowlist, both checked
+    // in the superRefine below.
+    OAUTH_CIMD_ENABLED: z.string().optional(),
+    OAUTH_CIMD_ALLOWED_HOSTS: z.string().optional(),
 
     // Wave 3 live-authorization rollout controls. Shape is validated in EVERY
     // environment (a garbage value is a bug anywhere); presence is required in
@@ -977,7 +1066,10 @@ const envObjectSchema = z
     REDIS_PORT: z.string().optional(),
     REDIS_PASSWORD_FILE: z.string().optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-    PARTNER_HOOKS_URL: z.string().url().optional(),
+    PARTNER_HOOKS_URL: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.string().url().optional(),
+    ),
     PARTNER_HOOKS_SECRET: z.string().min(16).optional(),
     // Empty string means "unset" — same reason as APNS_ENVIRONMENT above: both
     // compose files map this as `${IP_ALLOWLIST_ENFORCEMENT_MODE:-}`, so the key
@@ -1011,6 +1103,15 @@ const envObjectSchema = z
     // staying on the safe default — see docs/operations/agent-network-and-manifest-rollout.md.
     AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID: z.enum(['true', 'false']).default('false'),
 
+    // #8616 heartbeat retain-state kill switch (routes/agents/
+    // heartbeatSettingsDecision.ts). Default on: a beat that advertises
+    // securityCapabilities.retainStateProtocolVersion 1 gets `retainState`
+    // for features with no decision this beat. 'false' answers every agent
+    // with the legacy payload, as an older API would. Strict enum so a typo
+    // boot-refuses instead of silently staying on.
+    HEARTBEAT_RETAIN_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
+    AGENT_ECH_ENABLED: z.enum(['true', 'false']).default('true'),
+
     // Phase 2 of per-partner LLM BYOK (#3922), Task 3.1 — gates catalog-mode
     // routing (partner_ai_connections.catalog_entry_id). Off by default so a
     // rolling deploy or rollback never exposes catalog selection ahead of
@@ -1022,9 +1123,11 @@ const envObjectSchema = z
     LLM_PROVIDER_CATALOG_ENABLED: z.enum(['true', 'false']).default('false'),
 
     // Caller verification (anti-vishing, #6354 W01). Exact-string contract:
-    // only 'true' enables; '' === unset. No generic boolean superRefine —
+    // unset or 'true' enables (W05 default); '' and 'false' disable. No generic boolean superRefine —
     // '1'/'yes'/'on' are refused at boot rather than silently accepted.
     CALLER_VERIFICATION_ENABLED: z.enum(['true', 'false', '']).optional(),
+    // Workstation tier (#6354 W05): dark by default; same exact-string contract.
+    CALLER_VERIFICATION_WORKSTATION_ENABLED: z.enum(['true', 'false', '']).optional(),
 
     // Security remediation Wave 6, Task 9 (approved plan deviation D1) — the
     // managed-software destination gate (services/managedSoftwareDispatchPolicy.ts).
@@ -1064,8 +1167,15 @@ const envObjectSchema = z
 
     // -- Alternative LLM backend (openai-compatible, e.g. vLLM) ---------------
     // Off by default. Chat-only PoC; tool-calling is not supported on this path.
-    MCP_LLM_PROVIDER: z.enum(['anthropic', 'openai-compatible']).default('anthropic'),
-    MCP_LLM_BASE_URL: z.string().url().optional(),
+    // '' = unset (compose maps these as `${VAR:-}`, #7640).
+    MCP_LLM_PROVIDER: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.enum(['anthropic', 'openai-compatible']).default('anthropic'),
+    ),
+    MCP_LLM_BASE_URL: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.string().url().optional(),
+    ),
     MCP_LLM_API_KEY: z.string().optional(),
     MCP_LLM_MODEL: z.string().optional(),
     MCP_LLM_PRICE_INPUT_PER_M_USD: z.string().optional().transform((v) => (v ? parseFloat(v) : 0)).pipe(z.number().min(0)),
@@ -1297,6 +1407,16 @@ const envSchema = envObjectSchema
       }
     }
 
+    // Network Proxy tunnel origin (spec 2026-10-06 §2): refuse boot on a
+    // malformed template or one sharing a registrable domain with any app origin,
+    // in every NODE_ENV — a same-site tunnel origin is a tenant-isolation bug.
+    const tunnelOrigin = parseTunnelOriginConfig(data);
+    if (!tunnelOrigin.ok) {
+      for (const issue of tunnelOrigin.issues) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [issue.path], message: `${issue.path} ${issue.message}` });
+      }
+    }
+
     // MCP_LLM_PROVIDER openai-compatible: endpoint + model id required at boot
     // (enforced in all environments, not just production). W06 (#7604, D6):
     // boot turns these into one env-managed OpenAI-compatible connection PER
@@ -1524,6 +1644,31 @@ const envSchema = envObjectSchema
                 `${key} must be set when BREEZE_AI_WORKSPACE_ENABLED=true — the Vercel SDK's ambient-credential fallback is deliberately not used, so a missing value fails every analysis run instead of booting cleanly.`,
             });
           }
+        }
+      }
+      // Wisp is hosted-only (Wisp design §10): wispEnabled() already reads
+      // false off-hosted, so a self-hosted deploy setting the flag is a
+      // misconfiguration that would silently do nothing — refuse it at boot.
+      const wispFlag = (data.BREEZE_WISP_ENABLED ?? '').trim().toLowerCase();
+      if (wispFlag === 'true' || wispFlag === '1' || wispFlag === 'yes' || wispFlag === 'on') {
+        if ((data.IS_HOSTED ?? '').trim().toLowerCase() !== 'true') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['IS_HOSTED'],
+            message: 'BREEZE_WISP_ENABLED=true requires IS_HOSTED=true — Wisp is hosted-only (Wisp design §10).',
+          });
+        }
+        // A Wisp grant borrows a human's authority on a fresh step-up proof
+        // (Wisp design §4.2). With ENABLE_2FA off no step-up can be minted and
+        // the grant path degrades to "session only", so refuse it in production.
+        // Same falsy rule as envFlag('ENABLE_2FA', true).
+        const enable2fa = (data.ENABLE_2FA ?? '').trim().toLowerCase();
+        if (enable2fa !== '' && !['1', 'true', 'yes', 'on'].includes(enable2fa)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['ENABLE_2FA'],
+            message: 'BREEZE_WISP_ENABLED=true requires ENABLE_2FA to stay on — Wisp grants are created and refreshed on a step-up proof (Wisp design §4.2).',
+          });
         }
       }
 
@@ -2009,6 +2154,90 @@ const envSchema = envObjectSchema
       });
     }
 
+    // OAUTH_CIMD_ENABLED / OAUTH_CIMD_ALLOWED_HOSTS (B-W03 #6157). A typo in
+    // the allowlist would otherwise fail closed at runtime with no boot error.
+    const cimdEnabledRaw = (data.OAUTH_CIMD_ENABLED ?? '').trim().toLowerCase();
+    if (cimdEnabledRaw && !boolValues.has(cimdEnabledRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ENABLED'],
+        message: 'OAUTH_CIMD_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false.',
+      });
+    }
+    const cimdHosts = parseCimdAllowedHosts(data.OAUTH_CIMD_ALLOWED_HOSTS);
+    if (!cimdHosts.ok) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ALLOWED_HOSTS'],
+        message: `OAUTH_CIMD_ALLOWED_HOSTS must be a comma-separated list of hostnames or .suffix entries (no scheme, path, port or wildcard): ${cimdHosts.reason}.`,
+      });
+    }
+
+    // MCP_STATELESS_ENABLED (B-W03 #6157). Same treatment as AGENT_AUTO_PROMOTE.
+    const mcpStatelessRaw = (data.MCP_STATELESS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpStatelessRaw && !boolValues.has(mcpStatelessRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_STATELESS_ENABLED'],
+        message:
+          'MCP_STATELESS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (the MCP server answers only the initialize-based protocol versions).',
+      });
+    }
+
+    // MCP_TIER3_INTENTS_ENABLED (B-W04 #6158): boolean typo guard.
+    const mcpIntentsRaw = (data.MCP_TIER3_INTENTS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpIntentsRaw && !boolValues.has(mcpIntentsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_TIER3_INTENTS_ENABLED'],
+        message:
+          'MCP_TIER3_INTENTS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (Tier-3 over MCP keeps the MCP_APPROVAL_REQUIRED refusal).',
+      });
+    }
+    // MCP_APPS_ENABLED (B-W05 #6159): boolean typo guard.
+    const mcpAppsRaw = (data.MCP_APPS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpAppsRaw && !boolValues.has(mcpAppsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_APPS_ENABLED'],
+        message:
+          'MCP_APPS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (no MCP Apps view is advertised or served).',
+      });
+    }
+    // MCP_TASKS_ENABLED (B-W06 #6160): boolean typo guard.
+    const mcpTasksRaw = (data.MCP_TASKS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpTasksRaw && !boolValues.has(mcpTasksRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_TASKS_ENABLED'],
+        message:
+          'MCP_TASKS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (Tier-3 calls keep the pending_approval result; no Tasks extension is advertised).',
+      });
+    }
+    for (const knob of [
+      'MCP_INTENT_MAX_LIVE_PER_PRINCIPAL',
+      'MCP_INTENT_CREATES_PER_HOUR',
+      'MCP_INTENT_CREATES_PER_USER_PER_HOUR',
+      'MCP_APPROVAL_WAIT_MS',
+      'MCP_APPROVAL_WAITS_PER_PRINCIPAL',
+      'MCP_TASK_PENDING_POLL_INTERVAL_MS',
+      'MCP_TASK_POLL_INTERVAL_MS',
+      'MCP_TASK_TTL_GRACE_MS',
+    ] as const) {
+      const raw = (data[knob] ?? '').trim();
+      if (raw && (!/^\d+$/.test(raw) || Number(raw) < 1)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [knob],
+          message: `${knob} must be a positive integer when set.`,
+        });
+      }
+    }
+
     // ABUSE_SIGNALS_ENABLED (signup-abuse detection). Same treatment and same
     // reasoning as AGENT_AUTO_PROMOTE above: independent of NODE_ENV, because
     // the value silently governs whether the subsystem runs at all. A typo
@@ -2135,6 +2364,18 @@ const envSchema = envObjectSchema
       });
     }
 
+    // FLOWS_ENABLED (Tool Catalog W3, #5218). Same treatment as
+    // TOOL_SOURCES_ENABLED: a typo must fail boot rather than read as off.
+    const flowsRaw = (data.FLOWS_ENABLED ?? '').trim().toLowerCase();
+    if (flowsRaw && !boolValues.has(flowsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FLOWS_ENABLED'],
+        message:
+          'FLOWS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to true (set false to keep Flows off).',
+      });
+    }
+
     // TOOL_SOURCES_ALLOW_PRIVATE_EGRESS (Task A7). Same boolean-format check,
     // plus a hosted refusal: a tool source that can reach a private/
     // loopback/link-local address from the shared hosted egress path is an
@@ -2174,6 +2415,14 @@ const envSchema = envObjectSchema
         code: z.ZodIssueCode.custom,
         path: ['BREEZE_AI_WORKSPACE_ENABLED'],
         message: 'BREEZE_AI_WORKSPACE_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the workspace lane and artifact capture are dark).',
+      });
+    }
+    const wispRaw = (data.BREEZE_WISP_ENABLED ?? '').trim().toLowerCase();
+    if (wispRaw && !boolValues.has(wispRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_WISP_ENABLED'],
+        message: 'BREEZE_WISP_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (Wisp is dark).',
       });
     }
     const blobBackendRaw = (data.ARTIFACT_BLOB_BACKEND ?? '').trim().toLowerCase();
@@ -2298,6 +2547,30 @@ const envSchema = envObjectSchema
         message:
           'M365_TENANT_SYNC_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the M365 tenant sync ticker and worker are dark).',
       });
+    }
+    const flowTtlRaw = (data.FLOW_APPROVAL_TTL_HOURS ?? '').trim();
+    if (flowTtlRaw && (!/^\d+$/.test(flowTtlRaw) || Number(flowTtlRaw) < 1 || Number(flowTtlRaw) > 168)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FLOW_APPROVAL_TTL_HOURS'],
+        message: 'FLOW_APPROVAL_TTL_HOURS must be an integer between 1 and 168 (hours a parked flow step waits for approval; default 24).',
+      });
+    }
+    for (const [knob, min, max, what] of [
+      ['FLOW_MAX_RUNNING_PER_OWNER', 1, 500, 'running flow runs per flow owner; default 20'],
+      ['FLOW_RUN_RETENTION_DAYS', 7, 3650, 'days before a finished flow run\'s bodies are pruned; default 90'],
+      ['FLOW_WEBHOOK_RATE_PER_MINUTE', 1, 6000, 'inbound webhook deliveries accepted per flow per minute; default 120'],
+      ['FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS', 1, 365, 'days a non-accepted flow webhook delivery row is kept; default 30'],
+      ['FLOW_FOREACH_MAX_PARALLEL', 1, 10, 'most for-each items one flow step runs at once; default 5'],
+    ] as const) {
+      const raw = (data[knob] ?? '').trim();
+      if (raw && (!/^\d+$/.test(raw) || Number(raw) < min || Number(raw) > max)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [knob],
+          message: `${knob} must be an integer between ${min} and ${max} (${what}).`,
+        });
+      }
     }
     for (const knob of ['M365_SYNC_CONCURRENCY', 'M365_SYNC_MAX_BACKLOG', 'M365_SYNC_TICK_BATCH'] as const) {
       const raw = (data[knob] ?? '').trim();
@@ -2553,6 +2826,18 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
     }
   }
 
+  // B-W06 (#6160, D-B55): Tasks exist only in the stateless era, so the flag
+  // without MCP_STATELESS_ENABLED is a silent no-op — say so at boot.
+  {
+    const truthy = (v: string | undefined) => ['1', 'true', 'yes', 'on'].includes((v ?? '').trim().toLowerCase());
+    if (truthy(env.MCP_TASKS_ENABLED) && !truthy(env.MCP_STATELESS_ENABLED)) {
+      warnings.push({
+        key: 'MCP_TASKS_ENABLED',
+        message: 'is on but MCP_STATELESS_ENABLED is off, so the MCP Tasks extension stays inactive (no task handles, nothing advertised). Turn MCP_STATELESS_ENABLED on with it.',
+      });
+    }
+  }
+
   // Production: FORCE_HTTPS should be true
   if (isProduction) {
     const forceHttps = (env.FORCE_HTTPS ?? '').trim().toLowerCase();
@@ -2699,6 +2984,20 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
           `installer bootstrap tokens are issued with a ${MAX_BOOTSTRAP_TOKEN_TTL_MINUTES}-minute lifetime.`,
       });
     }
+  }
+
+  // TICKET_IMPORT_MAX_BYTES_PER_HOUR (services/migrationWindowLimits.ts) is a
+  // plain positive integer number of bytes. positiveIntEnv falls back to the
+  // 2 GiB default on anything else (`2e9`, `2GiB`, `2_147_483_648`, `12abc`,
+  // `0`); say so once at boot, so the operator learns their value is ignored.
+  const importBytesRaw = (env.TICKET_IMPORT_MAX_BYTES_PER_HOUR ?? '').trim();
+  if (importBytesRaw !== '' && !(/^\d+$/.test(importBytesRaw) && Number.parseInt(importBytesRaw, 10) > 0)) {
+    warnings.push({
+      key: 'TICKET_IMPORT_MAX_BYTES_PER_HOUR',
+      message:
+        `"${importBytesRaw}" is not a plain positive integer number of bytes; ` +
+        'the default of 2147483648 (2 GiB) per window per hour applies.',
+    });
   }
 
   // Warn about optional secrets that look insecure

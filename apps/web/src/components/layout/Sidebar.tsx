@@ -1,6 +1,7 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { Fragment, useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  MessageSquare,
   LayoutDashboard,
   Monitor,
   Radar,
@@ -33,7 +34,6 @@ import {
   HardDrive,
   BarChart3,
   BrainCircuit,
-  DraftingCompass,
   Bot,
   History,
   Activity,
@@ -45,7 +45,6 @@ import {
   ScanSearch,
   ArrowRightLeft,
   Usb,
-  MessagesSquare,
   Ticket,
   X,
   Cloud,
@@ -58,26 +57,30 @@ import {
   Bug,
   Puzzle,
   LayoutGrid,
+  MapPin,
   Cpu,
   TrendingUp,
-  BookCheck,
   Power,
   ServerCog,
   Inbox,
   Sparkles,
   Smartphone,
+  Workflow,
+  Lock,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '../../stores/uiStore';
-import { useRecentsStore } from '../../stores/recentsStore';
+import { useRecentsStore, selectRecentEntries } from '../../stores/recentsStore';
+import { RECENT_ENTRY_ICONS } from './recentEntryIcons';
 import { SIDEBAR_CYCLE_MODE_EVENT } from '../../lib/keyboard/useGlobalShortcuts';
 import type { PermissionGrant } from '@breeze/shared';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { getPartnersMe } from '../../lib/api/partnersMe';
 import { SERVICE_MANAGEMENT_MODES, useOrgStore, type ServiceManagementMode } from '../../stores/orgStore';
-import { useToolSourcesGate, usePreAssignmentGate } from '../../stores/featuresStore';
+import { useToolSourcesGate, useFlowsGate, usePreAssignmentGate, useAiOperatorTasksGate } from '../../stores/featuresStore';
 import { useAutopayEnabled } from '../../lib/autopayVisibility';
-import { isNavGateVisible } from '../../lib/navGates';
-import { sidebarSettingsEntries } from '../../lib/settingsCatalog';
+import { isNavGateVisible, type NavGateContext } from '../../lib/navGates';
+import { SETTINGS_CATALOG, sidebarSettingsEntries, type SettingsGroup } from '../../lib/settingsCatalog';
 import { WEB_VERSION } from '../../lib/version';
 import { semverCompare } from '@breeze/shared';
 import { getJwtClaims } from '../../lib/authScope';
@@ -86,12 +89,42 @@ import BrandHeader from './BrandHeader';
 import { ENABLE_EDR_INTEGRATIONS } from '../../lib/featureFlags';
 import { useExtensionNavigation } from '../extensions/useExtensionNavigation';
 import '../../lib/i18n';
+import { URL_CHANGE_EVENT } from '../../lib/replaceUrl';
+import { claimSamePageHashClick } from '../../lib/samePageHashClick';
+import { ticketTypeFromHash, type TicketType } from '../tickets/ticketType';
 
 interface SidebarProps {
   currentPath?: string;
 }
 
 type SidebarMode = 'open' | 'hover' | 'collapsed';
+
+// ---------------------------------------------------------------------------
+// Hash tracking (#7900 W3): the Service Desk's typed entries share `/tickets`
+// and differ only by `#type=<type>`, so active state needs the live hash.
+// `history.replaceState` (what `replaceUrl` uses) fires neither hashchange nor
+// popstate, hence the explicit `breeze:urlchange` event. Starts '' so the first
+// client render matches SSR, then adopts `window.location.hash` on mount so a
+// deep link `/tickets#type=problem` highlights the right entry.
+// ---------------------------------------------------------------------------
+function useCurrentHash(): string {
+  const [hash, setHash] = useState('');
+  useEffect(() => {
+    const update = () => setHash(window.location.hash);
+    update();
+    window.addEventListener('hashchange', update);
+    window.addEventListener('popstate', update);
+    window.addEventListener(URL_CHANGE_EVENT, update);
+    document.addEventListener('astro:after-swap', update);
+    return () => {
+      window.removeEventListener('hashchange', update);
+      window.removeEventListener('popstate', update);
+      window.removeEventListener(URL_CHANGE_EVENT, update);
+      document.removeEventListener('astro:after-swap', update);
+    };
+  }, []);
+  return hash;
+}
 
 // ---------------------------------------------------------------------------
 // Path tracking (reactive across Astro View Transitions)
@@ -162,6 +195,11 @@ type NavItem = {
   href: string;
   icon: React.ComponentType<{ className?: string }>;
   badgeKind?: 'deletion-requests' | 'approvals';
+  // #7900 W3: a Service Desk entry that filters /tickets to one ticket type.
+  // Active only when the page hash parses to this type (see activeHref).
+  ticketType?: TicketType;
+  // Stable e2e/test hook for entries that share a pathname.
+  testId?: string;
   // Hidden unless the current user is a platform admin. Keeps cross-tenant
   // platform-operator nav (and its badge fetch) out of ordinary users' UI.
   platformAdminOnly?: boolean;
@@ -175,7 +213,11 @@ type NavItem = {
   requiresAiForOffice?: boolean;
   /** #5216 W01: gated on the SERVER's TOOL_SOURCES_ENABLED via /config. */
   requiresToolSources?: boolean;
+  /** #5218: gated on the SERVER's FLOWS_ENABLED via /config. */
+  requiresFlows?: boolean;
   requiresPreAssignment?: boolean;
+  /** W06 R1b (#6171): gated on the SERVER's `features.aiOperatorTasks` via /config. */
+  requiresAiOperatorTasks?: boolean;
   // Hidden unless the user holds this permission (e.g. billing nav gated on
   // invoices:read). UX only — the route still enforces it server-side. While
   // the permission set is still loading, the item stays hidden. Typed as the
@@ -196,7 +238,22 @@ type NavItem = {
   requiresPartnerWideAdmin?: boolean;
   // Additional permissions the user must all hold (see navGates.ts).
   alsoRequiredPermissions?: readonly PermissionGrant[];
+  // #10135: the in-section heading this item sits under (declared once in the
+  // section's `headings`). Members of one heading are contiguous; the heading
+  // renders only while at least one member passes its gates, so a user who can
+  // see none of them never gets a label over nothing.
+  heading?: NavHeadingId;
+  // #10135: rendered locked (lock icon, reason as title and screen-reader text)
+  // when /orgs/partners/me answers wispEnabled: false. Only the Wisp home sets it.
+  lockedWhenWispOff?: boolean;
+  // #10135: this link is a settings hub for the named catalogue group; it is
+  // hidden while none of that group's cards would be visible (see isNavItemVisible).
+  hubGroup?: SettingsGroup;
 };
+
+// In-section group headings. A heading is a label, never a link or a page.
+type NavHeadingId = 'workers';
+type NavHeading = { label: string; labelKey: string };
 
 // ---------------------------------------------------------------------------
 // Top-level items (always visible, 6-8 max)
@@ -213,16 +270,17 @@ export const topLevelNav: NavItem[] = [
   // longer does: exactly one Organizations entry exists in the nav).
   { name: 'Organizations', labelKey: 'nav.organizations', href: '/organizations', icon: Building2, partnerScopeOnly: true, requiredPermission: { resource: 'organizations', action: 'read' } },
   // Unified list: agent devices + manual assets + network assets (#4622, #5228),
-  // hence the label. Recently opened devices render under this row — see
-  // `renderNavItem` and Sidebar.recents.test.tsx.
+  // hence the label. The Recent group renders under Dashboard — see
+  // `renderRecentGroup` and Sidebar.recents.test.tsx.
   { name: 'Devices & Assets', labelKey: 'nav.devices', href: '/devices', icon: Monitor, requiredPermission: { resource: 'devices', action: 'read' } },
   { name: 'Alerts', labelKey: 'nav.alerts', href: '/alerts', icon: Bell, requiredPermission: { resource: 'alerts', action: 'read' } },
   { name: 'Approvals', labelKey: 'nav.approvals', href: '/approvals', icon: ShieldCheck, badgeKind: 'approvals' },
-  { name: 'Incidents', labelKey: 'nav.incidents', href: '/incidents', icon: ShieldAlert, requiredPermission: { resource: 'alerts', action: 'read' } },
+  { name: 'Security Incidents', labelKey: 'nav.incidents', href: '/incidents', icon: ShieldAlert, requiredPermission: { resource: 'alerts', action: 'read' } },
   { name: 'Remote Access', labelKey: 'nav.remoteAccess', href: '/remote', icon: Terminal, requiredPermission: { resource: 'remote', action: 'access' } },
   { name: 'Scripts', labelKey: 'nav.scripts', href: '/scripts', icon: FileCode, requiredPermission: { resource: 'scripts', action: 'read' } },
   // #5288 — Automations finally get a nav home, as Jobs. /automations redirects here.
   { name: 'Jobs', labelKey: 'nav.jobs', href: '/jobs', icon: CalendarClock, requiredPermission: { resource: 'automations', action: 'read' } },
+  { name: 'Flows', labelKey: 'nav.flows', href: '/flows', icon: Workflow, requiresFlows: true, requiredPermission: { resource: 'automations', action: 'read' } },
   { name: 'Patches', labelKey: 'nav.patches', href: '/patches', icon: Download, requiredPermission: { resource: 'devices', action: 'read' } },
   { name: 'Vulnerabilities', labelKey: 'nav.vulnerabilities', href: '/vulnerabilities', icon: Bug, requiredPermission: { resource: 'devices', action: 'read' } },
 ];
@@ -240,6 +298,8 @@ interface NavSection {
   // section does not have to repeat `requiresModule` on each entry (and cannot
   // half-hide if a later item forgets it).
   requiresModule?: 'service_management';
+  // Labels for the headings this section's items reference (`NavItem.heading`).
+  headings?: Partial<Record<NavHeadingId, NavHeading>>;
 }
 
 // Exported for structural nav tests (see Sidebar.nav.test.tsx).
@@ -249,30 +309,40 @@ export const navSections: NavSection[] = [
     label: 'AI',
     labelKey: 'nav.sectionAi',
     icon: BrainCircuit,
+    // AI surface cohesion W04 (#10135, spec §5): the section reads as the
+    // sentence "Operators run Breeze. The workers do the work. Wisp runs your
+    // day." Settings-like AI pages (usage, script authoring, tool sources) live
+    // under Settings → AI (/settings/ai); fix memory and fleet design are
+    // reports reached from the agents that write them (Agents, Runs).
+    headings: {
+      workers: { label: 'Workers', labelKey: 'nav.workersHeading' },
+    },
     items: [
-      { name: 'Fleet Orchestration', labelKey: 'nav.fleetOrchestration', href: '/fleet', icon: BrainCircuit },
-      // #6498: /workspace drives the own-session /ai/* routes, every one of
-      // which requires ai_sessions:use (#6396). Without this gate a role holding
-      // only devices:read saw the full AI Workspace and a bare "Permission
-      // denied" on send.
-      { name: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/workspace', icon: MessagesSquare, requiredPermission: { resource: 'ai_sessions', action: 'use' } },
-      { name: 'AI Agents', labelKey: 'nav.aiAgents', href: '/settings/ai-agents', icon: Bot, requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      // Wisp W08 (#9921): the Wisp home. #6498: Wisp and the chat drive the
+      // own-session /ai/* routes, every one of which requires ai_sessions:use
+      // (#6396). Without this gate a role holding only devices:read saw the full
+      // chat page and a bare "Permission denied" on send.
+      // #10200: partner tokens only — grants are partner-staff only, so for
+      // anyone else /wisp just forwards to /ai/chat.
+      { name: 'Wisp', labelKey: 'nav.wisp', href: '/wisp', icon: Sparkles, lockedWhenWispOff: true, partnerScopeOnly: true, requiredPermission: { resource: 'ai_sessions', action: 'use' } },
+      // The full-page multi-tab chat (formerly "AI Assistant" at /workspace,
+      // then /wisp/chat — both redirect here, AI surface cohesion W05 #10136).
+      { name: 'Breeze AI', labelKey: 'nav.breezeAi', href: '/ai/chat', icon: MessageSquare, requiredPermission: { resource: 'ai_sessions', action: 'use' } },
+      { name: 'Agents', labelKey: 'nav.agents', href: '/settings/ai-agents', icon: Bot, heading: 'workers', requiredPermission: { resource: 'ai_agents', action: 'read' } },
       // Execution-trace runs list/detail (Wave 6 PR 1, #3828) — file-routed under
       // /ai-agents/runs (not /settings/*) since a run is fleet activity, not
       // agent configuration.
-      { name: 'AI Agent Runs', labelKey: 'nav.aiAgentRuns', href: '/ai-agents/runs', icon: History, requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      { name: 'Runs', labelKey: 'nav.runs', href: '/ai-agents/runs', icon: History, heading: 'workers', requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      // Operator Recipe Library W06 R1b (#6171): AI tasks + the recipe library.
+      // Same server flag as the "Delegate" action that starts one.
+      { name: 'AI Tasks', labelKey: 'nav.aiTasks', href: '/operator', icon: ListChecks, heading: 'workers', requiresAiOperatorTasks: true, requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      // Cross-device patterns the workers found (formerly "Fleet Orchestration").
+      { name: 'Findings', labelKey: 'nav.findings', href: '/fleet', icon: Sparkles, heading: 'workers', requiredPermission: { resource: 'ai_agents', action: 'read' } },
       // Fleet value accounting (Phase 2 wave P2-6, #4193) — the estimated
       // time-saved report over the same runs, so it sits beside them.
-      { name: 'AI Impact', labelKey: 'nav.aiImpact', href: '/ai-agents/impact', icon: TrendingUp, requiredPermission: { resource: 'ai_agents', action: 'read' } },
-      // AI Suggested Fixes W2 — observed fix track records (data, not settings).
-      { name: 'Fix memory', labelKey: 'nav.fixMemory', href: '/ai-agents/fix-memory', icon: BookCheck, requiredPermission: { resource: 'ai_agents', action: 'read' } },
-      // Fleet Designer W03 (#5653) — apply/rollback surface for a Fleet
-      // Design report, so it sits beside the other AI-report reads.
-      { name: 'Fleet Design', labelKey: 'nav.fleetDesign', href: '/ai-agents/fleet-design', icon: DraftingCompass, requiredPermission: { resource: 'ai_agents', action: 'read' } },
-      { name: 'AI Usage', labelKey: 'nav.aiUsage', href: '/settings/ai-usage', icon: BrainCircuit, partnerScopeOnly: true },
-      { name: 'Script authoring', labelKey: 'nav.scriptAuthoring', href: '/settings/ai-script-authoring', icon: FileCode, requiredPermission: { resource: 'ai_agents', action: 'read' } },
-      { name: 'Tool Sources', labelKey: 'nav.toolSources', href: '/settings/tool-sources', icon: Plug, requiresToolSources: true, requiredPermission: { resource: 'tool_sources', action: 'read' } },
-      { name: 'AI for Office', labelKey: 'nav.aiForOffice', href: '/ai-for-office', icon: FileSpreadsheet, partnerScopeOnly: true, requiresAiForOffice: true },
+      { name: 'Impact', labelKey: 'nav.impact', href: '/ai-agents/impact', icon: TrendingUp, heading: 'workers', requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      // A door for other people (end users in Office), not a worker.
+      { name: 'Breeze AI for Office', labelKey: 'nav.aiForOffice', href: '/ai-for-office', icon: FileSpreadsheet, partnerScopeOnly: true, requiresAiForOffice: true },
     ],
   },
   {
@@ -283,6 +353,7 @@ export const navSections: NavSection[] = [
     // Everything here reads/writes device state, gated on devices:read server-side.
     items: [
       { name: 'Device Groups', labelKey: 'nav.deviceGroups', href: '/devices/groups', icon: LayoutGrid, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'Sites', labelKey: 'nav.sites', href: '/settings/sites', icon: MapPin, testId: 'nav-sites', requiredPermission: { resource: 'sites', action: 'read' } },
       // Parked devices waiting for assignment — full partner admins only; the
       // pre-assignment routes also require devices:write and organizations:write.
       { name: 'Unassigned Devices', labelKey: 'nav.unassignedDevices', href: '/devices/unassigned', icon: Inbox, partnerScopeOnly: true, requiresPreAssignment: true, requiresPartnerWideAdmin: true, requiredPermission: { resource: 'devices', action: 'write' }, alsoRequiredPermissions: [{ resource: 'organizations', action: 'write' }] },
@@ -299,6 +370,8 @@ export const navSections: NavSection[] = [
       { name: 'OneDrive', labelKey: 'nav.oneDrive', href: '/onedrive', icon: Cloud, requiredPermission: { resource: 'devices', action: 'read' } },
       // MDM Module: Apple native MDM profiles — embedded in fleet management
       { name: 'MDM Profiles', labelKey: 'nav.mdmProfiles', href: '/mdm-profiles', icon: Smartphone, requiredPermission: { resource: 'devices', action: 'read' } },
+      // Messages sent to people at their devices and their delivery history (#8742).
+      { name: 'Messages', labelKey: 'nav.endpointMessages', href: '/endpoint-messages', icon: MessageSquare, requiredPermission: { resource: 'endpoint_messages', action: 'read' } },
     ],
   },
   {
@@ -311,6 +384,8 @@ export const navSections: NavSection[] = [
     items: [
       { name: 'Overview', labelKey: 'nav.securityOverview', href: '/security', icon: ShieldCheck, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'IOC Scans', labelKey: 'nav.securityScans', href: '/security/scans', icon: ScanSearch, requiredPermission: { resource: 'devices', action: 'read' } },
+      // YARA rule sets used by IOC scans (#6267).
+      { name: 'Detection Rules', labelKey: 'nav.securityDetectionRules', href: '/security/detection-rules', icon: FileCode, requiredPermission: { resource: 'devices', action: 'read' } },
       ...(ENABLE_EDR_INTEGRATIONS
         ? [{ name: 'EDR', labelKey: 'nav.edr', href: '/security/edr', icon: ShieldAlert, requiredPermission: { resource: 'devices', action: 'read' } } satisfies NavItem]
         : []),
@@ -347,7 +422,13 @@ export const navSections: NavSection[] = [
     icon: Ticket,
     requiresModule: 'service_management',
     items: [
-      { name: 'Tickets', labelKey: 'nav.tickets', href: '/tickets', icon: Ticket, requiredPermission: { resource: 'tickets', action: 'read' } },
+      { name: 'Tickets', labelKey: 'nav.tickets', href: '/tickets', icon: Ticket, testId: 'nav-tickets-all', requiredPermission: { resource: 'tickets', action: 'read' } },
+      // #7900 W3: one entry per ticket type, in ITIL order. Same page, filtered
+      // through the `type=` hash segment (see TicketsPage parseHash).
+      { name: 'Incidents', labelKey: 'nav.ticketsIncidents', href: '/tickets#type=incident', icon: Ticket, ticketType: 'incident', testId: 'nav-tickets-incident', requiredPermission: { resource: 'tickets', action: 'read' } },
+      { name: 'Service Requests', labelKey: 'nav.ticketsServiceRequests', href: '/tickets#type=service_request', icon: Ticket, ticketType: 'service_request', testId: 'nav-tickets-service_request', requiredPermission: { resource: 'tickets', action: 'read' } },
+      { name: 'Problems', labelKey: 'nav.ticketsProblems', href: '/tickets#type=problem', icon: Ticket, ticketType: 'problem', testId: 'nav-tickets-problem', requiredPermission: { resource: 'tickets', action: 'read' } },
+      { name: 'Changes', labelKey: 'nav.ticketsChanges', href: '/tickets#type=change', icon: Ticket, ticketType: 'change', testId: 'nav-tickets-change', requiredPermission: { resource: 'tickets', action: 'read' } },
       { name: 'Timesheets', labelKey: 'nav.timesheets', href: '/timesheet', icon: Clock, requiredPermission: { resource: 'time_entries', action: 'read' } },
     ],
   },
@@ -399,7 +480,9 @@ export const navSections: NavSection[] = [
       // Daily-use subset of the settings catalogue (lib/settingsCatalog.ts —
       // gates are defined once there). Everything else lives on /settings, which
       // is reached through the "More settings" entry below (#6220).
-      ...sidebarSettingsEntries(),
+      // A `sidebarOnly` entry is a group hub (Settings → AI, #10135); it carries
+      // its group so visibility can require a card in that group.
+      ...sidebarSettingsEntries().map((entry) => (entry.sidebarOnly ? { ...entry, hubGroup: entry.group } : entry)),
       { name: 'More settings', labelKey: 'nav.moreSettings', href: '/settings', icon: Settings },
     ],
   },
@@ -423,6 +506,7 @@ export const navSections: NavSection[] = [
       // adds the console path once one exists. The SQL fallback documented in
       // docs/deploy/ai-kill-switch.md still works and remains the runbook.
       { name: 'AI Kill Switch', labelKey: 'nav.aiKillSwitch', href: '/admin/ai-kill-switch', icon: Power, platformAdminOnly: true },
+      { name: 'Wisp', labelKey: 'nav.wisp', href: '/admin/wisp', icon: Sparkles, platformAdminOnly: true },
       // System page (spec 2026-09-23-system-connections-page-design.md, D7):
       // deployment-wide Connections status plus the #6605 Deprecations report
       // as tabs. Replaces the standalone Deprecations entry; its old settings
@@ -471,16 +555,17 @@ function saveExpandedSections(state: Record<string, boolean>) {
   try { localStorage.setItem('sidebar-sections', JSON.stringify(state)); } catch { /* Storage unavailable */ }
 }
 
-// Whether the "recent devices" rows under Devices & Assets are shown. Default
-// open; a user who wants a fully static nav collapses it once and it stays
-// collapsed. Safe to read in a useState initializer: the list itself is empty
-// on the server, so the flag cannot cause a hydration mismatch.
-export const RECENT_DEVICES_EXPANDED_KEY = 'sidebar-recent-devices';
-const RECENT_DEVICES_HREF = '/devices';
+// Whether the top-level Recent group is expanded. Default open; a user who
+// wants a fully static nav collapses it once and it stays collapsed. Safe to
+// read in a useState initializer: the group only renders after mount, so the
+// flag cannot cause a hydration mismatch. The old 'sidebar-recent-devices'
+// preference is deliberately not migrated.
+export const RECENT_EXPANDED_KEY = 'sidebar-recent';
+const TICKETS_PATH = '/tickets';
 
-function readRecentDevicesExpanded(): boolean {
+function readRecentExpanded(): boolean {
   try {
-    return localStorage.getItem(RECENT_DEVICES_EXPANDED_KEY) !== 'false';
+    return localStorage.getItem(RECENT_EXPANDED_KEY) !== 'false';
   } catch {
     return true;
   }
@@ -500,7 +585,39 @@ const pathAliases: Record<string, string> = {
   // sibling route, not a child, so prefix matching would leave the item
   // unhighlighted there.
   '/agreements/signed': '/agreements/templates',
+  // #10135: fix memory and fleet design are reports reached from the agents
+  // that write them, so the roster entry stays lit (and the AI section open).
+  '/ai-agents/fix-memory': '/settings/ai-agents',
+  '/ai-agents/fleet-design': '/settings/ai-agents',
+  // #10135: the AI settings screens are cards on the Settings → AI hub, so the
+  // hub's sidebar link stays lit on them (and on their detail pages).
+  '/settings/ai-usage': '/settings/ai',
+  '/settings/ai-script-authoring': '/settings/ai',
+  '/settings/tool-sources': '/settings/ai',
+  '/settings/wisp-memory': '/settings/ai',
 };
+
+// Exact alias first, then the alias of the nearest aliased ancestor path
+// (`/settings/tool-sources/<id>` → the tool-sources alias).
+function resolvePathAlias(path: string): string {
+  if (pathAliases[path]) return pathAliases[path];
+  for (const [from, to] of Object.entries(pathAliases)) {
+    if (path.startsWith(`${from}/`)) return to;
+  }
+  return path;
+}
+
+// Splits a section's items into consecutive runs that share a heading (or have
+// none), in order, so the renderer can label each headed run.
+function groupByHeading(items: NavItem[]): Array<{ heading?: NavHeadingId; items: NavItem[] }> {
+  const runs: Array<{ heading?: NavHeadingId; items: NavItem[] }> = [];
+  for (const item of items) {
+    const last = runs[runs.length - 1];
+    if (last && last.heading === item.heading) last.items.push(item);
+    else runs.push({ heading: item.heading, items: [item] });
+  }
+  return runs;
+}
 
 // Determine which section a given href belongs to (for auto-expand)
 function sectionForHref(href: string): string | null {
@@ -596,15 +713,17 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   modeRef.current = mode;
   const [hovered, setHovered] = useState(false);
   const recentDevices = useRecentsStore((s) => s.devices);
-  const [recentDevicesExpanded, setRecentDevicesExpanded] = useState<boolean>(readRecentDevicesExpanded);
-  const toggleRecentDevices = useCallback(() => {
-    setRecentDevicesExpanded((prev) => {
+  const recentPages = useRecentsStore((s) => s.pages);
+  const [recentExpanded, setRecentExpanded] = useState<boolean>(readRecentExpanded);
+  const toggleRecent = useCallback(() => {
+    setRecentExpanded((prev) => {
       const next = !prev;
-      try { localStorage.setItem(RECENT_DEVICES_EXPANDED_KEY, String(next)); } catch { /* Storage unavailable */ }
+      try { localStorage.setItem(RECENT_EXPANDED_KEY, String(next)); } catch { /* Storage unavailable */ }
       return next;
     });
   }, []);
   const currentPath = useCurrentPath(initialPath);
+  const currentHash = useCurrentHash();
   const navScrollRef = useSidebarScrollPersist();
   const isPlatformAdmin = useAuthStore((s) => s.user?.isPlatformAdmin === true);
   const storedPermissions = useAuthStore((s) => s.user?.permissions);
@@ -649,11 +768,18 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const [brandName, setBrandName] = useState<string | null>(null);
   const [brandLogoUrl, setBrandLogoUrl] = useState<string | null>(null);
   const [aiForOfficeEnabled, setAiForOfficeEnabled] = useState(false);
+  // #10135: 'unknown' until /orgs/partners/me answers (or for a non-partner
+  // token, which never asks). Only a real 'off' answer locks the Wisp entry, so
+  // a hosted page never flashes "not available" while the read is in flight.
+  const [wispServer, setWispServer] = useState<'unknown' | 'on' | 'off'>('unknown');
+  const wispEnabled = wispServer === 'on';
   // #5216 W01 — the server kill switch, read from /config through the shared
   // features store (the same one registration/aiOperatorTasks use).
   const autopayEnabled = useAutopayEnabled();
   const { enabled: toolSourcesEnabled } = useToolSourcesGate();
+  const { enabled: flowsEnabled } = useFlowsGate();
   const { enabled: preAssignmentEnabled } = usePreAssignmentGate();
+  const { enabled: aiOperatorTasksEnabled } = useAiOperatorTasksGate();
   // #5075 W04 — persisted, so the first paint after a reload already has the
   // right sections; the /orgs/partners/me effect below refreshes it.
   const serviceManagementMode = useOrgStore((state) => state.serviceManagementMode);
@@ -692,7 +818,8 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
     if (jwtScope !== 'partner') return;
 
     let cancelled = false;
-    fetchWithAuth('/orgs/partners/me')
+    // Shared with the other islands reading partners/me at load (#9172).
+    getPartnersMe()
       .then((r) => {
         if (!r.ok) {
           if (r.status !== 403 && r.status !== 404) {
@@ -700,18 +827,20 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
           }
           return null;
         }
-        return r.json() as Promise<{
+        return r.data as {
           name?: string;
           aiForOfficeEnabled?: boolean;
+          wispEnabled?: boolean;
           serviceManagementMode?: ServiceManagementMode;
           settings?: { branding?: { logoUrl?: string } };
-        }>;
+        };
       })
       .then((data) => {
         if (cancelled || !data) return;
         setBrandName(data.name ?? null);
         setBrandLogoUrl(data.settings?.branding?.logoUrl ?? null);
         setAiForOfficeEnabled(data.aiForOfficeEnabled === true);
+        setWispServer(data.wispEnabled === true ? 'on' : 'off');
         // Fail OPEN on anything unexpected: an older API that does not send the
         // field, or a value this build does not know, falls back to `native`
         // rather than withdrawing a module the partner is paying for. A failed
@@ -766,20 +895,38 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   // Find the best matching active href. Includes the runtime-extension items
   // (not part of the static `allNavItems`) so an extension's own page/nav
   // link highlights correctly while it's active.
-  const resolvedPath = pathAliases[currentPath] ?? currentPath;
+  const resolvedPath = resolvePathAlias(currentPath);
+  const recentEntries = useMemo(
+    () => selectRecentEntries({ devices: recentDevices, pages: recentPages }, resolvedPath),
+    [recentDevices, recentPages, resolvedPath],
+  );
   const activeHref = useMemo(() => {
     let best: string | null = null;
+    let bestLen = -1;
+    // Typed ticket entries share `/tickets` with plain Tickets: match on the
+    // parsed hash type (never the href string — the hash also carries the
+    // selection and sort), so exactly one of them is active.
+    const hashType = ticketTypeFromHash(currentHash);
     const candidates = extensionsSection ? [...allNavItems, ...extensionsSection.items] : allNavItems;
     for (const item of candidates) {
-      const matches = item.href === '/'
-        ? resolvedPath === '/'
-        : resolvedPath === item.href || resolvedPath.startsWith(item.href + '/');
-      if (matches && (!best || item.href.length > best.length)) {
+      const hrefPath = item.href.split('#')[0];
+      let matches: boolean;
+      if (item.ticketType) {
+        matches = resolvedPath === hrefPath && hashType === item.ticketType;
+      } else if (hrefPath === TICKETS_PATH) {
+        matches = resolvedPath === TICKETS_PATH ? hashType === null : resolvedPath.startsWith(TICKETS_PATH + '/');
+      } else if (hrefPath === '/') {
+        matches = resolvedPath === '/';
+      } else {
+        matches = resolvedPath === hrefPath || resolvedPath.startsWith(hrefPath + '/');
+      }
+      if (matches && hrefPath.length > bestLen) {
         best = item.href;
+        bestLen = hrefPath.length;
       }
     }
     return best;
-  }, [resolvedPath, extensionsSection]);
+  }, [resolvedPath, currentHash, extensionsSection]);
 
   // Auto-expand: the section containing the active page should be expanded.
   // Falls back to the extensions section (not covered by the static
@@ -857,18 +1004,37 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   // `renderNavItem` below so section-header visibility (renderCollapsibleSection)
   // matches what actually renders — a section whose items are all filtered out
   // must not show an empty header that expands to nothing.
-  const isNavItemVisible = (item: NavItem): boolean =>
-    isNavGateVisible(item, {
-      isPlatformAdmin,
-      permissions,
-      getScope: () => jwtScope,
-      autopayEnabled,
-      toolSourcesEnabled,
-      preAssignmentEnabled,
-      aiForOfficeEnabled,
-      serviceManagementMode,
-      canManagePartnerWide,
-    });
+  const navGateContext: NavGateContext = {
+    isPlatformAdmin,
+    permissions,
+    getScope: () => jwtScope,
+    autopayEnabled,
+    toolSourcesEnabled,
+    flowsEnabled,
+    preAssignmentEnabled,
+    aiForOfficeEnabled,
+    wispEnabled,
+    serviceManagementMode,
+    canManagePartnerWide,
+    // Extension names from the validated `/extensions/<name>/…` nav hrefs.
+    loadedExtensions: extensionNavLinks.map((link) => link.href.split('/')[2]).filter(Boolean),
+  };
+  const isNavItemVisible = (item: NavItem): boolean => {
+    if (item.requiresAiOperatorTasks && !aiOperatorTasksEnabled) return false;
+    if (!isNavGateVisible(item, navGateContext)) return false;
+    // #10135: a settings hub link (Settings → AI) never leads to an empty page —
+    // it shows only while one of the hub's cards passes the same gates.
+    if (item.hubGroup) {
+      // The hub has no permission of its own, so keep it hidden until the
+      // permission set is known (like every permission-gated item) rather than
+      // flashing it on the server render for users who can open none of it.
+      if (permissions === undefined) return false;
+      return SETTINGS_CATALOG.some(
+        (entry) => entry.group === item.hubGroup && !entry.sidebarOnly && isNavGateVisible(entry, navGateContext),
+      );
+    }
+    return true;
+  };
 
   const renderNavItem = (item: NavItem, forMobileOverlay = false) => {
     if (!isNavItemVisible(item)) return null;
@@ -883,17 +1049,27 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
           : undefined;
     const showBadge = typeof badgeCount === 'number' && badgeCount > 0;
     const label = item.labelKey ? t(/* i18n-dynamic */ item.labelKey, { defaultValue: item.name }) : item.name;
-    const withRecents = item.href === RECENT_DEVICES_HREF && labels && recentDevices.length > 0;
-    const anchor = (
+    // #10135 (Review Focus 1): Wisp is never hidden and never plain chat — when
+    // the server has it off the entry stays, locked, with the reason. The link
+    // still opens /wisp, which shows the same lock.
+    const lockedReason = item.lockedWhenWispOff && wispServer === 'off' ? t('nav.wispLockedServer') : null;
+    return (
       <a
-        data-testid={item.href === '/billing/autopay' ? 'autopay-nav' : undefined}
-        key={withRecents ? undefined : item.name}
+        data-testid={lockedReason ? 'nav-wisp-locked' : (item.testId ?? (item.href === '/billing/autopay' ? 'autopay-nav' : undefined))}
+        key={item.name}
         href={item.href}
-        title={narrow && !hovered ? label : undefined}
-        onClick={forMobileOverlay ? () => closeMobileMenu() : undefined}
+        aria-current={isActive ? 'page' : undefined}
+        title={lockedReason ?? (narrow && !hovered ? label : undefined)}
+        onClick={(event) => {
+          if (forMobileOverlay) closeMobileMenu();
+          // `/tickets#type=<t>` while already on /tickets: Astro's router would
+          // pushState it silently (no hashchange), leaving TicketsPage's
+          // useHashState filter stale (#8682 sweep). Cross-page clicks fall
+          // through to the router untouched.
+          claimSamePageHashClick(event, item.href);
+        }}
         className={cn(
           'flex items-center gap-3 rounded-md py-2 text-sm font-medium transition-colors',
-          withRecents && 'min-w-0 flex-1',
           // Icon rail: no horizontal padding, center the icon in the full row so
           // the highlight box and icon share the rail's centre line regardless
           // of the available width.
@@ -905,6 +1081,12 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
       >
         <item.icon className="h-5 w-5 shrink-0" />
         {labels && <span className="truncate flex-1">{label}</span>}
+        {lockedReason && (
+          <>
+            {labels && <Lock data-testid="nav-wisp-lock-icon" className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
+            <span className="sr-only">{lockedReason}</span>
+          </>
+        )}
         {labels && showBadge && (
           <span
             className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-500/20 px-1.5 chart-legend-xs font-semibold text-amber-800 dark:bg-amber-500/30 dark:text-amber-200"
@@ -919,59 +1101,49 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
         )}
       </a>
     );
-    if (!withRecents) return anchor;
+  };
 
-    // Recently opened devices (recentsStore), newest first. The chevron sits
-    // beside the row rather than inside the <a> — nested interactive content
-    // is invalid HTML and breaks keyboard focus order.
-    const toggleLabel = recentDevicesExpanded
-      ? t('layout.sidebar.hideRecentDevices')
-      : t('layout.sidebar.showRecentDevices');
+  // --- Recent group (devices + named records, newest first) -----------------
+  // Renders only after mount: the recents store is filled client-side by
+  // GlobalShortcuts, so the server HTML never has it. Not shown in the icon rail.
+  const renderRecentGroup = (forMobileOverlay = false) => {
+    const labels = forMobileOverlay ? true : showLabels;
+    if (!hydrated || !labels || recentEntries.length === 0) return null;
+    const toggleLabel = recentExpanded ? t('layout.sidebar.hideRecent') : t('layout.sidebar.showRecent');
     return (
-      <div key={item.name}>
-        <div className="flex items-center gap-1">
-          {anchor}
-          <button
-            type="button"
-            onClick={toggleRecentDevices}
-            aria-expanded={recentDevicesExpanded}
-            aria-label={toggleLabel}
-            title={toggleLabel}
-            className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <ChevronDown
-              className={cn(
-                'h-3.5 w-3.5 transition-transform duration-200',
-                recentDevicesExpanded ? 'rotate-0' : '-rotate-90'
-              )}
-            />
-          </button>
-        </div>
-        {recentDevicesExpanded && (
-          <ul
-            data-testid="sidebar-recent-devices"
-            aria-label={t('layout.sidebar.recentDevices')}
-            className="mt-0.5 space-y-0.5"
-          >
-            {recentDevices.map((device) => {
-              const href = `${RECENT_DEVICES_HREF}/${device.id}`;
-              const current = resolvedPath === href;
+      <div key="recent-group" data-testid="sidebar-recent-group">
+        <button
+          type="button"
+          data-testid="sidebar-recent-toggle"
+          onClick={toggleRecent}
+          aria-expanded={recentExpanded}
+          aria-label={toggleLabel}
+          title={toggleLabel}
+          className="flex items-center justify-between w-full px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+          style={{ fontSize: '12px' }}
+        >
+          <span>{t('layout.sidebar.recent')}</span>
+          <ChevronDown
+            className={cn(
+              'h-3.5 w-3.5 transition-transform duration-200',
+              recentExpanded ? 'rotate-0' : '-rotate-90'
+            )}
+          />
+        </button>
+        {recentExpanded && (
+          <ul data-testid="sidebar-recent" aria-label={t('layout.sidebar.recent')} className="mt-0.5 space-y-0.5">
+            {recentEntries.map((entry) => {
+              const Icon = RECENT_ENTRY_ICONS[entry.kind];
               return (
-                <li key={device.id}>
+                <li key={entry.href} data-kind={entry.kind}>
                   <a
-                    href={href}
-                    aria-current={current ? 'page' : undefined}
-                    title={device.name}
+                    href={entry.href}
+                    title={entry.label}
                     onClick={forMobileOverlay ? () => closeMobileMenu() : undefined}
-                    className={cn(
-                      'flex items-center gap-2 rounded-md py-1.5 pl-9 pr-3 text-sm transition-colors',
-                      current
-                        ? 'bg-muted text-foreground'
-                        : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                    )}
+                    className="flex items-center gap-2 rounded-md py-1.5 pl-3 pr-3 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
-                    <Clock className="h-3.5 w-3.5 shrink-0 opacity-70" aria-hidden="true" />
-                    <span className="truncate">{device.name}</span>
+                    <Icon className="h-3.5 w-3.5 shrink-0 opacity-70" aria-hidden="true" />
+                    <span className="truncate">{entry.label}</span>
                   </a>
                 </li>
               );
@@ -981,6 +1153,15 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
       </div>
     );
   };
+
+  // Top-level items, with the Recent group directly under Dashboard.
+  const renderTopLevelNav = (forMobileOverlay = false) =>
+    topLevelNav.map((item) => (
+      <Fragment key={item.name}>
+        {renderNavItem(item, forMobileOverlay)}
+        {item.href === '/' && renderRecentGroup(forMobileOverlay)}
+      </Fragment>
+    ));
 
   // --- Render a collapsible section ----------------------------------------
   const renderCollapsibleSection = (section: NavSection, forMobileOverlay = false) => {
@@ -996,7 +1177,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
     const labels = forMobileOverlay ? true : showLabels;
 
     return (
-      <div key={section.id}>
+      <div key={section.id} data-testid={`nav-section-${section.id}`}>
         <div className="my-2 border-t" />
         {/* In collapsed mode (no labels), show only the section icon */}
         {!labels ? (
@@ -1029,7 +1210,30 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
             inert={!expanded || undefined}
           >
             <div>
-              {section.items.map((item) => renderNavItem(item, forMobileOverlay))}
+              {groupByHeading(section.items).map((run) => {
+                if (!run.heading) return run.items.map((item) => renderNavItem(item, forMobileOverlay));
+                // A heading over nothing is noise (Review Focus 3): drop it
+                // when every member is hidden by its gates.
+                if (!run.items.some(isNavItemVisible)) return null;
+                const heading = section.headings?.[run.heading];
+                const headingId = `nav-heading-${section.id}-${run.heading}${forMobileOverlay ? '-mobile' : ''}`;
+                return (
+                  <div key={`heading:${run.heading}`} role="group" aria-labelledby={headingId}>
+                    <div
+                      id={headingId}
+                      data-testid={`nav-heading-${run.heading}`}
+                      className="px-3 pb-1 pt-2 text-xs font-medium text-muted-foreground/80"
+                    >
+                      {heading
+                        ? t(/* i18n-dynamic */ heading.labelKey, { defaultValue: heading.label })
+                        : run.heading}
+                    </div>
+                    <div className="ml-3 border-l pl-1">
+                      {run.items.map((item) => renderNavItem(item, forMobileOverlay))}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -1063,7 +1267,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const sidebarContent = (
     <aside
       className={cn(
-        'flex h-full flex-col border-r bg-card transition-all duration-200',
+        'flex h-full flex-col border-r bg-card transition-shadow duration-200',
         // Hide completely on mobile — the overlay handles it
         isMobile && 'hidden',
         // z-30: app-chrome overlay band. In-page sticky chrome (e.g. the quote/
@@ -1117,13 +1321,13 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
         className="sidebar-nav flex-1 min-h-0 space-y-1 overflow-y-auto p-2"
         style={{ scrollbarGutter: showLabels ? 'stable' : 'auto' }}
       >
-        {topLevelNav.map((item) => renderNavItem(item))}
+        {renderTopLevelNav()}
         {navSections.map((section) => renderCollapsibleSection(section))}
         {extensionsSection && renderCollapsibleSection(extensionsSection)}
       </nav>
 
       {showLabels && (
-        <div className="border-t px-4 py-2 text-[10px] text-muted-foreground/50">
+        <div className="border-t px-4 py-2 text-[11px] text-muted-foreground">
           <p>
             Web <VersionSpan version={WEB_VERSION} latest={latestVersion} component="Web" />
             {apiVersion && apiVersion !== 'unavailable' && (
@@ -1136,7 +1340,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
           <button
             type="button"
             onClick={() => window.dispatchEvent(new Event(REOPEN_EVENT))}
-            className="hover:text-muted-foreground hover:underline"
+            className="hover:text-foreground hover:underline"
           >
             {t('whatsNew.link')}
           </button>
@@ -1179,7 +1383,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
         </div>
 
         <nav className="sidebar-nav flex-1 min-h-0 space-y-1 overflow-y-auto p-2">
-          {topLevelNav.map((item) => renderNavItem(item, true))}
+          {renderTopLevelNav(true)}
           {navSections.map((section) => renderCollapsibleSection(section, true))}
           {extensionsSection && renderCollapsibleSection(extensionsSection, true)}
         </nav>

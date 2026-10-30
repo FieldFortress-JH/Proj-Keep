@@ -23,9 +23,12 @@
     "adminUsersDetailDevices": "Geräte des Benutzers",
     "aiAgentsImpact": "KI-Wirkung",
     "aiAgentsFixMemory": "Fix-Gedächtnis",
+    "flows": "Abläufe",
+    "flowDetail": "Ablauf",
+    "flowRun": "Ablaufausführung",
     "aiAgentsRunsDetail": "Lauf-Details",
     "aiAgentsRuns": "Agenten-Läufe",
-    "aiForOffice": "KI für Office",
+    "aiForOffice": "Breeze AI for Office",
     "aiRisk": "KI-Risiko-Engine",
     "alertsDelivery": "Warnungen – Zustellung",
     "alertsCorrelations": "Warnmeldungskorrelationen",
@@ -70,10 +73,10 @@
     "dnsSecurity": "DNS-Sicherheit",
     "dr": "Notfallwiederherstellung",
     "extensionsNamePath": "Erweiterung",
-    "fleet": "Flottenorchestrierung",
+    "fleet": "Erkenntnisse",
     "forgotPassword": "Passwort vergessen",
     "incidentsDetail": "Vorfalldetails",
-    "incidents": "Vorfälle",
+    "incidents": "Sicherheitsvorfälle",
     "dashboard": "Dashboard",
     "integrations": "Integrationen",
     "integrationsPsa": "PSA-Integrationen",
@@ -94,6 +97,7 @@
     "policies": "Richtlinien",
     "policiesNew": "Neue Richtlinie",
     "quick": "Schnellsupport",
+    "verify": "Supportanfrage prüfen",
     "registerPartner": "Registrieren Sie Ihr Unternehmen",
     "remoteFilesDevice": "Remote-Dateimanager",
     "remoteFiles": "Dateiübertragung starten",
@@ -138,6 +142,7 @@
     "settingsBilling": "Abrechnungseinstellungen",
     "settingsCatalog": "Produktkatalog",
     "settingsConnectedApps": "Verbundene Apps",
+    "settingsDeliverableTemplates": "Leistungsvorlagen",
     "settingsCustomFields": "Benutzerdefinierte Felder",
     "settingsEnrollmentKeys": "Registrierungsschlüssel",
     "settingsFilters": "Gespeicherte Filter",
@@ -151,6 +156,7 @@
     "settingsProfile": "Profileinstellungen",
     "settingsRoles": "Rollen",
     "settingsSitesDetail": "Standorteinstellungen",
+    "settingsSites": "Standorte",
     "settingsSso": "Single Sign-On (SSO)",
     "settingsUsers": "Benutzer",
     "settingsVariables": "Variablen",
@@ -164,7 +170,6 @@
     "ticketsNew": "Ticket erstellen",
     "timesheet": "Zeiterfassung",
     "vulnerabilities": "Schwachstellen",
-    "workspace": "KI-Assistent",
     "aiAgentsFleetDesign": "Flottendesign",
     "agreementTemplates": "Vereinbarungsvorlagen",
     "agreementTemplateDetail": "Vereinbarungsvorlage",
@@ -174,7 +179,19 @@
     "securityScans": "IOC-Scans",
     "devicesTime": "Zeitsynchronisierung",
     "adminAiModels": "KI-Modelle",
-    "billingAutopay": "Automatic payments"
+    "adminWisp": "Wisp",
+    "billingAutopay": "Automatische Zahlungen",
+    "endpointMessages": "Endpunkt-Nachrichten",
+    "securityDetectionRules": "Erkennungsregeln",
+    "settingsPlan": "Tarif & Funktionen",
+    "settingsWispMemory": "Wisp-Gedächtnis",
+    "wispThread": "Wisp-Thread",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "KI-Aufgaben",
+    "aiTask": "KI-Aufgabe",
+    "settingsAi": "KI-Einstellungen",
+    "settingsFlowLimits": "Ablauflimits"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote-Überwachung und -Verwaltung",
@@ -182,6 +199,10 @@
   },
   "authShell": {
     "tagline": "Die moderne RMM-Plattform für Geschwindigkeit, Klarheit und Skalierbarkeit."
+  },
+  "authFooter": {
+    "reportAbuse": "Missbrauch melden",
+    "security": "Sicherheit"
   },
   "errorPage": {
     "notFoundBody": "Die gesuchte Seite existiert nicht oder wurde möglicherweise verschoben.",
@@ -224,7 +245,7 @@
       },
       "connectedApps": {
         "title": "Verbundene Apps",
-        "description": "Überprüfen und widerrufen Sie KI-Assistenten und MCP-Clients, die Zugriff auf Ihren Mandanten haben."
+        "description": "KI-Clients prüfen und widerrufen, die auf Ihren Mandanten zugreifen dürfen."
       },
       "officeAddinBindings": {
         "title": "Outlook-Add-In-Bindungen",
@@ -253,6 +274,18 @@
       },
       "alertTemplates": {
         "title": "Alarmvorlagen"
+      },
+      "plan": {
+        "title": "Tarif & Funktionen",
+        "description": "Ihr Tarif, welche Funktionen er umfasst und woher jede einzelne stammt."
+      },
+      "wispMemory": {
+        "title": "Wisp-Gedächtnis",
+        "description": "Prüfen, bestätigen und widerrufen, was Wisp sich merkt."
+      },
+      "flowLimits": {
+        "title": "Ablauflimits",
+        "description": "Monatliche Ausführungslimits und das KI-Token-Limit für Abläufe."
       }
     },
     "groups": {
@@ -275,7 +308,7 @@
   },
   "settingsConnectedAppsPage": {
     "heading": "Verbundene Apps",
-    "description": "KI-Assistenten und andere MCP-Clients, die per OAuth für den Zugriff auf Ihren Mandanten autorisiert wurden. Widerrufen Sie den Zugriff jederzeit — das Token der App wird innerhalb von 10 Minuten abgelehnt."
+    "description": "KI-Clients, die über OAuth für den Zugriff auf Ihren Mandanten autorisiert wurden. Der Zugriff kann jederzeit widerrufen werden – das Token der App wird nach spätestens 10 Minuten abgelehnt."
   },
   "settingsOrganizationBillingPage": {
     "backLink": "← Organisationseinstellungen",

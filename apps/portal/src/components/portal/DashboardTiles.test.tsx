@@ -2,7 +2,16 @@
 import { render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DashboardTiles, DashboardUnavailable } from './DashboardTiles';
-import type { DashboardDto } from '@breeze/shared';
+import type { BackupTileDto, DashboardDto } from '@breeze/shared';
+
+const BACKUP_TILE: BackupTileDto = {
+  status: 'not_configured',
+  completedAt: null,
+  verificationType: null,
+  configured: 0,
+  total: 10,
+  asOf: '2026-09-02T12:00:00.000Z',
+};
 
 const dashboard: DashboardDto = {
   asOf: '2026-09-02T12:00:00.000Z',
@@ -30,14 +39,7 @@ const dashboard: DashboardDto = {
     timezone: 'America/Denver',
     asOf: '2026-09-02T12:00:00.000Z',
   },
-  backup: {
-    status: 'not_configured',
-    completedAt: null,
-    verificationType: null,
-    configured: 0,
-    total: 10,
-    asOf: '2026-09-02T12:00:00.000Z',
-  },
+  backup: BACKUP_TILE,
   support: {
     status: 'ok',
     openTickets: 3,
@@ -108,6 +110,43 @@ describe('DashboardTiles', () => {
     expect(awaiting.textContent).toContain('are waiting for you');
   });
 
+  it('counts agreements awaiting the user\'s signature in the awaiting-you line', () => {
+    const agreements = [
+      { id: 'a1', name: 'MSA', templateName: 'MSA', status: 'sent' as const, sentAt: null, expiresAt: '2026-11-10T00:00:00.000Z', canSign: true },
+      // On the recipient list of someone else: not the user's to sign, so not "waiting on you".
+      { id: 'a2', name: 'DPA', templateName: 'DPA', status: 'sent' as const, sentAt: null, expiresAt: '2026-11-10T00:00:00.000Z', canSign: false },
+    ];
+    render(
+      <DashboardTiles
+        dashboard={{ ...dashboard, awaitingYou: { ...dashboard.awaitingYou, proposals: 0, invoices: 0 } }}
+        agreements={agreements}
+      />,
+    );
+    const awaiting = screen.getByTestId('portal-dashboard-tile-awaiting-you');
+    expect(awaiting.textContent).not.toContain('Nothing is waiting on you.');
+    expect(within(awaiting).getByRole('link', { name: '1 agreement' }).getAttribute('href')).toContain('/agreements');
+    expect(awaiting.textContent).toContain('1 agreement is waiting for you.');
+  });
+
+  it('joins three kinds of waiting item with commas and "and"', () => {
+    const agreements = [
+      { id: 'a1', name: 'MSA', templateName: 'MSA', status: 'sent' as const, sentAt: null, expiresAt: '2026-11-10T00:00:00.000Z', canSign: true },
+    ];
+    render(<DashboardTiles dashboard={dashboard} agreements={agreements} />);
+    const awaiting = screen.getByTestId('portal-dashboard-tile-awaiting-you');
+    expect(awaiting.textContent).toContain('1 proposal, 2 invoices and 1 agreement are waiting for you.');
+  });
+
+  it('renders the agreements-to-sign card under the page heading, not above it', () => {
+    const agreements = [
+      { id: 'a1', name: 'MSA', templateName: 'MSA', status: 'sent' as const, sentAt: null, expiresAt: '2026-11-10T00:00:00.000Z', canSign: true },
+    ];
+    render(<DashboardTiles dashboard={dashboard} agreements={agreements} />);
+    const heading = screen.getByRole('heading', { level: 1, name: 'Dashboard' });
+    const card = screen.getByTestId('dashboard-agreements-awaiting');
+    expect(heading.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it('says so warmly when nothing is awaiting the customer', () => {
     render(
       <DashboardTiles
@@ -152,7 +191,7 @@ describe('DashboardTiles', () => {
             total: 2,
           },
           backup: {
-            ...dashboard.backup,
+            ...BACKUP_TILE,
             status: 'ok',
             completedAt: '2026-09-02T11:00:00.000Z',
             verificationType: 'automated',
@@ -191,7 +230,7 @@ describe('DashboardTiles', () => {
             total: 2,
           },
           backup: {
-            ...dashboard.backup,
+            ...BACKUP_TILE,
             status: 'ok',
             completedAt: '2026-09-02T11:00:00.000Z',
             verificationType: 'automated',
@@ -294,7 +333,7 @@ describe('DashboardTiles', () => {
         dashboard={{
           ...dashboard,
           backup: {
-            ...dashboard.backup,
+            ...BACKUP_TILE,
             status: 'ok',
             completedAt: '2026-09-02T11:00:00.000Z',
             verificationType: 'automated',
@@ -399,5 +438,23 @@ describe('security score rule', () => {
     expect(rule.getAttribute('aria-label')).toMatch(/^Score \d+ of 100/);
     const fill = rule.querySelector('[data-testid="portal-score-rule-fill"]');
     expect(fill?.getAttribute('width')).toBe(String(dashboard.securityScore.score));
+  });
+});
+
+describe('DashboardTiles — backup row gate (#9351)', () => {
+  const withoutBackup = (): DashboardDto => {
+    const d = { ...dashboard, devicesProtected: { ...dashboard.devicesProtected, protected: 2, unprotected: 0, unknown: 0, total: 2 } };
+    delete (d as { backup?: unknown }).backup;
+    return d;
+  };
+
+  it('omits the backup row when the dashboard carries no backup tile', () => {
+    render(<DashboardTiles dashboard={withoutBackup()} />);
+    expect(screen.queryByTestId('portal-dashboard-tile-backup')).toBeNull();
+  });
+
+  it('headlines devices only when there is no backup tile', () => {
+    render(<DashboardTiles dashboard={withoutBackup()} />);
+    expect(screen.getByText('All 2 devices have endpoint protection.')).toBeTruthy();
   });
 });

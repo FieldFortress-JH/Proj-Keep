@@ -1,10 +1,15 @@
 import TopologyEntry from '../topology/TopologyEntry';
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { useHashState } from "@/lib/useHashState";
+import { eventLogFilterFromHash, type EventLogFilter } from "@/lib/deviceEventLogLink";
+import { usePermissions } from "@/lib/permissions";
+import { ENABLE_ENDPOINT_MESSAGING } from "@/lib/featureFlags";
+import DeviceChatPanel from "../endpointMessages/DeviceChatPanel";
 import { fetchWithAuth } from "../../stores/auth";
 import { asList } from "@/lib/asList";
 import {
   Monitor,
+  Container,
   Cpu,
   Database,
   MemoryStick,
@@ -35,11 +40,14 @@ import {
   History,
   Bot,
   Smartphone,
+  MessageSquare,
 } from "lucide-react";
 import { formatPercent } from "@/lib/i18n/format";
 import { formatUptime } from "../../lib/utils";
 import type { Device, DeviceStatus } from "./DeviceList";
-import { formatDeviceSummaryOs } from "./osDisplay";
+import { formatOsLabel } from "./formatOsLabel";
+import { formatTimeAgo } from "@/lib/formatTime";
+import { formatDateTime } from "@/lib/dateTimeFormat";
 import RebootScheduledBadge from "./RebootScheduledBadge";
 import UninstallStateBadge from "./UninstallStateBadge";
 import DeviceActions from "./DeviceActions";
@@ -54,6 +62,7 @@ import DeviceAlertHistory from "./DeviceAlertHistory";
 import DeviceActivityFeed from "./DeviceActivityFeed";
 import DeviceAiActivitySignal from "./DeviceAiActivitySignal";
 import DeviceQueuedActions from "./DeviceQueuedActions";
+import DeviceOverviewState from "./DeviceOverviewState";
 import DeviceScriptHistory from "./DeviceScriptHistory";
 import DevicePerformanceGraphs from "./DevicePerformanceGraphs";
 import DeviceEventLogViewer from "./DeviceEventLogViewer";
@@ -67,7 +76,12 @@ import DeviceChangeHistoryTab from "./DeviceChangeHistoryTab";
 import DeviceBootPerformanceTab from "./DeviceBootPerformanceTab";
 import DevicePlaybookHistory from "./DevicePlaybookHistory";
 import DevicePeripheralsTab from "./DevicePeripheralsTab";
+import DeviceWorkloadsTab from "./DeviceWorkloadsTab";
+import DeviceRestorePointAttempts from "./DeviceRestorePointAttempts";
 import DeviceWarrantyCard from "./DeviceWarrantyCard";
+import PhysicalPlacementCard from "./PhysicalPlacementCard";
+import { EntityLink } from "@/components/shared/EntityLink";
+import WispLinkButton from "@/components/wisp/WispLinkButton";
 import DeviceBillingCard from "./DeviceBillingCard";
 import DeviceUserIdleStat from "./DeviceUserIdleStat";
 import MacOSPermissionsBanner from "./MacOSPermissionsBanner";
@@ -87,8 +101,9 @@ import DeviceMonitoringTab from "./DeviceMonitoringTab";
 import DeviceComplianceTab from "./DeviceComplianceTab";
 import DeviceLinkedProfilesTab from "./DeviceLinkedProfilesTab";
 import MdmDeviceTab from "../mdm/MdmDeviceTab";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import ContactResponsibilitiesCard from "../shared/ContactResponsibilitiesCard";
 import { Puzzle } from "lucide-react";
 import ExtensionSlotHost, {
   useExtensionSlotDescriptors,
@@ -121,11 +136,14 @@ type CoreTab =
   | "boot-performance"
   | "playbooks"
   | "peripherals"
+  | "workloads"
+  | "system-restore"
   | "backup"
   | "linked-profiles"
   | "tickets"
   | "operator-tasks"
-  | "mdm";
+  | "mdm"
+  | "chat";
 
 /**
  * Extension-contributed `device.detail.tabs` tab id:
@@ -145,9 +163,44 @@ type Tab = CoreTab | ExtTab;
 type DeviceDetailsProps = {
   device: Device;
   timezone?: string;
-  onBack?: () => void;
   onAction?: (action: string, device: Device) => void;
+  /**
+   * Timestamp of the newest CPU/RAM sample behind `device.cpuPercent` /
+   * `ramPercent`; `null` = the device has no sample in the last 24h. Omitted =
+   * the caller cannot say, so only the offline rule applies (#9026).
+   */
+  metricsSampledAt?: string | null;
+  /** The user's working org (null = fleet view); drives the scope cue (#9027). */
+  workingOrgId?: string | null;
+  /** Switch the working org to this device's org and stay on the record. */
+  onSwitchToDeviceOrg?: () => void;
 };
+
+// Sub-line record links: foreground colour plus a quiet resting underline, so
+// they are distinguishable from the plain OS / agent text beside them (#9026).
+// Below md they also get a 32px tap height (#9028).
+const SUBLINE_LINK =
+  "text-foreground underline decoration-muted-foreground/50 underline-offset-4 hover:decoration-foreground max-md:inline-flex max-md:min-h-[32px] max-md:items-center";
+
+// A sample is written on every heartbeat that carries metrics (60s by
+// default, routes/agents/heartbeat.ts). Twice the API's 5-minute offline
+// threshold (services/deviceLiveness) tolerates a lengthened heartbeat or a
+// skipped sample without flapping to "—", while a genuinely stale number
+// still never reads as live.
+export const METRIC_SAMPLE_FRESH_MS = 10 * 60 * 1000;
+
+/** Whether the header's CPU/RAM numbers describe the machine right now (#9026). */
+export function metricsAreCurrent(
+  status: DeviceStatus,
+  sampledAt: string | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (status === "offline" || status === "decommissioned") return false;
+  if (sampledAt === undefined) return true;
+  if (!sampledAt) return false;
+  const at = Date.parse(sampledAt);
+  return Number.isFinite(at) && now - at <= METRIC_SAMPLE_FRESH_MS;
+}
 
 const statusColors: Record<DeviceStatus, string> = {
   online: "bg-success/15 text-success border-success/30",
@@ -221,11 +274,14 @@ const VALID_TABS: CoreTab[] = [
   "boot-performance",
   "playbooks",
   "peripherals",
+  "workloads",
+  "system-restore",
   "backup",
   "linked-profiles",
   "tickets",
   "operator-tasks",
   "mdm",
+  "chat",
 ];
 
 // Mirrors the character set an `ExtensionSlotDescriptor.key` can contain:
@@ -242,7 +298,8 @@ const EXT_TAB_RE = /^ext:[a-z][a-z0-9-]{1,31}:[a-z0-9._:-]+$/;
 // direct unit-testing of the hash round-trip without mounting the (heavy)
 // full component.
 export function tabFromHash(hash: string): Tab | undefined {
-  const seg = hash.split("/")[0] ?? "";
+  // `&k=v` filters may follow the tab segment (`#eventlog&from=…`); strip them.
+  const seg = hash.split("/")[0]?.split("&")[0] ?? "";
   if (VALID_TABS.includes(seg as CoreTab)) return seg as CoreTab;
   if (EXT_TAB_RE.test(seg)) return seg as ExtTab;
   return undefined;
@@ -271,14 +328,18 @@ type LinkedNetworkAsset = { id: string; label: string };
 // Task 4). Renders nothing while loading or when there are zero matches —
 // most devices were never seen by network discovery, and a permanent empty
 // row would just be noise.
-function NetworkAssetRow({ deviceId }: { deviceId: string }) {
+function NetworkAssetRow({ deviceId, orgId }: { deviceId: string; orgId?: string }) {
   const { t } = useTranslation("devices");
   const [assets, setAssets] = useState<LinkedNetworkAsset[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setAssets(null);
-    fetchWithAuth(`/discovery/assets?linkedDeviceId=${deviceId}`)
+    // The endpoint 400s ("orgId is required") for partner/all-orgs sessions
+    // unless told which org owns the device.
+    const params = new URLSearchParams({ linkedDeviceId: deviceId });
+    if (orgId) params.set("orgId", orgId);
+    fetchWithAuth(`/discovery/assets?${params.toString()}`)
       .then(async (res) => {
         if (!res.ok) return [];
         const data = await res.json();
@@ -295,7 +356,7 @@ function NetworkAssetRow({ deviceId }: { deviceId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [deviceId]);
+  }, [deviceId, orgId]);
 
   if (!assets || assets.length === 0) return null;
 
@@ -341,14 +402,70 @@ function NetworkAssetRow({ deviceId }: { deviceId: string }) {
   );
 }
 
+/** One cell of the Overview stat strip; an unknown value is muted so the eye
+ *  lands on the stats that are actually there. */
+function HeaderStat({
+  icon,
+  label,
+  value,
+  title,
+  testId,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  title?: string;
+  testId?: string;
+}) {
+  const unknown = value === "—";
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <span className="shrink-0" aria-hidden="true">
+          {icon}
+        </span>
+        <span className="min-w-0 truncate">{label}</span>
+      </div>
+      <p
+        data-testid={testId}
+        title={title}
+        className={`mt-1 truncate text-lg font-semibold tabular-nums ${
+          unknown ? "text-muted-foreground/60" : ""
+        }`}
+      >
+        {value}
+      </p>
+    </div>
+  );
+}
+
 export default function DeviceDetails({
   device,
   timezone,
-  onBack,
   onAction,
+  metricsSampledAt,
+  workingOrgId,
+  onSwitchToDeviceOrg,
 }: DeviceDetailsProps) {
+  // #9027: the record is in another org than the one the user is working in
+  // (fleet view has no working org, so it never shows the cue).
+  const scopeMismatch =
+    workingOrgId != null && device.orgId !== "" && workingOrgId !== device.orgId;
   const { t } = useTranslation("devices");
   usePageItemName(device.displayName || device.hostname);
+  const deviceName = device.displayName || device.hostname;
+  const showHostname = Boolean(device.hostname) && device.hostname !== deviceName;
+  const statsCurrent = metricsAreCurrent(device.status, metricsSampledAt);
+  const formatStat = (value: number) =>
+    statsCurrent && Number.isFinite(value)
+      ? formatPercent(value / 100, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+      : "—";
+  // "Offline · last seen 25 minutes ago": state first when the machine is gone.
+  const lastSeenValid = !Number.isNaN(new Date(device.lastSeen).getTime()) && device.lastSeen !== "";
+  const statusText =
+    device.status === "offline" && lastSeenValid
+      ? t("deviceDetails.offlineLastSeen", { ago: formatTimeAgo(device.lastSeen) })
+      : statusLabels[device.status];
   // Enabled `device.detail.tabs` contributions, deterministically ordered.
   // Never throws — a registry failure or zero enabled contributions simply
   // appends no extension tabs (see useExtensionSlotDescriptors).
@@ -360,6 +477,11 @@ export default function DeviceDetails({
   const [highlightedExecutionId, setHighlightedExecutionId] = useHashState<
     string | undefined
   >(undefined, scriptExecutionIdFromHash);
+  // Wave F (#9791): `#eventlog[/<source>]&from=&to=` hands the reliability
+  // scoring window (and, where one exists, the exact source) to the Event log tab.
+  const [eventLogFilter, setEventLogFilter] = useHashState<
+    EventLogFilter | undefined
+  >(undefined, eventLogFilterFromHash);
   // Whether the Overview Activity rail is collapsed to its thin vertical bar.
   // Starts collapsed so the page paints at full width during the async load and
   // never flashes a rail that then vanishes (the v0.85.0 stretch bug). Once the
@@ -393,6 +515,7 @@ export default function DeviceDetails({
     setActiveTab(tab);
     setFocusedAnomalyId(undefined);
     setHighlightedExecutionId(undefined);
+    setEventLogFilter(undefined);
   };
 
   // Use provided timezone or browser default
@@ -409,8 +532,15 @@ export default function DeviceDetails({
   // about linkage, so a `#linked-profiles` deep link on an unlinked device
   // would otherwise select a tab that has no button and no panel — a blank
   // content area. Resolve it back to Overview here, where linkage is known.
+  // Chat (#8743) is hidden unless the build enables endpoint messaging AND the
+  // user may send (UX gate; every chat route re-checks server-side). A
+  // `#chat/<conversationId>` deep link without access falls back to Overview.
+  const { can } = usePermissions();
+  const canChat = ENABLE_ENDPOINT_MESSAGING && can("endpoint_messages", "send");
   const activeTab: Tab =
-    hashTab === "linked-profiles" && !isLinked ? "overview" : hashTab;
+    (hashTab === "linked-profiles" && !isLinked) || (hashTab === "chat" && !canChat)
+      ? "overview"
+      : hashTab;
 
   // "Needs attention" counts per signal tab (GET /devices/:id/tab-counts).
   // Drives the badges and the promotion of by-default-empty tabs (Anomalies,
@@ -558,6 +688,9 @@ export default function DeviceDetails({
     },
     {
       id: "topology",
+      // #9030: grouped, so it sits under the Monitoring header in "More"
+      // instead of orphaned above the first section.
+      group: groups.monitoring,
       label: t("topology:title"),
       icon: <Network className="h-4 w-4" />,
       title: t("topology:title"),
@@ -615,6 +748,35 @@ export default function DeviceDetails({
       icon: <Usb className="h-4 w-4" />,
       title: t("deviceDetails.usbBluetoothAndConnectedDevices"),
     },
+    // Workload hosts only (#8193): hostsWorkloads is true once any container
+    // or VM runtime is detected. A `#workloads` deep link still mounts the
+    // panel on other devices — it explains "no runtime" / "agent too old"
+    // rather than leaving a blank content area.
+    ...(device.hostsWorkloads
+      ? [
+          {
+            id: "workloads" as Tab,
+            group: groups.inventory,
+            label: t("deviceDetails.workloads"),
+            icon: <Container className="h-4 w-4" />,
+            title: t("deviceDetails.workloadsTitle"),
+          },
+        ]
+      : []),
+    // Windows only (#4759): System Restore request ledger. A `#system-restore`
+    // deep link still mounts the panel on other devices, where the explicit
+    // empty state explains there is nothing recorded.
+    ...(device.os === "windows"
+      ? [
+          {
+            id: "system-restore" as Tab,
+            group: groups.management,
+            label: t("deviceDetails.systemRestore"),
+            icon: <History className="h-4 w-4" />,
+            title: t("deviceDetails.systemRestore"),
+          },
+        ]
+      : []),
     // --- Management ---
     {
       id: "scripts",
@@ -662,6 +824,18 @@ export default function DeviceDetails({
           icon: <Smartphone className="h-4 w-4" />,
           title: "Apple MDM — profiles, commands, and device management",
         }]
+      : []),
+    ...(canChat
+      ? [
+          {
+            id: "chat" as Tab,
+            group: groups.management,
+            label: t("endpointChat.tabLabel"),
+            icon: <MessageSquare className="h-4 w-4" />,
+            title: t("endpointChat.tabTitle"),
+          },
+        ]
+    
       : []),
     {
       id: "playbooks",
@@ -751,24 +925,33 @@ export default function DeviceDetails({
 
   return (
     <div className="space-y-6">
-      <div className="rounded-lg border bg-card p-6 shadow-xs">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex items-start gap-4">
-            <div className="flex h-14 w-14 items-center justify-center rounded-lg bg-muted">
+      {/* #9028: below md the card tightens (no icon tile, smaller padding),
+          the title clamps to two lines and the status pills wrap onto their own
+          line, so the header stays ~200px tall at 390px. md+ is unchanged. */}
+      {/* Title and actions sit side by side only from 2xl; below that the
+          action row stacks under the title. Side by side, the cluster is
+          capped at 70% so it wraps onto a second row instead of squeezing
+          the title down to an ellipsis. */}
+      <div className="rounded-lg border bg-card p-4 shadow-xs md:p-6">
+        <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-start 2xl:justify-between">
+          <div className="flex min-w-0 flex-1 items-start gap-4">
+            <div className="hidden h-14 w-14 shrink-0 items-center justify-center rounded-lg bg-muted md:flex">
               <Monitor className="h-7 w-7 text-muted-foreground" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-3 min-w-0">
+              <div className="flex min-w-0 flex-col items-start gap-1.5 md:flex-row md:flex-wrap md:items-center md:gap-3">
                 <h1
-                  className="truncate text-xl font-semibold tracking-tight"
-                  title={device.displayName || device.hostname}
+                  className="line-clamp-2 text-xl font-semibold tracking-tight [overflow-wrap:anywhere] md:line-clamp-1"
+                  title={deviceName}
                 >
-                  {device.displayName || device.hostname}
+                  {deviceName}
                 </h1>
+                <div className="flex flex-wrap items-center gap-2 md:contents">
                 <span
+                  data-testid="device-status-pill"
                   className={`inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-xs font-medium ${statusColors[device.status]}`}
                 >
-                  {statusLabels[device.status]}
+                  {statusText}
                 </span>
                 {/* "Removed" says the record was offboarded; this says what
                     happened to the agent on the actual machine (#3987).
@@ -797,21 +980,89 @@ export default function DeviceDetails({
                   rebootDeferralsUsed={device.rebootDeferralsUsed}
                   rebootMaxDeferrals={device.rebootMaxDeferrals}
                 />
+                </div>
               </div>
-              <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-                <span>
-                  {formatDeviceSummaryOs(device.os, device.osVersion)}
-                </span>
+              {/* One name in the h1; the hostname appears once, here, only when
+                  it differs. Org/site links sit in the foreground colour with a
+                  resting underline so they read as links beside plain text. */}
+              <p
+                data-testid="device-header-subline"
+                className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground"
+              >
+                {/* Facts on one line, location on the next. Items are set
+                    apart by spacing rather than "·" separators: a separator
+                    strands itself at a line edge whenever the row wraps. */}
+                {showHostname && (
+                  <span data-testid="device-header-hostname" className="font-mono">
+                    {device.hostname}
+                  </span>
+                )}
+                <span>{formatOsLabel(device.os, device.osVersion, device.osBuild)}</span>
                 <span>
                   {t("deviceDetails.agentV")}
                   {device.agentVersion}
                 </span>
-                <span>{device.siteName}</span>
-              </div>
+              </p>
+              <p
+                data-testid="device-header-location"
+                className="mt-0.5 text-sm text-muted-foreground"
+              >
+                <span>
+                  <Trans
+                    t={t}
+                    i18nKey="deviceDetails.locatedIn"
+                    components={{
+                      org: (
+                        <EntityLink
+                          kind="org"
+                          id={device.orgId}
+                          name={device.orgName}
+                          className={device.orgId ? SUBLINE_LINK : undefined}
+                        />
+                      ),
+                      site: (
+                        <EntityLink
+                          kind="site"
+                          id={device.siteId}
+                          name={device.siteName}
+                          className={device.siteId ? SUBLINE_LINK : undefined}
+                        />
+                      ),
+                    }}
+                  />
+                </span>
+              </p>
+              {/* #9027: same idea as the org record's "Workspace: X" chip. Not
+                  a live region — it describes the page, it is not an event. */}
+              {scopeMismatch && (
+                <p
+                  data-testid="device-scope-cue"
+                  className="mt-2 flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground"
+                >
+                  <span>{t("deviceDetails.scopeCue.viewing", { org: device.orgName })}</span>
+                  {onSwitchToDeviceOrg && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <button
+                        type="button"
+                        data-testid="device-scope-switch"
+                        onClick={onSwitchToDeviceOrg}
+                        className="font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-4 hover:decoration-foreground"
+                      >
+                        {t("deviceDetails.scopeCue.switch", { org: device.orgName })}
+                      </button>
+                    </>
+                  )}
+                </p>
+              )}
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <DeviceActions device={device} onAction={onAction} />
+          <div className="2xl:max-w-[70%] 2xl:shrink-0">
+            <DeviceActions
+              device={device}
+              onAction={onAction}
+              extraActions={<WispLinkButton kind="device" id={device.id} orgId={device.orgId} />}
+            />
           </div>
         </div>
       </div>
@@ -828,107 +1079,99 @@ export default function DeviceDetails({
         tabs={overflowTabs}
         activeTab={activeTab}
         onTabChange={(id) => switchTab(id as Tab)}
+        testIdPrefix="device-tab-"
+        mobileMode="scroll"
       />
 
       {activeTab === "overview" && (
         <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
           <div className="min-w-0 flex-1 space-y-6">
-            {/* Two groups — Health (CPU/RAM/Uptime) and Activity (Last Seen/
-                User/Idle) — side by side on ≥xl (stacked and wrapping below,
-                since the Activity rail narrows this card at lg). Stats are
-                content-sized (flex, not an equal-width grid) with non-wrapping labels and values so e.g.
-                "14d 13h 24m" stays on one line; the username (arbitrary
-                length) truncates first, and the "Logged-in User" label
-                itself is also allowed to truncate as a last resort under
-                extreme width constraints (#7153) — both blocks get min-w-0
-                so the Health block can't starve the Activity block. */}
-            <div className="flex flex-col gap-4 rounded-lg border bg-card px-5 py-4 xl:flex-row xl:gap-6">
-              <div className="flex min-w-0 flex-1 flex-wrap gap-x-6 gap-y-3">
-                <div className="shrink-0">
-                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
-                    <Cpu className="h-3.5 w-3.5" />
-                    CPU
-                  </div>
-                  <p className="mt-1 text-lg font-semibold tabular-nums">
-                    {formatPercent(device.cpuPercent / 100, {
-                      minimumFractionDigits: 1,
-                      maximumFractionDigits: 1,
-                    })}
-                  </p>
-                </div>
-                <div className="shrink-0">
-                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
-                    <MemoryStick className="h-3.5 w-3.5" />
-                    RAM
-                  </div>
-                  <p className="mt-1 text-lg font-semibold tabular-nums">
-                    {formatPercent(device.ramPercent / 100, {
-                      minimumFractionDigits: 1,
-                      maximumFractionDigits: 1,
-                    })}
-                  </p>
-                </div>
-                <div className="shrink-0">
-                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
-                    <Clock className="h-3.5 w-3.5" />
-                    {t("deviceDetails.uptime")}{" "}
-                  </div>
-                  <p className="mt-1 whitespace-nowrap text-lg font-semibold">
-                    {formatUptime(device.uptimeSeconds)}
-                  </p>
-                </div>
-              </div>
-              <div
-                className="hidden w-px self-stretch bg-border xl:block"
-                aria-hidden="true"
-              />
-              <div className="flex min-w-0 flex-1 flex-wrap gap-x-6 gap-y-3">
-                <div className="shrink-0">
-                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
-                    <Clock className="h-3.5 w-3.5" />
-                    {t("deviceDetails.lastSeen")}{" "}
-                  </div>
-                  <p className="mt-1 whitespace-nowrap text-lg font-semibold">
-                    {formatLastSeen(device.lastSeen, effectiveTimezone)}
-                  </p>
-                </div>
-                <div className="min-w-[9rem] flex-1">
-                  <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                    <User className="h-3.5 w-3.5 shrink-0" />
-                    <span className="min-w-0 flex-1 truncate">
-                      {t("deviceDetails.loggedInUser")}
-                    </span>
-                  </div>
-                  <p
-                    className="mt-1 truncate text-lg font-semibold"
-                    title={device.lastUser || undefined}
-                  >
-                    {device.lastUser || "—"}
-                  </p>
-                </div>
-                <div className="shrink-0">
-                  <DeviceUserIdleStat deviceId={device.id} />
-                </div>
-              </div>
-            </div>
-
-            <NetworkAssetRow deviceId={device.id} />
-
-            <DeviceReliabilityPanel deviceId={device.id} />
-
-            <DevicePerformanceGraphs deviceId={device.id} compact />
-
-            <DeviceWarrantyCard deviceId={device.id} compact />
-
-            <DeviceBillingCard deviceId={device.id} />
-
+            {/* #9029: blocks run in triage order — (1) state + what is open,
+                (2) health, (3) the performance chart, (4) contacts / warranty
+                / billing. Empty cards collapse to one line with a next step. */}
+            <DeviceOverviewState
+              deviceId={device.id}
+              status={device.status}
+              lastSeen={device.lastSeen}
+              alertCount={tabCounts?.alerts}
+              ticketCount={tabCounts?.tickets}
+              onOpenTab={(tab) => switchTab(tab)}
+            />
             {device.status !== "decommissioned" && (
               <DeviceQueuedActions deviceId={device.id} />
             )}
+            {/* Six stats on one even grid (6 across at xl, 3 at sm, 2 below)
+                instead of two content-sized flex groups with a divider, which
+                crowded CPU/RAM/Uptime together and spread the rest. Every cell
+                is min-w-0 and truncates, so an arbitrarily long username or
+                "14d 13h 24m" never pushes a neighbour out (#7153). */}
+            <div
+              data-testid="device-health-strip"
+              className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-lg border bg-card px-5 py-4 sm:grid-cols-3 xl:grid-cols-6"
+            >
+              <HeaderStat
+                icon={<Cpu className="h-3.5 w-3.5" />}
+                label="CPU"
+                value={formatStat(device.cpuPercent)}
+                testId="device-stat-cpu"
+              />
+              <HeaderStat
+                icon={<MemoryStick className="h-3.5 w-3.5" />}
+                label="RAM"
+                value={formatStat(device.ramPercent)}
+                testId="device-stat-ram"
+              />
+              <HeaderStat
+                icon={<Clock className="h-3.5 w-3.5" />}
+                label={t("deviceDetails.uptime")}
+                value={formatUptime(device.uptimeSeconds)}
+              />
+              <HeaderStat
+                icon={<Clock className="h-3.5 w-3.5" />}
+                label={t("deviceDetails.lastSeen")}
+                value={formatLastSeen(device.lastSeen, effectiveTimezone)}
+                title={lastSeenValid ? formatDateTime(device.lastSeen, { timeZone: effectiveTimezone }) : undefined}
+              />
+              <HeaderStat
+                icon={<User className="h-3.5 w-3.5" />}
+                label={t("deviceDetails.loggedInUser")}
+                value={device.lastUser || "—"}
+                title={device.lastUser || undefined}
+                testId="device-stat-user"
+              />
+              <div className="min-w-0">
+                <DeviceUserIdleStat deviceId={device.id} />
+              </div>
+            </div>
+
+            <DeviceReliabilityPanel deviceId={device.id} />
+
+            <DevicePerformanceGraphs
+              deviceId={device.id}
+              compact
+              offlineSince={device.status === "offline" ? device.lastSeen : undefined}
+            />
+
+            <ContactResponsibilitiesCard
+              orgId={device.orgId}
+              siteId={device.siteId}
+              deviceId={device.id}
+              assignHref={device.orgId ? `/organizations/${device.orgId}#contacts` : undefined}
+            />
+
+            <DeviceWarrantyCard deviceId={device.id} compact />
+
+            <PhysicalPlacementCard subject="device" id={device.id} />
+
+            <DeviceBillingCard deviceId={device.id} />
+
+            <NetworkAssetRow deviceId={device.id} orgId={device.orgId || undefined} />
           </div>
 
+          {/* #9030: the rail collapses instantly — animating `width` reflowed
+              the whole Overview column on every frame. */}
           <div
-            className={`w-full shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out ${
+            className={`w-full shrink-0 overflow-hidden ${
               activityCollapsed ? "lg:w-11 lg:self-stretch" : "lg:w-80"
             }`}
           >
@@ -1002,6 +1245,17 @@ export default function DeviceDetails({
         />
       )}
 
+      {activeTab === "workloads" && (
+        <DeviceWorkloadsTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "system-restore" && (
+        <DeviceRestorePointAttempts deviceId={device.id} />
+      )}
+
       {activeTab === "peripherals" && (
         <DevicePeripheralsTab
           deviceId={device.id}
@@ -1035,6 +1289,14 @@ export default function DeviceDetails({
 
       {activeTab === "tickets" && <DeviceTicketsTab deviceId={device.id} />}
 
+      {activeTab === "chat" && (
+        <DeviceChatPanel
+          deviceId={device.id}
+          osType={device.os}
+          agentVersion={device.agentVersion}
+        />
+      )}
+
       {activeTab === "operator-tasks" && (
         <OperatorTaskActivityFeed deviceId={device.id} />
       )}
@@ -1045,12 +1307,16 @@ export default function DeviceDetails({
           orgId={device.orgId}
           timezone={effectiveTimezone}
           highlightExecutionId={highlightedExecutionId}
+          deviceStatus={device.status}
         />
       )}
 
       {activeTab === "performance" && (
         <div className="space-y-6">
-          <DevicePerformanceGraphs deviceId={device.id} />
+          <DevicePerformanceGraphs
+            deviceId={device.id}
+            offlineSince={device.status === "offline" ? device.lastSeen : undefined}
+          />
           <DeviceAnomaliesPanel deviceId={device.id} compact onChanged={refreshTabCounts} />
         </div>
       )}
@@ -1067,10 +1333,11 @@ export default function DeviceDetails({
           deviceId={device.id}
           timezone={effectiveTimezone}
           osType={device.os}
+          linkedFilter={eventLogFilter}
         />
       )}
 
-      {activeTab === "topology" && <TopologyEntry siteId={device.siteId} deviceId={device.id} />}
+      {activeTab === "topology" && <TopologyEntry siteId={device.siteId} deviceId={device.id} orgId={device.orgId} />}
 
       {activeTab === "monitoring" && (
         <DeviceMonitoringTab

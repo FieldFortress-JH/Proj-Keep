@@ -30,12 +30,13 @@ export type MailPurposePolicy =
       lane: 'partner';
       stream: PartnerMailStream;
       /**
-       * The From used when no partner identity applies — which in W01 is
-       * ALWAYS. It preserves what each send site does TODAY:
+       * The From used when no partner sending identity applies.
        *   'default'              → the bare EMAIL_FROM.
-       *   'partner_display_name' → `"<Partner> via Breeze" <EMAIL_FROM address>`.
-       * Only quote.sent and invoice.sent, plus quote.acceptance_recorded
-       * (#6635) — the customer notice that rides alongside the same quote.
+       *   'partner_display_name' → `"<Partner name>" <EMAIL_FROM address>`
+       *                            (EMAIL_FROM's own display name, if set, wins).
+       * Every customer purpose uses the company name except billing.notice
+       * (autopay notices, which kept the bare EMAIL_FROM when they shipped).
+       * Staff and security mail stays on the platform lane and is not listed here.
        */
       fallbackFrom: 'default' | 'partner_display_name';
     };
@@ -56,13 +57,24 @@ export const MAIL_PURPOSES = {
   'account.deletion_requested': { lane: 'platform' },
   'account.deletion_declined': { lane: 'platform' },
   'account.purge_warning': { lane: 'platform' },
+  // #8713. Breeze → the partner's own admins about the partner's trust
+  // review: the request was received, or the partner is now trusted. Platform
+  // lane: account mail to the partner's staff must not depend on, or appear to
+  // come from, a partner sending domain. Send site:
+  // services/partnerTrustPartnerMail.ts.
+  'account.trust_review_received': { lane: 'platform' },
+  'account.trust_approved': { lane: 'platform' },
 
   // ---- platform lane: operations and MSP staff notices --------------------
   'ops.alert': { lane: 'platform' },
   'staff.ai_budget_alert': { lane: 'platform' },
   'staff.autopay': { lane: 'platform' },
   'staff.contract_renewal': { lane: 'platform' },
+  'staff.trust_declaration_reminder': { lane: 'platform' },
   'staff.quote_outcome': { lane: 'platform' },
+  // #9075 W2b: the request creator (MSP staff) is told the client signed or
+  // declined an agreement request. Send site: services/agreementOutcomeNotify.ts.
+  'staff.agreement_outcome': { lane: 'platform' },
   // W03. The notice that a partner's own sending domain is verified / at risk
   // / failed / suspended / auto-removed. PLATFORM on purpose: a mail saying
   // "your sending domain is broken" must never be sent from that domain
@@ -73,21 +85,50 @@ export const MAIL_PURPOSES = {
   'staff.report_failure': { lane: 'platform' },
   // Settings → Access Reviews: "Email reviewers" to the assigned reviewer (MSP staff).
   'staff.access_review_notice': { lane: 'platform' },
+  // Trust Center gated documents (#8770 W02d): a requester confirmed a request; MSP staff review it.
+  // Send site: services/trustPage/access/emails.ts.
+  'staff.trust_access_request': { lane: 'platform' },
+  // Connection health daily digest to MSP staff and grant owners (spec 2026-10-15 §4).
+  // Send site: services/connectionHealth/digest.ts.
+  'staff.connection_health_digest': { lane: 'platform' },
   'deployment.invite': { lane: 'platform' },
   'ticket.staff_notification': { lane: 'platform' },
 
   // ---- partner lane -------------------------------------------------------
-  'ticket.customer_notification': { lane: 'partner', stream: 'support', fallbackFrom: 'default' },
-  'portal.invite': { lane: 'partner', stream: 'support', fallbackFrom: 'default' },
-  'portal.password_reset': { lane: 'partner', stream: 'support', fallbackFrom: 'default' },
+  'ticket.customer_notification': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
+  'portal.invite': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
+  'portal.password_reset': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
+  // Caller verification (#6354 W03): the request-confirmation link sent to the
+  // customer contact. Customer-facing, so it rides the partner's support stream
+  // (their sending domain when verified, company-name fallback otherwise).
+  'security.caller_verification_link': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
   'quote.sent': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
   // #6635: "your provider recorded your acceptance" — sent to the customer
   // when a tech accepts on their behalf. Same envelope as the quote itself;
   // its own purpose so delivery history never reports it as a quote send.
   'quote.acceptance_recorded': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
+  // #9075 W2b: the agreement request (signing link) emailed to the client's
+  // recipients — the same envelope as a quote send. Send site:
+  // services/agreementRequestEmail.ts.
+  'agreement.sent': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
+  // #9075 W2b: "Your signed copy" to the signer and every request recipient,
+  // with the signed agreement attached. Customer-facing, its own purpose so
+  // delivery history never reports it as a request send. Send site:
+  // services/agreementSignedCopyEmail.ts.
+  'agreement.signed_copy': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
   'billing.notice': { lane: 'partner', stream: 'billing', fallbackFrom: 'default' },
   'invoice.sent': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
-  'report.delivery': { lane: 'partner', stream: 'general', fallbackFrom: 'default' },
+  'report.delivery': { lane: 'partner', stream: 'general', fallbackFrom: 'partner_display_name' },
+  // Connection health digest to CUSTOMER org users, sent only when the MSP turns
+  // on customerAdminsNotified for their org (spec 2026-10-15 §6, W5). Same mail
+  // as staff.connection_health_digest, but customer-facing, so it rides the
+  // partner's stream. Send site: services/connectionHealth/digest.ts.
+  'customer.connection_health_digest': { lane: 'partner', stream: 'general', fallbackFrom: 'partner_display_name' },
+  // Trust Center gated documents (#8770 W02d): the outside requester's confirm link, grant and decline.
+  // Customer-facing for the MSP, so the partner's support stream. Send site: services/trustPage/access/emails.ts.
+  'trust.access_verification': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
+  'trust.access_granted': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
+  'trust.access_denied': { lane: 'partner', stream: 'support', fallbackFrom: 'partner_display_name' },
 } as const satisfies Record<string, MailPurposePolicy>;
 
 export type MailPurpose = keyof typeof MAIL_PURPOSES;

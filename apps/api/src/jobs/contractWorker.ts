@@ -19,6 +19,7 @@ import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { contracts } from '../db/schema';
 import { generateDueInvoice } from '../services/contractService';
 import { runHourBlockCloseOutSweep } from '../services/contractHourBlockClose';
+import { runHourBlockAlertSweep } from '../services/contractHourBlockAlerts';
 import { buildAutomationEligibleOrgPredicate } from '../services/tenantStatus';
 import { runContractRenewalSweep } from '../services/contractRenewal';
 import { issueInvoice } from '../services/invoiceService';
@@ -45,7 +46,7 @@ export function getContractQueue(): Queue {
  * Bill every active contract whose next_billing_at <= asOf.
  * Each contract is independent — one failure does not abort the rest.
  */
-export async function runContractBillingSweep(asOf: Date = new Date()): Promise<{ billed: number; failed: number }> {
+export async function runContractBillingSweep(asOf: Date = new Date()): Promise<{ billed: number; failed: number; deferred: number }> {
   const today = asOf.toISOString().slice(0, 10);
 
   const due = await runOutsideDbContext(() =>
@@ -67,6 +68,7 @@ export async function runContractBillingSweep(asOf: Date = new Date()): Promise<
 
   let billed = 0;
   let failed = 0;
+  let deferred = 0;
 
   for (const row of due) {
     let res;
@@ -75,6 +77,23 @@ export async function runContractBillingSweep(asOf: Date = new Date()): Promise<
         withSystemDbAccessContext(() => generateDueInvoice(row.id, asOf))
       );
       if (res.generated) billed++;
+      // #9243: the renewal sweep ran just before this and did not renew an
+      // auto-renew contract whose term has ended. Billing defers it, so it is
+      // neither billed nor expired, but it stays deferred until a sweep renews it.
+      // That is a real anomaly: count it and report it.
+      if (res.skipped === 'renewal_pending') {
+        deferred++;
+        console.error('[contract-billing] renewal pending after the renewal sweep: contractId=%s orgId=%s — not billed, not expired', row.id, row.orgId);
+        captureException(new Error(`contract ${row.id} billing deferred: auto-renew term ended but the renewal sweep did not extend it`));
+      }
+      // #9509: the sweep only picks contracts whose pointer is due, so a lost
+      // ledger claim means the pointer sat on a period that was already billed.
+      // generateDueInvoice moved it on (the next run bills), but the invariant
+      // broke, so report it rather than leave it to a stdout warning.
+      if (res.skipped === 'already_billed') {
+        console.error('[contract-billing] already billed: due contract pointed at a claimed period; pointer moved on: contractId=%s orgId=%s', row.id, row.orgId);
+        captureException(new Error(`contract ${row.id} billing pointer was on an already-claimed period (moved past it)`));
+      }
       // Wave 3 (#3775): a catalog line billed at the contract snapshot because
       // the price book has no row in the contract's currency is never silent —
       // one structured warning per gap so ops can fill the book.
@@ -143,23 +162,44 @@ export async function runContractBillingSweep(asOf: Date = new Date()): Promise<
     }
   }
 
-  return { billed, failed };
+  return { billed, failed, deferred };
 }
 
 /**
- * The daily billing-sweep job, in order: renewal → billing → block-hours close-out.
- * Renewal MUST run before billing so an about-to-expire auto-renew contract has
- * its term extended before generateDueInvoice decides expiry. The close-out runs
+ * The daily billing-sweep job, in order: renewal → billing → block-hours close-out → threshold alerts.
+ * Renewal MUST run before billing so an auto-renew contract whose term ends today
+ * is extended before generateDueInvoice bills the period starting on end_date
+ * (#9243). Billing defers rather than expires an auto-renew contract it meets
+ * un-renewed. The close-out runs
  * AFTER billing so a contract the billing run just expired or cancelled has its
  * block line retired before the sweep looks for the periods it left behind.
  */
-export async function runBillingSweepJob(asOf: Date = new Date()): Promise<{ billed: number; failed: number }> {
-  await runOutsideDbContext(() => withSystemDbAccessContext(() => runContractRenewalSweep()));
+export async function runBillingSweepJob(asOf: Date = new Date()): Promise<{ billed: number; failed: number; deferred: number }> {
+  // Same asOf as billing: renewal and billing must agree on what "today" is (#9243).
+  // A renewal failure must not stop billing. Billing defers an un-renewed
+  // auto-renew contract and never expires it, so continuing is safe. Every
+  // deferral is then counted and reported by the billing sweep.
+  try {
+    await runOutsideDbContext(() => withSystemDbAccessContext(() => runContractRenewalSweep(asOf)));
+  } catch (err) {
+    console.error('[ContractWorker] renewal sweep failed; billing continues and defers un-renewed auto-renew contracts', err instanceof Error ? err.message : err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
+  }
   const billing = await runContractBillingSweep(asOf);
   // Self-wrapping: one system transaction per contract, failures captured per contract.
   const hb = await runHourBlockCloseOutSweep(asOf);
   if (hb.closes > 0 || hb.errors > 0) {
     console.info('[contract-billing] block-hours close-out: contracts=%d closes=%d errors=%d', hb.contracts, hb.closes, hb.errors);
+  }
+  // Threshold alerts run LAST: they read the open period's carried-in balance,
+  // which only exists once billing and close-out have closed the period that
+  // just ended. Own per-line system contexts; a failure is reported but must
+  // never fail the job or the billing result.
+  try {
+    await runHourBlockAlertSweep(asOf);
+  } catch (err) {
+    console.error('[ContractWorker] hour-block alert sweep failed', err instanceof Error ? err.message : err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
   }
   return billing;
 }

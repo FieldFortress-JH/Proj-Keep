@@ -2,6 +2,7 @@ import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import { i18n } from '@/lib/i18n';
 import { useState, useCallback } from 'react';
+import { YARA_MAX_RULE_SETS_PER_POLICY } from '@breeze/shared';
 import { fetchWithAuth } from '../../../stores/auth';
 import { showToast } from '../../shared/Toast';
 import type { FeatureType, FeatureLink } from './types';
@@ -12,14 +13,23 @@ type SavePayload = {
   inlineSettings?: Record<string, unknown> | null;
 };
 
+/** Structured failure of the last save/remove, for tabs that render code-specific UI. */
+export type FeatureLinkErrorDetail = { status: number; code?: string; body?: unknown };
+
 export function useFeatureLink(policyId: string) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
+  const [errorDetail, setErrorDetail] = useState<FeatureLinkErrorDetail>();
 
   const save = useCallback(
-    async (existingLinkId: string | null, payload: SavePayload): Promise<FeatureLink | null> => {
+    async (
+      existingLinkId: string | null,
+      payload: SavePayload,
+      opts: { successMessage?: string | null } = {},
+    ): Promise<FeatureLink | null> => {
       setSaving(true);
       setError(undefined);
+      setErrorDetail(undefined);
       try {
         const url = existingLinkId
           ? `/configuration-policies/${policyId}/features/${existingLinkId}`
@@ -40,13 +50,34 @@ export function useFeatureLink(policyId: string) {
           request: () => fetchWithAuth(url, { method, body: JSON.stringify(body) }),
           parseSuccess: (value) => (value as { data: FeatureLink }).data ?? value as FeatureLink,
           errorFallback: i18n.t('common:states.error'),
-          successMessage: i18n.t('common:states.saved'),
+          friendly: (code) => {
+            if (code === 'MONITOR_NOT_ATTACHABLE') {
+              return i18n.t('policies:configurationPolicies.featureTabs.monitorsTab.notAttachable');
+            }
+            // Security link rule-set gate (#6263 W03 securityRuleSetGate.ts, #6267).
+            if (code === 'TOO_MANY_RULE_SETS') {
+              return i18n.t('policies:configurationPolicies.featureTabs.securityTab.ruleSets.errors.tooMany', { max: YARA_MAX_RULE_SETS_PER_POLICY });
+            }
+            if (code === 'INVALID_RULE_SET_IDS') {
+              return i18n.t('policies:configurationPolicies.featureTabs.securityTab.ruleSets.errors.invalidIds');
+            }
+            if (code === 'YARA_RULE_SET_NOT_ATTACHABLE') {
+              return i18n.t('policies:configurationPolicies.featureTabs.securityTab.ruleSets.errors.notAttachable');
+            }
+            return undefined;
+          },
+          ...(opts.successMessage === null
+            ? {}
+            : { successMessage: opts.successMessage ?? i18n.t('common:states.saved') }),
           onUnauthorized: () => void navigateTo('/login', { replace: true }),
         });
       } catch (err) {
         if (err instanceof ActionError && err.status === 401) return null;
         if (!(err instanceof ActionError)) showToast({ type: 'error', message: i18n.t('common:states.error') });
         setError(err instanceof Error ? err.message : i18n.t('common:states.error'));
+        setErrorDetail(
+          err instanceof ActionError ? { status: err.status, code: err.code, body: err.body } : undefined,
+        );
         return null;
       } finally {
         setSaving(false);
@@ -64,6 +95,7 @@ export function useFeatureLink(policyId: string) {
     async (linkId: string, opts: { successMessage?: string | null } = {}): Promise<boolean> => {
       setSaving(true);
       setError(undefined);
+      setErrorDetail(undefined);
       try {
         await runAction({
           request: () => fetchWithAuth(`/configuration-policies/${policyId}/features/${linkId}`, { method: 'DELETE' }),
@@ -78,6 +110,9 @@ export function useFeatureLink(policyId: string) {
         if (err instanceof ActionError && err.status === 401) return false;
         if (!(err instanceof ActionError)) showToast({ type: 'error', message: i18n.t('common:states.error') });
         setError(err instanceof Error ? err.message : i18n.t('common:states.error'));
+        setErrorDetail(
+          err instanceof ActionError ? { status: err.status, code: err.code, body: err.body } : undefined,
+        );
         return false;
       } finally {
         setSaving(false);
@@ -86,7 +121,10 @@ export function useFeatureLink(policyId: string) {
     [policyId]
   );
 
-  const clearError = useCallback(() => setError(undefined), []);
+  const clearError = useCallback(() => {
+    setError(undefined);
+    setErrorDetail(undefined);
+  }, []);
 
-  return { save, remove, saving, error, clearError };
+  return { save, remove, saving, error, errorDetail, clearError };
 }

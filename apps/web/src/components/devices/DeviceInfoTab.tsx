@@ -29,7 +29,7 @@ import { fetchWithAuth } from "../../stores/auth";
 import { formatUptime } from "../../lib/utils";
 import { runAction, ActionError } from "../../lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
-import { isAgentUpdateStuck, isDeviceLogSilent } from "@breeze/shared";
+import { isAgentUpdateStuck } from "@breeze/shared";
 import {
   DEVICE_ROLES,
   getDeviceRoleLabel,
@@ -40,10 +40,13 @@ import {
 import DeviceFunctionField from "./DeviceFunctionField";
 import { asList } from '@/lib/asList';
 import { formatDeviceDetailOsVersion } from "./osDisplay";
+import { formatOsBuild } from "./formatOsLabel";
 import DeviceTimeSection from "./time/DeviceTimeSection";
+import { derivePromptRenderer, helperInstallIssueKey } from "./promptRenderer";
 import { formatNumber } from "@/lib/i18n/format";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import { dropdownChoiceLabel } from "../../lib/customFieldChoice";
 
 type DeviceInfoTabProps = {
   deviceId: string;
@@ -84,9 +87,28 @@ type DeviceInfo = {
   helperVersion?: string | null;
   helperInstallIssue?: string | null;
   helperInstallIssueSince?: string | null;
+  /**
+   * Terminal watchdog-install failure view (#8620). The API only sends it for
+   * `gave_up` / `unsupported`; every other state is null. Closed vocabulary.
+   */
+  watchdogInstall?: {
+    state: string;
+    errorClass: string;
+    since: string | null;
+  } | null;
+  /** Derived read view from the API (#8608); absent until an agent reports. */
+  logShipping?: {
+    state: "healthy" | "quiet" | "failing" | "unknown";
+    failingSince: string | null;
+    lastError: string | null;
+  } | null;
+  /**
+   * #8612 — set only when a debug/info log-level raise completed 5+ min ago
+   * and no log has arrived since. Observational, never a fault verdict.
+   */
+  logsNotArriving?: { since: string } | null;
   status?: string | null;
   lastSeenAt?: string | null;
-  lastLogAt?: string | null;
   enrolledAt?: string | null;
   lastUser?: string | null;
   uptimeSeconds?: number | null;
@@ -221,12 +243,216 @@ function formatDesktopAccessReason(
   }
 }
 
+function AssistStatusRow({
+  helperVersion,
+  helperInstallIssue,
+}: {
+  helperVersion?: string | null;
+  helperInstallIssue?: string | null;
+}) {
+  const { t } = useTranslation("devices");
+  const renderer = derivePromptRenderer({ helperVersion, helperInstallIssue });
+  let value: string;
+  if (renderer.status === "installed") {
+    value = t("deviceInfoTab.assistStatus.installed");
+  } else if (renderer.status === "notDeployed") {
+    value = t("deviceInfoTab.assistStatus.notDeployed");
+  } else {
+    let reason: string;
+    switch (helperInstallIssueKey(renderer.issue ?? "")) {
+      case "webview2Outdated":
+        reason = t("deviceInfoTab.assistStatus.reason.webview2Outdated");
+        break;
+      case "crashLoop":
+        reason = t("deviceInfoTab.assistStatus.reason.crashLoop");
+        break;
+      case "unmanagedInstall":
+        reason = t("deviceInfoTab.assistStatus.reason.unmanagedInstall");
+        break;
+      case "awaitingServerOffer":
+        reason = t("deviceInfoTab.assistStatus.reason.awaitingServerOffer");
+        break;
+      case "installAbandoned":
+        reason = t("deviceInfoTab.assistStatus.reason.installAbandoned");
+        break;
+      default:
+        reason = t("deviceInfoTab.assistStatus.reason.unknown");
+    }
+    value = t("deviceInfoTab.assistStatus.unavailable", { reason });
+  }
+  return (
+    <div className="flex justify-between py-2" data-testid="assist-status">
+      <dt className="text-sm text-muted-foreground">{t("deviceInfoTab.assistStatus.label")}</dt>
+      <dd className="text-sm font-medium text-right">{value}</dd>
+    </div>
+  );
+}
+
 function InfoRow({ label, value }: { label: string; value: string }) {
   const { t } = useTranslation("devices");
   return (
     <div className="flex justify-between py-2">
       <dt className="text-sm text-muted-foreground">{label}</dt>
       <dd className="text-sm font-medium text-right">{value || "—"}</dd>
+    </div>
+  );
+}
+
+const LOG_SHIPPING_CHIP_CLASS: Record<string, string> = {
+  healthy: "bg-success/10 text-success border-success/30",
+  quiet: "bg-muted/40 text-muted-foreground border-muted",
+  failing: "bg-warning/10 text-warning border-warning/40",
+};
+
+/**
+ * Terminal watchdog-install failure (#8620). Read-only; the API only sends the
+ * view for `gave_up` / `unsupported`, and this renders nothing for anything
+ * else (including a state a newer API might add).
+ */
+function WatchdogInstallNotice({ watchdogInstall }: { watchdogInstall: DeviceInfo["watchdogInstall"] }) {
+  const { t } = useTranslation("devices");
+  if (!watchdogInstall) return null;
+  const { state } = watchdogInstall;
+  if (state !== "gave_up" && state !== "unsupported") return null;
+
+  const since = watchdogInstall.since ? new Date(watchdogInstall.since).toLocaleDateString() : "—";
+  let message: React.ReactNode;
+  if (state === "unsupported") {
+    message = t("deviceInfoTab.watchdogInstall.unsupported", { since });
+  } else {
+    // Closed `lastErrorClass` vocabulary; the raw token is never rendered and
+    // anything outside it falls through to the generic reason.
+    let reason: string;
+    switch (watchdogInstall.errorClass) {
+      case "network":
+        reason = t("deviceInfoTab.watchdogInstall.reason.network");
+        break;
+      case "server":
+        reason = t("deviceInfoTab.watchdogInstall.reason.server");
+        break;
+      case "policy":
+        reason = t("deviceInfoTab.watchdogInstall.reason.policy");
+        break;
+      case "signature":
+        reason = t("deviceInfoTab.watchdogInstall.reason.signature");
+        break;
+      case "checksum":
+        reason = t("deviceInfoTab.watchdogInstall.reason.checksum");
+        break;
+      case "dev_build":
+        reason = t("deviceInfoTab.watchdogInstall.reason.devBuild");
+        break;
+      case "unsupported_os":
+        reason = t("deviceInfoTab.watchdogInstall.reason.unsupportedOs");
+        break;
+      case "install_cmd":
+        reason = t("deviceInfoTab.watchdogInstall.reason.installCmd");
+        break;
+      case "locked":
+        reason = t("deviceInfoTab.watchdogInstall.reason.locked");
+        break;
+      default:
+        reason = t("deviceInfoTab.watchdogInstall.reason.unknown");
+    }
+    message = (
+      <Trans
+        i18nKey="deviceInfoTab.watchdogInstall.gaveUp"
+        t={t}
+        values={{ since, reason }}
+        components={{ code: <code className="font-mono text-xs" /> }}
+      />
+    );
+  }
+
+  return (
+    <div
+      data-testid="watchdog-install-issue"
+      role="status"
+      className={
+        state === "unsupported"
+          ? "rounded-md border border-muted bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+          : "rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
+      }
+    >
+      {message}
+    </div>
+  );
+}
+
+/**
+ * Log-shipping health (#8609). Renders nothing for `unknown`/absent so
+ * devices whose agent has not reported show no row. The reason is mapped from
+ * a closed vocabulary; payload text is never rendered verbatim.
+ */
+function LogShippingRow({ logShipping }: { logShipping: DeviceInfo["logShipping"] }) {
+  const { t } = useTranslation("devices");
+  const state = logShipping?.state;
+  if (state !== "healthy" && state !== "quiet" && state !== "failing") return null;
+
+  let tooltip: string;
+  if (state === "failing") {
+    const raw = logShipping?.lastError ?? "";
+    const httpStatus = /^http (\d{3})$/.exec(raw)?.[1];
+    let reason: string;
+    if (httpStatus) {
+      reason = t("deviceInfoTab.logShipping.reason.http", { status: httpStatus });
+    } else {
+      switch (raw) {
+        case "timeout":
+          reason = t("deviceInfoTab.logShipping.reason.timeout");
+          break;
+        case "dns":
+          reason = t("deviceInfoTab.logShipping.reason.dns");
+          break;
+        case "connection refused":
+          reason = t("deviceInfoTab.logShipping.reason.connectionRefused");
+          break;
+        case "tls":
+          reason = t("deviceInfoTab.logShipping.reason.tls");
+          break;
+        case "auth rejected":
+          reason = t("deviceInfoTab.logShipping.reason.authRejected");
+          break;
+        case "url unresolved":
+          reason = t("deviceInfoTab.logShipping.reason.urlUnresolved");
+          break;
+        case "other":
+          reason = t("deviceInfoTab.logShipping.reason.other");
+          break;
+        default:
+          reason = t("deviceInfoTab.logShipping.reason.unspecified");
+      }
+    }
+    const sinceDate = logShipping?.failingSince ? new Date(logShipping.failingSince) : null;
+    const since =
+      sinceDate && !Number.isNaN(sinceDate.getTime()) ? sinceDate.toLocaleDateString() : "—";
+    tooltip = t("deviceInfoTab.logShipping.tooltip.failing", { since, reason });
+  } else {
+    tooltip =
+      state === "healthy"
+        ? t("deviceInfoTab.logShipping.tooltip.healthy")
+        : t("deviceInfoTab.logShipping.tooltip.quiet");
+  }
+  const stateLabel =
+    state === "healthy"
+      ? t("deviceInfoTab.logShipping.state.healthy")
+      : state === "quiet"
+        ? t("deviceInfoTab.logShipping.state.quiet")
+        : t("deviceInfoTab.logShipping.state.failing");
+
+  return (
+    <div className="flex justify-between py-2">
+      <dt className="text-sm text-muted-foreground">{t("deviceInfoTab.logShipping.label")}</dt>
+      <dd>
+        <span
+          data-testid="log-shipping-health"
+          data-state={state}
+          title={tooltip}
+          className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${LOG_SHIPPING_CHIP_CLASS[state]}`}
+        >
+          {stateLabel}
+        </span>
+      </dd>
     </div>
   );
 }
@@ -341,7 +567,7 @@ function Section({
     <div className="rounded-lg border bg-card p-6 shadow-xs">
       <div className="flex items-center gap-2 mb-4">
         {icon}
-        <h3 className="text-sm font-semibold">{title}</h3>
+        <h2 className="text-sm font-semibold">{title}</h2>
       </div>
       <dl className="divide-y">{children}</dl>
     </div>
@@ -550,10 +776,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
     if (value === null || value === undefined || value === "") return "—";
     if (def.type === "boolean")
       return value ? t("deviceInfoTab.yes") : t("deviceInfoTab.no");
-    if (def.type === "dropdown" && def.options?.choices) {
-      const choice = def.options.choices.find((c) => c.value === value);
-      return choice?.label ?? String(value);
-    }
+    if (def.type === "dropdown") return dropdownChoiceLabel(def, value) ?? String(value);
     if (def.type === "date" && typeof value === "string")
       return formatDate(value);
     return String(value);
@@ -774,9 +997,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
             const RoleIcon = getDeviceRoleIcon(role);
             return <RoleIcon className="h-4 w-4 text-muted-foreground" />;
           })()}
-          <h3 className="text-sm font-semibold">
+          <h2 className="text-sm font-semibold">
             {t("deviceInfoTab.deviceRole")}
-          </h3>
+          </h2>
         </div>
         <dl className="divide-y">
           <div className="flex items-center justify-between py-2">
@@ -821,6 +1044,15 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
                   {(() => {
                     const role = (info?.deviceRole ?? "unknown") as string;
                     const RoleIcon = getDeviceRoleIcon(role);
+                    // #9030: "Unknown" read as a fact about the device; it
+                    // only means nothing has classified it yet.
+                    if (role === "unknown") {
+                      return (
+                        <span className="text-sm font-normal text-muted-foreground">
+                          {t("deviceInfoTab.roleNotAssessed")}
+                        </span>
+                      );
+                    }
                     return (
                       <span className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-2.5 py-1 text-xs font-medium">
                         <RoleIcon className="h-3 w-3" />
@@ -888,7 +1120,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         />
         <InfoRow
           label={t("deviceInfoTab.osBuild")}
-          value={info?.osBuild ?? "—"}
+          value={formatOsBuild(info?.osType, info?.osVersion, info?.osBuild) ?? "—"}
         />
         <InfoRow
           label={t("deviceInfoTab.architecture")}
@@ -1102,22 +1334,6 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
             })}
           </div>
         ) : null}
-        {info &&
-        isDeviceLogSilent({
-          status: info.status,
-          lastLogAt: info.lastLogAt,
-          enrolledAt: info.enrolledAt,
-        }) ? (
-          <div
-            data-testid="logs-silent"
-            role="status"
-            className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
-          >
-            {info.lastLogAt
-              ? t("deviceInfoTab.logsSilent", { since: formatDate(info.lastLogAt) })
-              : t("deviceInfoTab.logsSilentNeverShipped")}
-          </div>
-        ) : null}
         {info?.updateOfferWithheldReason ? (
           <div
             data-testid="update-offer-withheld"
@@ -1139,7 +1355,14 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           label={t("deviceInfoTab.helperVersion")}
           value={info?.helperVersion?.trim() || "—"}
         />
-        {/* #6925: Assist enabled but not installed — the agent reports why. */}
+        {/* #10190 W01: whether Breeze Assist can draw prompts here, from the
+            last-reported helper state (not the live per-session renderer). */}
+        <AssistStatusRow
+          helperVersion={info?.helperVersion}
+          helperInstallIssue={info?.helperInstallIssue}
+        />
+        {/* #6925, #10183, #10185: the agent reports why Assist is not
+            installed or not running. */}
         {info?.helperInstallIssue ? (
           <div
             data-testid="helper-install-issue"
@@ -1150,15 +1373,35 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
               const since = info.helperInstallIssueSince
                 ? new Date(info.helperInstallIssueSince).toLocaleDateString()
                 : "—";
-              switch (info.helperInstallIssue) {
-                case "awaiting_server_offer":
+              switch (helperInstallIssueKey(info.helperInstallIssue)) {
+                case "awaitingServerOffer":
                   return t("deviceInfoTab.helperInstallIssue.awaitingServerOffer", { since });
-                case "install_abandoned":
+                case "installAbandoned":
                   return t("deviceInfoTab.helperInstallIssue.installAbandoned", { since });
+                case "webview2Outdated":
+                  return t("deviceInfoTab.helperInstallIssue.webview2Outdated", { since });
+                case "crashLoop":
+                  return t("deviceInfoTab.helperInstallIssue.crashLoop", { since });
+                case "unmanagedInstall":
+                  return t("deviceInfoTab.helperInstallIssue.unmanagedInstall", { since });
                 default:
                   return t("deviceInfoTab.helperInstallIssue.unknown", { since });
               }
             })()}
+          </div>
+        ) : null}
+        <WatchdogInstallNotice watchdogInstall={info?.watchdogInstall} />
+        <LogShippingRow logShipping={info?.logShipping} />
+        {info?.logsNotArriving ? (
+          <div className="flex justify-between py-2">
+            <dt className="text-sm text-muted-foreground">
+              {t("deviceInfoTab.logsNotArriving.label")}
+            </dt>
+            <dd data-testid="logs-not-arriving" className="text-sm text-right">
+              {t("deviceInfoTab.logsNotArriving.text", {
+                since: formatDate(info.logsNotArriving.since),
+              })}
+            </dd>
           </div>
         ) : null}
         <div className="flex justify-between py-2">
@@ -1271,7 +1514,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <div className="rounded-lg border bg-card p-6 shadow-xs">
           <div className="flex items-center gap-2 mb-4">
             <Tag className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">{t("deviceInfoTab.tags")}</h3>
+            <h2 className="text-sm font-semibold">{t("deviceInfoTab.tags")}</h2>
           </div>
           <div className="flex flex-wrap gap-2">
             {tags.map((tag) => (
@@ -1290,9 +1533,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-2">
           <div className="flex items-center gap-2 mb-4">
             <ListChecks className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">
+            <h2 className="text-sm font-semibold">
               {t("deviceInfoTab.customFields")}
-            </h3>
+            </h2>
           </div>
           <dl className="divide-y">
             {applicableFields.map((def) => {

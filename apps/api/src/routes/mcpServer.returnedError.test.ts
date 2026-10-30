@@ -66,6 +66,7 @@ vi.mock('../middleware/apiKeyAuth', () => ({
       partnerId: 'partner-1',
       name: 'test',
       keyPrefix: 'brz_test',
+      mcpDomains: null,
       scopes: testState.scopes,
       rateLimit: 1000,
       createdBy: 'user-1',
@@ -213,6 +214,8 @@ describe('MCP tools/call returned-error signalling (#6408)', () => {
   it.each([
     { error: 'Device not found' },
     { error: 'Access denied', _chat: { outputCompacted: true } },
+    // #8340: a string code is part of the refusal, not data beside it.
+    { error: 'MFA required', code: 'MFA_REQUIRED' },
   ])('marks a pure returned error as isError and audits it as a failure: %j', async (value) => {
     const result = await callAndParse(JSON.stringify(value));
 
@@ -232,6 +235,7 @@ describe('MCP tools/call returned-error signalling (#6408)', () => {
     { devices: [{ id: 'd1' }], error: null },
     { items: [1], error: 'partial' },
     { ok: true },
+    { error: 'partial', code: 7 },
   ])('leaves a result carrying real data as a success: %j', async (value) => {
     const result = await callAndParse(JSON.stringify(value));
 

@@ -39,9 +39,10 @@
     },
     "confirm": {
       "title": "Confirmar la aprobación del parche",
-      "selectedOrganization": "la organización seleccionada",
-      "messageOne": "¿Aprobar el parche en el dispositivo {{count}} en {{org}}?",
-      "messageMany": "¿Aprobar el parche en dispositivos {{count}} en {{org}}?"
+      "selectedRing": "(sin nombre)",
+      "messageRingOne": "¿Aprobar el parche en {{count}} dispositivo de todas las organizaciones en el anillo {{ring}}?",
+      "messageRingMany": "¿Aprobar el parche en {{count}} dispositivos de todas las organizaciones en el anillo {{ring}}?",
+      "messagePartnerWide": "¿Aprobar el parche para todas las organizaciones de su partner?"
     },
     "checkingAccess": "Verificando tu acceso..."
   },
@@ -83,14 +84,19 @@
       "pendingDevices": "{{count}} tiene parches pendientes",
       "approved": "{{count}} aprobado",
       "pendingApproval": "{{count}} pendiente de aprobación",
+      "failedInstalls_one": "{{count}} instalación fallida",
+      "failedInstalls_other": "{{count}} instalaciones fallidas",
       "critical": "{{count}} crítico",
-      "reboot": "reiniciar {{count}}"
+      "reboot": "reiniciar {{count}}",
+      "imagesNotChecked_one": "{{count}} imagen de contenedor sin verificar",
+      "imagesNotChecked_other": "{{count}} imágenes de contenedor sin verificar"
     },
     "filters": {
       "allDevices": "Todos los dispositivos ({{count}})",
       "statusFilterLabel": "Filtrar por estado de cumplimiento",
       "pendingPatches": "Parches pendientes ({{count}})",
       "critical": "Crítico ({{count}})",
+      "failed": "Instalaciones fallidas ({{count}})",
       "pendingReboot": "Reinicio pendiente ({{count}})",
       "thirdPartyPending": "Pendiente de terceros ({{count}})",
       "compliant": "Cumple ({{count}})"
@@ -109,6 +115,8 @@
       "approvedTitle": "Parches excepcionales aprobados para su instalación",
       "pendingApproval": "Pendiente de aprobación",
       "pendingApprovalTitle": "Parches destacados aún pendientes de aprobación",
+      "failed": "Fallidos",
+      "failedTitle": "Parches pendientes cuyo último intento de instalación falló",
       "osPatches": "Parches OS",
       "osPatchesTitle": "Actualizaciones destacadas de los administradores de paquetes Windows Update, Apple o Linux",
       "thirdParty": "Tercero",
@@ -153,6 +161,11 @@
       "messageOne": "{{action}} en el dispositivo {{count}} en {{org}}?",
       "messageMany": "{{action}} en dispositivos {{count}} en {{org}}?",
       "messageMultiOrg": "¿{{action}} en dispositivos {{count}} en organizaciones {{orgCount}} ({{orgNames}})?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} de {{total}}",
+      "previous": "Página anterior",
+      "next": "Página siguiente"
     }
   },
   "patchInstallHistory": {
@@ -253,7 +266,9 @@
       "moderate": "Moderado",
       "low": "Bajo",
       "unrated": "Sin calificar",
-      "unratedNote": "No se aprobará automáticamente"
+      "unratedNote": "No se aprobará automáticamente",
+      "derivedNote": "Calificación derivada",
+      "derivedTooltip": "El proveedor no publicó una calificación para esta actualización. Esta gravedad se derivó de su clasificación y título."
     },
     "approval": {
       "pending": "Pendiente",
@@ -301,6 +316,7 @@
       "os": "OS",
       "release": "Liberar",
       "approval": "Aprobación",
+      "devices": "Dispositivos",
       "actions": "Acciones"
     },
     "releaseUnknown": "Desconocida",
@@ -313,6 +329,23 @@
       "badgeDevices_other": "La instalación falló en {{count}} dispositivos",
       "noReason": "El agente no informó ningún motivo",
       "failedAt": "El último intento de instalación falló: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} dispositivo",
+      "badge_other": "{{count}} dispositivos",
+      "none": "Ningún dispositivo en el alcance necesita aún este parche",
+      "open": "Mostrar los dispositivos que aún necesitan {{title}}",
+      "heading": "Dispositivos que aún necesitan {{title}}",
+      "loading": "Cargando dispositivos…",
+      "error": "No se pudo cargar la lista de dispositivos.",
+      "showing": "Mostrando {{shown}} de {{total}}",
+      "loadMore": "Cargar más",
+      "lastChecked": "Última comprobación: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Versión del paquete {{version}}",
+      "id": "ID de catálogo {{id}}",
+      "title": "Otra entrada del catálogo tiene el mismo título. Cada una se aprueba por separado."
     }
   },
   "patchesPage": {
@@ -353,7 +386,8 @@
       "createRing": "No se pudo crear el anillo de actualización",
       "deleteRing": "No se pudo eliminar el anillo",
       "approveUnknown": "Estado de aprobación desconocido: no se pudo leer la respuesta del servidor. Actualiza para confirmar qué parches se aprobaron.",
-      "approveAbortedWithFailures": "{{message}} (El servidor también rechazó {{count}} parches antes de esto.)"
+      "approveAbortedWithFailures": "{{message}} (El servidor también rechazó {{count}} parches antes de esto.)",
+      "checkRingLinks": "No se pudo comprobar qué políticas usan este anillo; no se eliminó nada"
     },
     "toast": {
       "ringSaved": "Anillo de actualización guardado",
@@ -383,10 +417,18 @@
       "createTitle": "Crear anillo de actualización"
     },
     "truncatedNotice": "Se muestran {{shown}} de {{total}} parches. Los filtros de aquí solo acotan lo ya cargado, así que el resto no se puede alcanzar desde esta vista: usa la API de parches para recorrer el catálogo completo.",
-    "shiftedNotice": "Se muestran {{shown}} de {{total}} parches: el catálogo cambió mientras se cargaba. Vuelve a cargar para ver el resto."
+    "emptyRingSeverityNotice": "Este anillo aún no tiene dispositivos. La severidad informada por los dispositivos aparece cuando se asignan dispositivos, así que hasta entonces la mayoría de los parches figuran como Sin calificar.",
+    "shiftedNotice": "Se muestran {{shown}} de {{total}} parches: el catálogo cambió mientras se cargaba. Vuelve a cargar para ver el resto.",
+    "ringDelete": {
+      "messageNone": "Ninguna política usa este anillo. Sus reglas de aprobación y su configuración de programación se eliminarán y no se podrán restaurar.",
+      "title": "¿Eliminar {{name}}?",
+      "messageOne": "1 política dejará de aplicar parches programados hasta que elijas otro anillo.",
+      "messageMany": "{{count}} políticas dejarán de aplicar parches programados hasta que elijas otro anillo.",
+      "confirm": "Eliminar anillo"
+    }
   },
   "patchJobsList": {
-    "empty": "Aún no hay trabajos de parches. Los trabajos creados por políticas, anillos de actualización o el asistente de IA aparecerán aquí.",
+    "empty": "Aún no hay trabajos de parches. Los trabajos creados por políticas, anillos de actualización o Breeze AI aparecerán aquí.",
     "loading": "Cargando trabajos de parches...",
     "columns": {
       "name": "Trabajo",
@@ -509,6 +551,22 @@
       "title": "Instalar aplicación",
       "description": "Cuánto tiempo tienen los dispositivos para aplicar parches aprobados y cuánto tiempo un usuario puede posponer el reinicio. El comportamiento de reinicio en sí se establece según la política en la pestaña Parche."
     },
+    "featureUpdates": {
+      "title": "Actualizaciones de funciones de Windows",
+      "description": "Si los dispositivos de este anillo reciben versiones de funciones de Windows (por ejemplo, 25H2). Breeze las instala solo mediante las reglas de aprobación de abajo; agregue una anulación de Actualizaciones de funciones para aprobarlas automáticamente.",
+      "modeBlock": "Bloquear",
+      "modeAllow": "Permitir la versión más reciente",
+      "modePin": "Fijar a una versión",
+      "productLabel": "Versión de Windows",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Versión",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Windows Update en cada dispositivo se configura para apuntar a esta versión (política de versión objetivo de Windows Update for Business). A menos que la configuración de la política \"Breeze es la única fuente de Windows Update\" esté activada, Windows puede descargar e instalar la versión según su propio calendario, fuera de la aprobación de Breeze.",
+      "validation": {
+        "release": "Ingrese una versión como 25H2."
+      }
+    },
     "approvalPolicy": {
       "title": "Política de aprobación",
       "description": "Qué se aprueba automáticamente en este anillo y durante cuánto tiempo se debe retener un parche después del lanzamiento del proveedor. El valor predeterminado se aplica a todas las categorías; agregue una anulación para tratar uno de manera diferente.",
@@ -564,7 +622,47 @@
     "badges": {
       "manual": "Manual",
       "os": "SO: {{severities}}",
-      "thirdParty": "Apps de terceros"
+      "thirdParty": "Apps de terceros",
+      "appRules_one": "{{count}} regla de aplicación",
+      "appRules_other": "{{count}} reglas de aplicación",
+      "featureUpdatesNewest": "Actualizaciones de funciones: más reciente",
+      "featureUpdatesPinned": "Actualizaciones de funciones: {{release}}"
+    }
+  },
+  "ringAppRules": {
+    "applicationRules": "Reglas de aplicación",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Bloquee aplicaciones específicas para que no se apliquen parches automatizados o fíjelas a una versión máxima.",
+    "blocked": "Bloqueado",
+    "pinned": "Fijado",
+    "maxVersion": "versión máxima",
+    "pinnedApplicationsNeedAVersion": "Las aplicaciones fijadas necesitan una versión.",
+    "addApplication": "Agregar aplicación",
+    "searchCatalogAndDetectedApplications": "Buscar catálogo y aplicaciones detectadas...",
+    "searching": "Buscando...",
+    "catalog": "catálogo",
+    "couldnTLoadApplicationsYouCanStill": "No se pudieron cargar las aplicaciones; aún puede agregarlas mediante el paquete ID a continuación.",
+    "noMatches": "Sin coincidencias.",
+    "orEnterAPackageIDManually": "O ingrese un paquete ID manualmente",
+    "removeRuleFor": "Eliminar regla para {{application}}",
+    "scopeNote": "Estas reglas se aplican a todos los dispositivos cuya directiva de configuración vincula este anillo."
+  },
+  "patchDetails": {
+    "unknown": "Desconocido",
+    "source": "Origen",
+    "packageId": "KB / ID de paquete",
+    "severity": "Gravedad",
+    "releaseDate": "Fecha de lanzamiento",
+    "firstSeen": "Visto por primera vez en el catálogo",
+    "rings": {
+      "title": "Anillos de actualización",
+      "note": "Cuándo aprueba automáticamente cada anillo este parche (regla a nivel de anillo; no se muestran las excepciones por categoría).",
+      "none": "No hay anillos de actualización configurados.",
+      "manual": "Sin aprobación automática — requiere aprobación manual",
+      "immediate": "Se aprueba automáticamente de inmediato",
+      "needsDate": "Retenido — sin fecha de lanzamiento para iniciar la ventana de {{count}} días",
+      "autoApproves": "Se aprueba automáticamente el {{date}}",
+      "hold_one": "Retraso de {{count}} día",
+      "hold_other": "Retraso de {{count}} días"
     }
   }
 }

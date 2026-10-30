@@ -141,27 +141,13 @@ pnpm install
 ```bash
 # Copy environment template
 cp .env.example .env
-
-# Edit .env with your local settings
 ```
 
-**Required Environment Variables:**
-
-```env
-# Database
-DATABASE_URL=postgresql://breeze:breeze@localhost:5432/breeze
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Authentication
-JWT_SECRET=your-super-secret-key-change-in-production
-
-# Optional: MinIO for file storage
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-```
+`.env.example` is the production template. Generate the three required secrets as shown in
+[CONTRIBUTING.md → Development Setup](../../CONTRIBUTING.md#development-setup), then change the
+local-development values listed in [CONTRIBUTING.md → Local `.env` values](../../CONTRIBUTING.md#local-env-values)
+(`NODE_ENV`, `FORCE_HTTPS`, `REDIS_URL`). That section is the one place these are kept, so the two
+guides cannot drift apart.
 
 ### Running Services Locally
 
@@ -176,11 +162,16 @@ This starts:
 - Redis on port 6379
 - MinIO on port 9000/9001 (optional)
 
+These publish on `127.0.0.1` only, so the dev services are reachable from this
+machine alone. Set `BREEZE_DEV_BIND_ADDR=0.0.0.0` only if another machine must
+reach the stack, and change the passwords first if you do — see
+`CONTRIBUTING.md` for which ones.
+
 **2. Initialize the database:**
 
 ```bash
-# Push schema to database
-pnpm db:push
+# Apply migrations to the database
+pnpm db:migrate
 
 # Optional: Open Drizzle Studio to inspect data
 pnpm db:studio
@@ -189,8 +180,11 @@ pnpm db:studio
 **3. Start development servers:**
 
 ```bash
-# Start all services (web + API)
-pnpm dev
+# Start the app services (api + web + portal)
+pnpm dev:app
+
+# `pnpm dev` runs every package, including the Office add-ins, which need the Windows or
+# macOS certificate store; on Linux/WSL they skip themselves with a message.
 ```
 
 | Service | URL |
@@ -202,14 +196,11 @@ pnpm dev
 ### Database Setup and Migrations
 
 ```bash
-# Generate migration from schema changes
-pnpm db:generate
-
-# Push schema directly (development)
-pnpm db:push
-
-# Run migrations (production)
+# Apply migrations (development and production)
 pnpm db:migrate
+
+# Verify the migration set applies cleanly to a fresh database
+pnpm db:check-drift
 
 # Open database GUI
 pnpm db:studio
@@ -992,23 +983,16 @@ export const devices = pgTable('devices', {
 
 ### Migration Workflow
 
-**Development (schema push):**
+Migrations are hand-written SQL files in `apps/api/migrations/`. Drizzle is used for queries only: do not run `drizzle-kit generate` or `drizzle-kit push`. Read `apps/api/migrations/README.md` for naming and idempotency rules.
 
 ```bash
-# Directly push schema changes to database
-pnpm db:push
-```
+# 1. Add an idempotent SQL file to apps/api/migrations/ (and update the Drizzle schema in apps/api/src/db/schema/)
 
-**Production (migrations):**
-
-```bash
-# Generate migration from schema changes
-pnpm db:generate
-
-# Review generated SQL in apps/api/drizzle/
-
-# Apply migrations
+# 2. Apply migrations
 pnpm db:migrate
+
+# 3. Verify the migration set applies cleanly to a fresh database
+pnpm db:check-drift
 ```
 
 ### Common Query Patterns

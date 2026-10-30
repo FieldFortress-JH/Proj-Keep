@@ -242,6 +242,7 @@ vi.mock('../services/mfaStepUpGrant', () => ({
   validateStepUpGrant: vi.fn(),
   consumeStepUpGrant: vi.fn(),
   passkeyRemovalResourceDigest: vi.fn(() => 'sha256:passkey-credential-row'),
+  callerVerificationAdministrativeDigest: vi.fn(() => 'sha256:ca11e7ver1f1cat10nadm1n000000000000000000000000000000000000000a'),
   rollbackResourceDigest: vi.fn(() => 'sha256:600d9bcdbac702fc40c080c8a0dddec84fc2a84564f79ec13410b0f6942edf80'),
   // RMM-QA-176 D11: a DELIBERATELY DIFFERENT constant from the rollback digest
   // above. The mint route dispatches the digest function by operation, so a
@@ -253,6 +254,7 @@ vi.mock('../services/mfaStepUpGrant', () => ({
   // operation, and a dispatch that fell through to another digest function
   // would produce the wrong constant and fail the assertion below.
   moveOrgResourceDigest: vi.fn(() => 'sha256:m0ve0r9b0undd19e5700000000000000000000000000000000000000000000'),
+  forceRebootResourceDigest: vi.fn(() => 'sha256:f0rcer3b00700000000000000000000000000000000000000000000000000000'),
   // Unattested restore step-up: another distinct constant, same reason.
   unattestedRestoreResourceDigest: vi.fn(() => 'sha256:b0c7a5c0e5700000000000000000000000000000000000000000000000000004'),
   // Parked-device assignment: two more distinct constants, same reason.
@@ -491,7 +493,7 @@ import { hashRecoveryCode, encryptMfaSecret } from './auth/helpers';
 import { finalizeSsoPendingLink } from './auth/ssoLinkCompletion';
 import * as mfaPolicyModule from '../services/mfaPolicy';
 import { enforceIpAllowlist } from '../services/ipAllowlist';
-import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, maintenanceResourceDigest, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, preAssignmentEnableResourceDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, unattestedRestoreResourceDigest, autopayChargeNowResourceDigest, partnerPaymentSettingsResourceDigest, autopayRequestRecipientResourceDigest, orgPaymentSettingsResourceDigest } from '../services/mfaStepUpGrant';
+import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, maintenanceResourceDigest, moveOrgResourceDigest, forceRebootResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, preAssignmentEnableResourceDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, unattestedRestoreResourceDigest, autopayChargeNowResourceDigest, partnerPaymentSettingsResourceDigest, autopayRequestRecipientResourceDigest, orgPaymentSettingsResourceDigest } from '../services/mfaStepUpGrant';
 import { verifyStepUpPasskeyAssertion } from './auth/passkeys';
 import { getTwilioService } from '../services/twilio';
 import { authMiddleware } from '../middleware/auth';
@@ -5041,6 +5043,40 @@ describe('auth routes', () => {
 			expect(mintStepUpGrant).not.toHaveBeenCalled();
 		});
 
+		it('mints a caller_verification_administrative_disable grant bound to its own digest', async () => {
+			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
+			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-cv-admin');
+			const resource = {
+				orgId: '00000000-0000-4000-8000-000000000004',
+				entraTenantId: 'tenant-1',
+				entraOid: 'oid-1',
+				reason: 'Confirmed offboarding with the HR manager',
+			};
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation: 'caller_verification_administrative_disable', resource }),
+			});
+			expect(res.status).toBe(200);
+			expect(mintStepUpGrant).toHaveBeenCalledWith(expect.objectContaining({
+				operation: 'caller_verification_administrative_disable',
+				resourceDigest: 'sha256:ca11e7ver1f1cat10nadm1n000000000000000000000000000000000000000a',
+			}));
+		});
+
+		it('rejects caller_verification_administrative_disable before factor verification when the resource is missing or short', async () => {
+			for (const resource of [undefined, { orgId: '00000000-0000-4000-8000-000000000004', entraTenantId: 't', entraOid: 'o', reason: 'short' }]) {
+				const res = await app.request('/auth/mfa/step-up', {
+					method: 'POST',
+					headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+					body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation: 'caller_verification_administrative_disable', resource }),
+				});
+				expect(res.status).toBe(400);
+			}
+			expect(verifyStepUpPasskeyAssertion).not.toHaveBeenCalled();
+			expect(mintStepUpGrant).not.toHaveBeenCalled();
+		});
+
 		it('rejects agent_rollback before factor verification when the resource binding is absent', async () => {
 			const res = await app.request('/auth/mfa/step-up', {
 				method: 'POST',
@@ -5125,6 +5161,39 @@ describe('auth routes', () => {
 
 		// Device move-org step-up (spec 2026-09-18 D2): a bound operation whose
 		// resource must parse under ITS OWN schema before any factor is verified.
+		// #8729: force reboot is bound to exactly one device.
+		it('mints a device_force_reboot grant bound to the device digest', async () => {
+			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
+			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-force-reboot');
+			const resource = { deviceId: '00000000-0000-4000-8000-000000000010' };
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation: 'device_force_reboot', resource }),
+			});
+			expect(res.status).toBe(200);
+			expect(forceRebootResourceDigest).toHaveBeenCalledWith(resource);
+			expect(mintStepUpGrant).toHaveBeenCalledWith(expect.objectContaining({
+				operation: 'device_force_reboot',
+				resourceDigest: 'sha256:f0rcer3b00700000000000000000000000000000000000000000000000000000',
+			}));
+		});
+
+		it.each([
+			['no resource', undefined],
+			['a resource with extra keys', { deviceId: '00000000-0000-4000-8000-000000000010', targetOrgId: '00000000-0000-4000-8000-000000000020' }],
+			['a non-uuid device id', { deviceId: 'not-a-uuid' }],
+		])('refuses a device_force_reboot step-up with %s, before verifying a factor', async (_label, resource) => {
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation: 'device_force_reboot', resource }),
+			});
+			expect(res.status).toBe(400);
+			expect(verifyStepUpPasskeyAssertion).not.toHaveBeenCalled();
+			expect(mintStepUpGrant).not.toHaveBeenCalled();
+		});
+
 		it('mints a device_move_org grant bound to the canonical move digest', async () => {
 			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
 			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-move-org');

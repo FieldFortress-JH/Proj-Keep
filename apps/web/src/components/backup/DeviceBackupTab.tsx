@@ -13,12 +13,15 @@ import {
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
+import SnapshotIntegrityBadge from './SnapshotIntegrityBadge';
 import { friendlyFetchError } from '../../lib/utils';
 import { useScrollToError } from '../../lib/scrollToError';
 import BackupVerificationTab from './BackupVerificationTab';
 import ExternalBackupCard from './ExternalBackupCard';
-import { formatNumber } from '@/lib/i18n/format';
+import { formatBytes } from './backupDashboardHelpers';
 import DeviceVaultStatus from './DeviceVaultStatus';
+import ReparseSkipNotice from './ReparseSkipNotice';
+import { splitReparseSkipNotice } from '@breeze/shared';
 import AlphaBadge from '../shared/AlphaBadge';
 import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
@@ -67,6 +70,8 @@ type Snapshot = {
   id: string;
   deviceId: string;
   label: string | null;
+  /** From GET /backup/snapshots; absent on an older API. */
+  integrityStatus?: string | null;
   createdAt: string;
   sizeBytes?: number | null;
   fileCount?: number | null;
@@ -108,14 +113,6 @@ const vssStateConfig: Record<string, { className: string; label: string }> = {
   unknown: { className: 'text-muted-foreground bg-muted', label: 'Unknown' },
 };
 
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes == null) return '-';
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${formatNumber(bytes / Math.pow(k, i), { maximumFractionDigits: 1 })} ${sizes[i]}`;
-}
 
 function formatTime(iso: string | null | undefined, timezone?: string | null): string {
   return formatDateTime(iso, {
@@ -417,7 +414,11 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
   // note, not an error — and it is the only channel a total VSS failure has,
   // since that outcome produces no vssMetadata at all. This tab used to ignore
   // errorLog entirely, so such a run displayed as a clean green backup.
-  const lastJobDiagnostic = lastJob?.errorLog?.trim() || null;
+  // #9543: deliberately skipped reparse points are informational — shown on
+  // their own muted line, so a run whose only note is the skip is not framed
+  // as "completed with warnings" and a failed run's banner keeps its reason.
+  const { diagnostic: lastJobDiagnostic, reparseSkipped: lastJobReparseSkipped } =
+    splitReparseSkipNotice(lastJob?.errorLog);
   const lastJobFailed = lastJobStatus === 'failed';
   // #5396: distinct from the generic "completed with warnings" framing — this
   // run has a concrete, agent-reported count of files that failed to read or
@@ -584,7 +585,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                         {formatDuration(job.startedAt, job.completedAt)}
                       </td>
                       <td className="py-2 pr-4 text-muted-foreground">
-                        {formatBytes(job.totalSize)}
+                        {formatBytes(job.totalSize, '-')}
                       </td>
                       <td className="py-2">
                         {errorCount > 0 ? (
@@ -634,6 +635,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
           </div>
         </div>
       )}
+      {lastJobReparseSkipped && <ReparseSkipNotice summary={lastJobReparseSkipped} />}
 
       {/* VSS Status */}
       {showVssStatus && (
@@ -769,7 +771,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                     <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       {t('deviceBackupTab.snapshotDetails')} </div>
                     <div className="mt-2 space-y-1 text-foreground">
-                      <div>{t('deviceBackupTab.size2')} {formatBytes(selectedSnapshot.sizeBytes)}</div>
+                      <div>{t('deviceBackupTab.size2')} {formatBytes(selectedSnapshot.sizeBytes, '-')}</div>
                       <div>{t('deviceBackupTab.files')} {selectedSnapshot.fileCount ?? '-'}</div>
                       <div>{t('deviceBackupTab.protection')} {protectionSummary(selectedSnapshot)}</div>
                     </div>
@@ -916,6 +918,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.created2')}</th>
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.expires2')}</th>
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.size')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.integrity')}</th>
                   <th className="pb-2 font-medium">{t('deviceBackupTab.protection2')}</th>
                 </tr>
               </thead>
@@ -935,7 +938,10 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                     </td>
                     <td className="py-2 pr-4 text-muted-foreground">{formatTime(snap.expiresAt, effectiveZone)}</td>
                     <td className="py-2 pr-4 text-muted-foreground">
-                      {formatBytes(snap.sizeBytes)}
+                      {formatBytes(snap.sizeBytes, '-')}
+                    </td>
+                    <td className="py-2 pr-4">
+                      <SnapshotIntegrityBadge status={snap.integrityStatus} />
                     </td>
                     <td className="py-2">
                       <div className="flex flex-wrap items-center gap-1.5">

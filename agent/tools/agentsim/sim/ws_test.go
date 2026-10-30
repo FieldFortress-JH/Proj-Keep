@@ -22,6 +22,50 @@ func runAgent(t *testing.T, f *fakeAPI, mutate func(*Config)) (*Agent, Identity,
 	return a, id, rec, cancel
 }
 
+func runAgentWithTimeline(t *testing.T, f *fakeAPI) (*Agent, Identity, *Recorder, context.CancelFunc) {
+	t.Helper()
+	cfg := testConfig(f, t.TempDir())
+	id := f.preEnroll(0)
+	rec := newTestRecorder()
+	rec.EnableTimeline(time.Second, time.Minute)
+	a := NewAgent(&cfg, rec, id, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	done := make(chan struct{})
+	go func() { a.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return a, id, rec, cancel
+}
+
+func TestLiveGaugeFollowsTheSocket(t *testing.T) {
+	f := newFakeAPI(t)
+	_, _, rec, _ := runAgentWithTimeline(t, f)
+	eventually(t, 2*time.Second, func() bool { return rec.timeline.live.Load() == 1 }, "gauge never rose to 1")
+	f.setRejectWS(true)
+	f.dropSockets()
+	eventually(t, time.Second, func() bool { return rec.timeline.live.Load() == 0 }, "gauge did not fall after the drop")
+}
+
+func TestHubCloseAllDropsEverySocketAndTheyRedial(t *testing.T) {
+	f := newFakeAPI(t)
+	hub := newSocketHub()
+	cfg := testConfig(f, t.TempDir())
+	rec := newTestRecorder()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		id := f.preEnroll(i)
+		a := NewAgent(&cfg, rec, id, nil)
+		a.hub = hub
+		go a.Run(ctx)
+	}
+	eventually(t, 2*time.Second, func() bool { return hub.Len() == 3 }, "hub never saw 3 sockets")
+	if n := hub.CloseAll(); n != 3 {
+		t.Fatalf("CloseAll closed %d, want 3", n)
+	}
+	eventually(t, time.Second, func() bool { return rec.wsReconnects.Load() >= 3 && hub.Len() == 3 },
+		"sockets were not redialled after the drop")
+}
+
 func TestWSCommandIsAnsweredOverTheSocket(t *testing.T) {
 	f := newFakeAPI(t)
 	_, id, _, _ := runAgent(t, f, nil)
@@ -39,21 +83,22 @@ func TestAppPingIsAnsweredWithPong(t *testing.T) {
 	eventually(t, 2*time.Second, func() bool { return f.pongs() >= 3 }, "server app pings were not answered with pong frames (the API closes with 4008)")
 }
 
-func TestEstablishedDropReconnectsImmediately(t *testing.T) {
+func TestEstablishedDropReconnects(t *testing.T) {
 	f := newFakeAPI(t)
 	_, id, rec, _ := runAgent(t, f, nil)
 	eventually(t, 2*time.Second, func() bool { return f.socketFor(id.AgentID) }, "no first connection")
 	f.dropSockets()
-	// No backoff after an established drop: well under the 700 ms floor a
-	// failed connect would cost (1 s − 30 %).
-	eventually(t, 500*ms, func() bool { return f.socketFor(id.AgentID) && rec.wsReconnects.Load() >= 1 },
-		"an established socket that dropped was not redialled at once")
+	// The shipped agent paces every redial (TestSimRunUsesAgentReconnectPolicy
+	// pins the waits); here the pacing is scaled to milliseconds.
+	eventually(t, time.Second, func() bool { return f.socketFor(id.AgentID) && rec.wsReconnects.Load() >= 1 },
+		"an established socket that dropped was never redialled")
 }
 
 func TestFailedUpgradeBacksOff(t *testing.T) {
 	f := newFakeAPI(t)
 	f.setRejectWS(true)
-	_, _, rec, _ := runAgent(t, f, nil)
+	// The pre-W09 cohort has no start jitter, so attempt 1 is immediate; real-time pacing.
+	_, _, rec, _ := runAgent(t, f, func(c *Config) { c.PreW09Fraction, c.wsPaceScale = 1, 0 })
 	time.Sleep(1600 * ms)
 	// Attempt 1 at ~first beat, attempt 2 after 1 s ± 30 %, attempt 3 only
 	// after a further 2 s ± 30 %: at most 2 attempts in 1.6 s.

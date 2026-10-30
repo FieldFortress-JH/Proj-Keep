@@ -171,3 +171,42 @@ describe('TicketList — phone card first line', () => {
     expect(src).toMatch(/order-1 min-w-0 grow basis-0 sm:basis-auto/);
   });
 });
+
+describe('TicketList — ticket type (#8596)', () => {
+  it.each([
+    ['incident', 'Incident'],
+    ['service_request', 'Service request'],
+    ['problem', 'Problem'],
+    ['change', 'Change'],
+  ] as const)('shows %s as the quiet label "%s" beside the number', (ticketType, label) => {
+    render(<TicketList tickets={[ticket({ ticketType })]} />);
+    const badge = screen.getByTestId('portal-ticket-type-t1');
+    expect(badge.textContent).toBe(label);
+    // Context, not state: never a second StatusMark dot on the row.
+    expect(badge.querySelector('[aria-hidden="true"]')).toBeNull();
+  });
+
+  it('renders no type label when an older API response has no ticketType', () => {
+    render(<TicketList tickets={[ticket({ ticketType: undefined })]} />);
+    expect(screen.queryByTestId('portal-ticket-type-t1')).toBeNull();
+  });
+});
+
+// #8972: merged tombstones never reach this list — GET /portal/tickets filters
+// them server-side (isNull(merged_into_ticket_id), pinned by
+// portalTicketMerge.integration.test.ts) and the payload carries no merged
+// marker to filter on. The list renders exactly the rows it is given.
+describe('TicketList — merged tickets are hidden by the server, not here', () => {
+  it('renders every row it is given, survivors included', () => {
+    render(
+      <TicketList
+        tickets={[
+          ticket({ id: 'surv-1', ticketNumber: 'T-2', subject: 'Survivor of a merge' }),
+          ticket({ id: 't-3', ticketNumber: 'T-3', subject: 'Unrelated request' }),
+        ]}
+      />,
+    );
+    expect(screen.getByText('Survivor of a merge')).toBeTruthy();
+    expect(screen.getByText('Unrelated request')).toBeTruthy();
+  });
+});

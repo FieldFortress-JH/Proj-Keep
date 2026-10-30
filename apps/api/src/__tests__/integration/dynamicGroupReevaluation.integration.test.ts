@@ -38,6 +38,18 @@
  *      having evaluated nothing. Driven end to end against real Redis with a
  *      real BullMQ worker, with the undelayed behaviour as a paired negative
  *      control in the same test.
+ *   8. #8832 — tags: a `tags` rule flips both ways on a `['tags']` request.
+ *   9. #8832 — custom fields, end to end from the one value writer
+ *      (`persistDeviceCustomFieldValues`): the write enqueues a job after
+ *      commit whose `custom.<key>` matches the spelling stored in
+ *      `filter_fields_used`, and running it flips membership both ways; a
+ *      write whose transaction rolls back enqueues nothing; re-writing an
+ *      unchanged value enqueues nothing (the real `setWhere` skip).
+ *  10. #10497 — software inventory changes make devices join and leave groups.
+ *  11. #10539 — version-only changes enqueue detail fields; identical inventory enqueues nothing.
+ *  12. #10497 — POST /devices/:id/move-org enqueues device.created for the target org,
+ *      which rebuilds dynamic membership; device.updated with no fields does not.
+ *  13. #10497 — a software.notInstalled group gains the device when the software is uninstalled.
  */
 import './setup';
 
@@ -45,9 +57,12 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { randomUUID } from 'crypto';
 import { and, eq } from 'drizzle-orm';
 import type { Worker } from 'bullmq';
+import { Hono } from 'hono';
+import type { SoftwareInventoryObservationV2 } from '@breeze/shared';
 
 import { db, withSystemDbAccessContext } from '../../db';
 import {
+  customFieldDefinitions,
   deviceGroupMemberships,
   deviceGroups,
   devices,
@@ -64,6 +79,12 @@ import {
   shutdownDeviceGroupJobs,
 } from '../../jobs/deviceGroupJobs';
 import { closeRedis } from '../../services/redis';
+import { extractFieldsFromFilter, type FilterConditionGroup } from '../../services/filterEngine';
+import { persistDeviceCustomFieldValues } from '../../services/customFields/queries';
+import { ingestSoftwareInventoryReport } from '../../services/softwareInventoryObservations';
+import { createAccessToken } from '../../services/jwt';
+import { moveOrgRoutes } from '../../routes/devices/moveOrg';
+import { withMoveOrgStepUpGrant } from './moveOrgStepUpFixture';
 import {
   createOrganization,
   createPartner,
@@ -109,6 +130,27 @@ async function seedDynamicGroup(orgId: string): Promise<string> {
         type: 'dynamic',
         filterConditions: SERVER_HOSTNAME_FILTER,
         filterFieldsUsed: ['hostname'],
+      })
+      .returning({ id: deviceGroups.id });
+    return row!.id;
+  });
+}
+
+/**
+ * A dynamic group whose `filter_fields_used` is derived exactly the way the
+ * group routes derive it on save, so a mismatch between that spelling and the
+ * field names a producer requests shows up here as a group that never flips.
+ */
+async function seedDynamicGroupWithFilter(orgId: string, filter: FilterConditionGroup): Promise<string> {
+  return withSystemDbAccessContext(async () => {
+    const [row] = await db
+      .insert(deviceGroups)
+      .values({
+        orgId,
+        name: `dyn ${randomUUID().slice(0, 8)}`,
+        type: 'dynamic',
+        filterConditions: filter,
+        filterFieldsUsed: extractFieldsFromFilter(filter),
       })
       .returning({ id: deviceGroups.id });
     return row!.id;
@@ -342,6 +384,364 @@ describe('dynamic device group re-evaluation on device change (#4630)', () => {
 
     expect(result).toEqual({ evaluated: false, orgId: null });
   });
+
+  runDb('#8832: a tags rule flips both ways on a tags re-evaluation', async () => {
+    const env = await setupTestEnvironment();
+    const groupId = await seedDynamicGroupWithFilter(env.organization.id, {
+      operator: 'AND',
+      conditions: [{ field: 'tags', operator: 'hasAny', value: ['retired'] }],
+    });
+    const deviceId = await seedDevice(env.organization.id, env.site.id, 'wks-tagged');
+    const reevaluate = () => runReevaluation({
+      deviceId,
+      orgId: env.organization.id,
+      eventType: 'device.updated',
+      changedFields: ['tags'],
+    });
+
+    await reevaluate();
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+
+    // What PATCH /devices/:id and manage_tags write.
+    await withSystemDbAccessContext(async () => {
+      await db.update(devices).set({ tags: ['retired', 'hq'] }).where(eq(devices.id, deviceId));
+    });
+    await reevaluate();
+    expect(await memberDeviceIds(groupId)).toEqual([deviceId]);
+
+    await withSystemDbAccessContext(async () => {
+      await db.update(devices).set({ tags: [] }).where(eq(devices.id, deviceId));
+    });
+    await reevaluate();
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+  });
+});
+
+/**
+ * #8832 — a custom-field value write re-evaluates `custom.<key>` groups.
+ *
+ * Driven from `persistDeviceCustomFieldValues`, the single writer behind the
+ * device PATCH, PATCH /custom-fields, the CSV importer and script write-back.
+ * It enqueues through `runAfterDbContextCommit`, so this goes through real
+ * Redis: the job must appear only after the writing transaction commits, carry
+ * the `custom.<key>` spelling the group's `filter_fields_used` stores, and —
+ * run exactly as the worker runs it — flip membership in both directions.
+ */
+describe('custom-field value writes re-evaluate dynamic groups (#8832)', () => {
+  const FIELD_KEY = 'asset_disposition';
+
+  afterEach(async () => {
+    await getDeviceGroupReevaluationQueue().obliterate({ force: true }).catch(() => {});
+  });
+
+  async function seedDefinition(orgId: string): Promise<string> {
+    return withSystemDbAccessContext(async () => {
+      const [row] = await db
+        .insert(customFieldDefinitions)
+        .values({ orgId, name: 'Asset disposition', fieldKey: FIELD_KEY, type: 'text' })
+        .returning({ id: customFieldDefinitions.id });
+      return row!.id;
+    });
+  }
+
+  async function writeDisposition(deviceId: string, orgId: string, definitionId: string, value: string) {
+    await withSystemDbAccessContext(() =>
+      persistDeviceCustomFieldValues(
+        deviceId,
+        orgId,
+        [{ definitionId, fieldKey: FIELD_KEY, type: 'text', value }],
+        'manual',
+      ),
+    );
+  }
+
+  /** The enqueue is fire-and-forget after commit, so wait for it to land. */
+  async function awaitQueuedJob(deviceId: string) {
+    const queue = getDeviceGroupReevaluationQueue();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const job = await queue.getJob(deviceGroupReevaluationJobId(deviceId));
+      if (job) return job;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`no re-evaluation job was enqueued for device ${deviceId}`);
+  }
+
+  runDb('a committed value write enqueues custom.<key> and the job flips membership both ways', async () => {
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const definitionId = await seedDefinition(orgId);
+    const groupId = await seedDynamicGroupWithFilter(orgId, {
+      operator: 'AND',
+      conditions: [{ field: `custom.${FIELD_KEY}`, operator: 'equals', value: 'retired' }],
+    });
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-disposition');
+
+    await writeDisposition(deviceId, orgId, definitionId, 'retired');
+    const added = await awaitQueuedJob(deviceId);
+    expect(added.data.changedFields).toEqual([`custom.${FIELD_KEY}`]);
+    expect(added.data.eventType).toBe('device.updated');
+    // Before the job runs the group is stale — the #8832 symptom.
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+    await runDeviceGroupReevaluationJob(added.data);
+    expect(await memberDeviceIds(groupId)).toEqual([deviceId]);
+    await added.remove();
+
+    await writeDisposition(deviceId, orgId, definitionId, 'in_service');
+    const removed = await awaitQueuedJob(deviceId);
+    expect(removed.data.changedFields).toEqual([`custom.${FIELD_KEY}`]);
+    await runDeviceGroupReevaluationJob(removed.data);
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+  }, 30_000);
+
+  runDb('re-writing an unchanged value enqueues nothing', async () => {
+    // A fleet-wide script re-asserting the same value on every run must not
+    // enqueue a re-evaluation per device. Proven against the real upsert's
+    // setWhere/RETURNING, not a mock.
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const definitionId = await seedDefinition(orgId);
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-unchanged');
+
+    await writeDisposition(deviceId, orgId, definitionId, 'retired');
+    await (await awaitQueuedJob(deviceId)).remove();
+
+    await writeDisposition(deviceId, orgId, definitionId, 'retired');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await getDeviceGroupReevaluationQueue().getJob(deviceGroupReevaluationJobId(deviceId))).toBeUndefined();
+
+    // Positive control: a real change on the same device still enqueues.
+    await writeDisposition(deviceId, orgId, definitionId, 'in_service');
+    expect((await awaitQueuedJob(deviceId)).data.changedFields).toEqual([`custom.${FIELD_KEY}`]);
+  }, 30_000);
+
+  runDb('a write whose transaction rolls back enqueues nothing', async () => {
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const definitionId = await seedDefinition(orgId);
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-rollback');
+
+    const rollback = new Error('roll back the value write');
+    await expect(withSystemDbAccessContext(async () => {
+      await persistDeviceCustomFieldValues(
+        deviceId,
+        orgId,
+        [{ definitionId, fieldKey: FIELD_KEY, type: 'text', value: 'retired' }],
+        'import',
+      );
+      throw rollback;
+    })).rejects.toBe(rollback);
+
+    // Positive control on the same device afterwards: a committed write DOES
+    // land a job, so "no job" above is the rollback, not a slow enqueue.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await getDeviceGroupReevaluationQueue().getJob(deviceGroupReevaluationJobId(deviceId))).toBeUndefined();
+    await writeDisposition(deviceId, orgId, definitionId, 'retired');
+    expect((await awaitQueuedJob(deviceId)).data.reason).toBe('custom_field_write:manual');
+  }, 30_000);
+});
+
+describe('software inventory and org moves re-evaluate groups (#10497)', () => {
+  afterEach(async () => {
+    await getDeviceGroupReevaluationQueue().obliterate({ force: true }).catch(() => {});
+  });
+
+  async function awaitQueuedJob(deviceId: string) {
+    const queue = getDeviceGroupReevaluationQueue();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const job = await queue.getJob(deviceGroupReevaluationJobId(deviceId));
+      if (job) return job;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`no re-evaluation job was enqueued for device ${deviceId}`);
+  }
+
+  function report(items: Array<{ name: string; version?: string }>): SoftwareInventoryObservationV2 {
+    return {
+      schemaVersion: 2,
+      observationId: randomUUID(),
+      collectorVersion: '1.0.0',
+      observedAt: '2026-08-24T12:00:00.000Z',
+      completeness: 'complete',
+      expectedSources: ['windows:registry:hklm64'],
+      succeededSources: ['windows:registry:hklm64'],
+      failedSources: [],
+      truncated: false,
+      itemCount: items.length,
+      items,
+    };
+  }
+
+  runDb('a device joins then leaves a software.installed group as its inventory changes', async () => {
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const name = 'PowerChute Business Edition Agent';
+    const groupId = await seedDynamicGroupWithFilter(orgId, {
+      operator: 'AND',
+      conditions: [{ field: 'software.installed', operator: 'equals', value: name }],
+    });
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-software');
+    const device = { id: deviceId, orgId, agentVersion: '1.0.0' };
+
+    const installed = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name }, { name: 'Other software' }]),
+      receivedAt: new Date('2026-08-24T12:00:01Z'),
+    });
+    expect(installed.acceptedForInventory).toBe(true);
+    const added = await awaitQueuedJob(deviceId);
+    expect(added.data.eventType).toBe('device.updated');
+    expect([...added.data.changedFields].sort()).toEqual(['software.installed', 'software.notInstalled', 'software.vendor', 'software.version']);
+    expect(added.data.reason).toBe('software_inventory_change');
+    // Ingest only enqueues; membership is unchanged until the job runs.
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+    await runDeviceGroupReevaluationJob(added.data);
+    expect(await memberDeviceIds(groupId)).toEqual([deviceId]);
+    await added.remove();
+
+    const uninstalled = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'Other software' }]),
+      receivedAt: new Date('2026-08-24T12:00:02Z'),
+    });
+    expect(uninstalled.acceptedForInventory).toBe(true);
+    const removed = await awaitQueuedJob(deviceId);
+    await runDeviceGroupReevaluationJob(removed.data);
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+  }, 30_000);
+
+  runDb('a device joins a software.notInstalled group when the software is uninstalled', async () => {
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const name = 'PowerChute Business Edition Agent';
+    const groupId = await seedDynamicGroupWithFilter(orgId, {
+      operator: 'AND',
+      conditions: [{ field: 'software.notInstalled', operator: 'equals', value: name }],
+    });
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-missing-software');
+    const device = { id: deviceId, orgId, agentVersion: '1.0.0' };
+
+    const installed = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name }, { name: 'Other software' }]),
+      receivedAt: new Date('2026-08-24T12:00:01Z'),
+    });
+    expect(installed.acceptedForInventory).toBe(true);
+    const added = await awaitQueuedJob(deviceId);
+    await runDeviceGroupReevaluationJob(added.data);
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+    await added.remove();
+
+    const uninstalled = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'Other software' }]),
+      receivedAt: new Date('2026-08-24T12:00:02Z'),
+    });
+    expect(uninstalled.acceptedForInventory).toBe(true);
+    const removed = await awaitQueuedJob(deviceId);
+    expect([...removed.data.changedFields].sort()).toEqual(['software.installed', 'software.notInstalled', 'software.vendor', 'software.version']);
+    await runDeviceGroupReevaluationJob(removed.data);
+    expect(await memberDeviceIds(groupId)).toEqual([deviceId]);
+  }, 30_000);
+
+  runDb('version-only changes enqueue detail fields and identical inventory enqueues nothing', async () => {
+    const env = await setupTestEnvironment();
+    const orgId = env.organization.id;
+    const deviceId = await seedDevice(orgId, env.site.id, 'wks-same-software');
+    const device = { id: deviceId, orgId, agentVersion: '1.0.0' };
+    const installedGroupId = await seedDynamicGroupWithFilter(orgId, {
+      operator: 'AND',
+      conditions: [{ field: 'software.installed', operator: 'equals', value: 'A' }],
+    });
+    const outdatedGroupId = await seedDynamicGroupWithFilter(orgId, {
+      operator: 'AND',
+      conditions: [{ field: 'software.version', operator: 'below', value: { name: 'A', version: '2' } }],
+    });
+
+    await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'A', version: '1' }, { name: 'B', version: '1' }]),
+      receivedAt: new Date('2026-08-24T12:00:01Z'),
+    });
+    const initial = await awaitQueuedJob(deviceId);
+    await runDeviceGroupReevaluationJob(initial.data);
+    expect(await memberDeviceIds(installedGroupId)).toEqual([deviceId]);
+    expect(await memberDeviceIds(outdatedGroupId)).toEqual([deviceId]);
+    await initial.remove();
+
+    const upgraded = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'B', version: '2' }, { name: 'A', version: '2' }]),
+      receivedAt: new Date('2026-08-24T12:00:02Z'),
+    });
+    expect(upgraded.acceptedForInventory).toBe(true);
+    const detailChange = await awaitQueuedJob(deviceId);
+    expect(detailChange.data.changedFields).toEqual(['software.version', 'software.vendor']);
+    await runDeviceGroupReevaluationJob(detailChange.data);
+    expect(await memberDeviceIds(installedGroupId)).toEqual([deviceId]);
+    expect(await memberDeviceIds(outdatedGroupId)).toEqual([]);
+    await detailChange.remove();
+
+    const unchanged = await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'A', version: '2' }, { name: 'B', version: '2' }]),
+      receivedAt: new Date('2026-08-24T12:00:03Z'),
+    });
+    expect(unchanged.acceptedForInventory).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await getDeviceGroupReevaluationQueue().getJob(deviceGroupReevaluationJobId(deviceId))).toBeUndefined();
+
+    // Positive control: removing a name on the same device still enqueues.
+    await ingestSoftwareInventoryReport({
+      device,
+      report: report([{ name: 'A', version: '2' }]),
+      receivedAt: new Date('2026-08-24T12:00:04Z'),
+    });
+    expect((await awaitQueuedJob(deviceId)).data.reason).toBe('software_inventory_change');
+  }, 30_000);
+
+  runDb('a device moved to org B joins B\'s matching dynamic group', async () => {
+    const { partner, organization, site, user, role } = await setupTestEnvironment({ scope: 'partner' });
+    const targetOrg = await createOrganization({ partnerId: partner.id });
+    const targetSite = await createSite({ orgId: targetOrg.id });
+    const groupId = await seedDynamicGroup(targetOrg.id);
+    const deviceId = await seedDevice(organization.id, site.id, 'srv-moving');
+    const token = await createAccessToken({
+      sub: user.id,
+      email: user.email,
+      roleId: role.id,
+      orgId: null,
+      partnerId: partner.id,
+      scope: 'partner',
+      mfa: true,
+      aep: 1,
+      mep: 1,
+      sid: 'it-session',
+    });
+    const app = new Hono();
+    app.route('/devices', moveOrgRoutes);
+
+    const response = await app.request(`/devices/${deviceId}/move-org`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(await withMoveOrgStepUpGrant(token, deviceId, {
+        orgId: targetOrg.id,
+        siteId: targetSite.id,
+      })),
+    });
+    expect(response.status).toBe(200);
+    const job = await awaitQueuedJob(deviceId);
+    expect(job.data.eventType).toBe('device.created');
+    expect(job.data.orgId).toBe(targetOrg.id);
+    expect(job.data.reason).toBe('device_org_moved');
+
+    // The old parked-assignment payload cannot rebuild the deleted memberships.
+    await runDeviceGroupReevaluationJob({ ...job.data, eventType: 'device.updated', changedFields: [] });
+    expect(await memberDeviceIds(groupId)).toEqual([]);
+    await runDeviceGroupReevaluationJob(job.data);
+    expect(await memberDeviceIds(groupId)).toEqual([deviceId]);
+  }, 30_000);
 });
 
 /**

@@ -219,6 +219,7 @@
     "created2": "Creato",
     "expires2": "Scade",
     "protection2": "Protezione",
+    "integrity": "Integrità",
     "hold": "Blocco",
     "standard": "Standard",
     "restorePointCount_one": "{{count}} punto di ripristino",
@@ -487,6 +488,22 @@
     "selectASnapshot": "Seleziona uno snapshot",
     "chooseTheRecoveryPointYouWantToRestore": "Scegli il punto di ripristino da cui ripristinare.",
     "noSnapshotsAvailable": "Nessuno snapshot disponibile.",
+    "device": "Dispositivo",
+    "selectADevice": "Seleziona un dispositivo",
+    "chooseTheDeviceToRestore": "Scegli il dispositivo di cui vuoi ripristinare il backup.",
+    "deviceOption_one": "{{device}} ({{count}} snapshot)",
+    "deviceOption_other": "{{device}} ({{count}} snapshot)",
+    "unknownDevice": "Dispositivo sconosciuto",
+    "reviewDevice": "Dispositivo: {{device}}",
+    "snapshotNeedsSecondFactor": "Richiede secondo fattore",
+    "secondFactorNote": "Questo punto di ripristino non è verificato. All’avvio del ripristino ti verrà chiesto di confermare con il tuo secondo fattore.",
+    "secondFactorNoteNotEnrolled": "Questo punto di ripristino non è verificato e non hai un secondo fattore configurato. Per avviare il ripristino ne serve uno.",
+    "secondFactorSetUp": "Configura l’autenticazione a due fattori",
+    "commandDetails": "Dettagli del comando",
+    "copyCommandId": "Copia ID comando",
+    "commandIdCopied": "ID comando copiato",
+    "commandIdCopyFailed": "Impossibile copiare l’ID comando",
+    "carriedSnapshotUnavailable": "Lo snapshot con cui hai aperto la procedura guidata non è più disponibile. Scegli un dispositivo e uno dei suoi snapshot.",
     "selectRestoreType": "Seleziona tipo di ripristino",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Il ripristino completo ripristina tutto; il ripristino selettivo ripristina file specifici.",
     "fullRestore": "Ripristino completo",
@@ -529,9 +546,18 @@
     "noRestoreHistoryYet": "Nessuna cronologia di ripristino.",
     "files2": "File:",
     "size": "Dimensione:",
-    "filesSelected_one": "{{count}} file selezionato",
-    "filesSelected_other": "{{count}} file selezionati",
-    "unknownDevice": "Dispositivo sconosciuto",
+    "filesSelected_one": "{{formatted}} file selezionato",
+    "filesSelected_other": "{{formatted}} file selezionati",
+    "folderFileCount_one": "{{formatted}} documento",
+    "folderFileCount_other": "{{formatted}} documenti",
+    "allFilesFromSnapshot": "Tutti i file dello snapshot",
+    "selectionFiles_one": "{{formatted}} documento",
+    "selectionFiles_other": "{{formatted}} documenti",
+    "selectionFolders_one": "{{formatted}} cartella",
+    "selectionFolders_other": "{{formatted}} cartelle",
+    "largeFolderSelectionTitle": "Selezione estesa",
+    "selectFolder": "Seleziona la cartella {{name}}",
+    "confirmLargeFolderSelection": "Questa selezione comprende circa {{formatted}} file e il ripristino potrebbe richiedere tempo. Continuare?",
     "kindVm": "Ripristina come VM",
     "kindInstantBoot": "Avvio istantaneo",
     "kindSelective": "Ripristino selettivo",
@@ -629,6 +655,10 @@
     "path": "Percorso:",
     "useTheRestoreWorkflowToRecoverOrExport": "Usa il flusso di ripristino per recuperare o esportare file da questo snapshot.",
     "select": "Seleziona",
+    "folderFileCount_one": "{{count}} documento",
+    "folderFileCount_other": "{{count}} documenti",
+    "selectFolder": "Seleziona la cartella {{name}}",
+    "confirmLargeFolderSelection": "Questa selezione comprende circa {{count}} file e il ripristino potrebbe richiedere tempo. Continuare?",
     "name": "Nome",
     "size2": "Dimensione",
     "modified": "Modificato"
@@ -720,7 +750,9 @@
     "vaultType": "Tipo vault",
     "retentionCount": "Conteggio conservazione",
     "numberOfSnapshotsToKeepInTheVault": "Numero di snapshot da conservare nel vault (1-100).",
-    "cancel": "Annulla"
+    "cancel": "Annulla",
+    "failedToSave": "Impossibile salvare il vault. Riprova.",
+    "deviceConfigNotSent": "Vault salvato, ma la sua configurazione non è stata inviata al dispositivo: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Caricamento vault...",
@@ -742,7 +774,12 @@
     "actions": "Azioni",
     "sync": "Sincronizza",
     "edit": "Modifica",
-    "deactivate": "Disattiva"
+    "deactivate": "Disattiva",
+    "inactive": "Inattivo",
+    "syncStarted": "Sincronizzazione del vault avviata",
+    "failedToSync": "Impossibile avviare la sincronizzazione del vault. Riprova.",
+    "failedToDeactivate": "Impossibile disattivare il vault. Riprova.",
+    "deviceConfigNotSent": "Vault salvato, ma la sua configurazione non è stata inviata al dispositivo: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Caricamento disaster recovery...",
@@ -993,6 +1030,8 @@
     "codeExpires": "Scade alle {{time}}",
     "overdueNotice": "Nessun check-in ancora — controlla la console di ripristino.",
     "fileIndexPreparing": "Preparazione dell'indice dei file per i riferimenti tra snapshot…",
+    "snapshotsLoadFailed": "Impossibile caricare gli snapshot. Ricarica la pagina per riprovare.",
+    "noSnapshots": "Nessuno snapshot ripristinabile bare-metal per ora. È necessario un backup completo della macchina contrassegnato come ripristinabile bare-metal.",
     "statusFailed": "Ripristino non riuscito",
     "statusRefused": "Ripristino rifiutato",
     "status": {
@@ -1002,7 +1041,8 @@
       "restoring": "Ripristino in corso",
       "validated": "Convalidato",
       "rebooted": "Riavviato",
-      "checked_in": "Check-in effettuato"
+      "checked_in": "Check-in effettuato",
+      "completed": "Completato"
     }
   },
   "backupHealth": {
@@ -1013,6 +1053,7 @@
     "statusTitle": "Stato",
     "recencyTitle": "Ultimo backup riuscito",
     "coverage": "{{covered}} endpoint su {{total}} hanno un backup recente",
+    "definition": "«Recente» indica un backup riuscito nelle ultime 48 ore. Lo stato di un dispositivo riflette la sua ultima esecuzione: può avere un backup recente e mostrare comunque Critico se quell’esecuzione è fallita.",
     "providerOnly": "{{value}} endpoint solo del provider",
     "m365Accounts": "{{value}} account Microsoft 365",
     "status": {
@@ -1069,10 +1110,14 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare metal",
+      "m365_mail": "Posta di Microsoft 365",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
       "m365_onedrive": "OneDrive",
       "m365_teams": "Teams",
+      "gws_mail": "Posta di Google Workspace",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Drive condivisi di Google",
       "other": "Altro"
     },
     "noObservation": "Nessuna osservazione",
@@ -1091,7 +1136,12 @@
       "errorUnlink": "Impossibile scollegare il dispositivo del provider",
       "error": "Impossibile caricare lo stato del backup esterno",
       "alsoCheck": "Controlla anche le connessioni di backup di terze parti in Integrazioni."
-    }
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} account SaaS",
+    "workloadBackup": "Backup di {{workload}}",
+    "sourceProvider": "Fornitori di backup"
   },
   "restoreResultNotices": {
     "systemStateRequiresRebuildTitle": "Lo stato del sistema viene applicato da una ricostruzione bare-metal",
@@ -1129,5 +1179,10 @@
     "checking": "Verifica in corso",
     "unverified": "Non verificato",
     "failed": "Controllo di integrità non superato"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} reparse point ignorato: giunzioni e punti di montaggio non vengono seguiti né ripristinati. È previsto, non è un errore.",
+    "summary_other": "{{count}} reparse point ignorati: giunzioni e punti di montaggio non vengono seguiti né ripristinati. È previsto, non è un errore.",
+    "showDetails": "Mostra percorsi ignorati"
   }
 }

@@ -1,5 +1,7 @@
+const setPageContext = vi.hoisted(() => vi.fn());
+vi.mock('@/stores/aiStore', () => ({ useAiStore: (select: (s: unknown) => unknown) => select({ setPageContext }) }));
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@/lib/i18n';
 import OrganizationRecordPage from './OrganizationRecordPage';
@@ -28,6 +30,20 @@ vi.mock('./OrgServiceTab', () => ({
   default: (props: { orgId: string; orgFetch: unknown }) => {
     serviceTabProps(props);
     return <div data-testid="org-service-tab" />;
+  },
+}));
+
+// The header's Link-to-Wisp button reads the Wisp flag off /orgs/partners/me,
+// which would add a request this suite's exact-request assertions do not
+// expect; the button has its own suite, and OrgRecordHeader.test.tsx asserts
+// it is mounted.
+vi.mock('@/components/wisp/WispLinkButton', () => ({ default: () => null }));
+
+const trustTabProps = vi.hoisted(() => vi.fn());
+vi.mock('@/components/trustCenter/TrustCenterTab', () => ({
+  default: (props: { orgId: string; orgFetch: unknown }) => {
+    trustTabProps(props);
+    return <div data-testid="org-trust-tab" />;
   },
 }));
 
@@ -153,6 +169,7 @@ describe('OrganizationRecordPage — happy path', () => {
     await waitFor(() => expect(screen.getByTestId('org-record-header')).toBeTruthy());
     expect(screen.getByTestId('org-record-header').textContent).toContain('Acme Dental');
     expect(screen.getByTestId('org-record-status')).toBeTruthy();
+    expect(setPageContext).toHaveBeenCalledWith(expect.objectContaining({ type: 'record', kind: 'organization', id: RECORD_ORG, orgId: RECORD_ORG, label: 'Acme Dental' }));
   });
 
   it('pins EVERY request to the record org while the store points at another org', async () => {
@@ -183,13 +200,24 @@ describe('OrganizationRecordPage — happy path', () => {
     expect(screen.queryByTestId('org-record-scope-chip')).toBeNull();
   });
 
-  it('renders overview tiles only for the summary sections the caller can read', async () => {
+  it('renders overview stats only for the summary sections the caller can read', async () => {
     render(<OrganizationRecordPage orgId={RECORD_ORG} />);
-    await waitFor(() => expect(screen.getByTestId('org-overview-tile-devices')).toBeTruthy());
-    expect(screen.getByTestId('org-overview-tile-alerts')).toBeTruthy();
-    // The summary omitted tickets/invoices — a 0 tile there would be a lie.
-    expect(screen.queryByTestId('org-overview-tile-tickets')).toBeNull();
-    expect(screen.queryByTestId('org-overview-tile-invoices')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('org-overview-stat-devices')).toBeTruthy());
+    expect(screen.getByTestId('org-overview-stat-alerts')).toBeTruthy();
+    // The summary omitted tickets/invoices — a 0 stat there would be a lie.
+    expect(screen.queryByTestId('org-overview-stat-tickets')).toBeNull();
+    expect(screen.queryByTestId('org-overview-stat-invoices')).toBeNull();
+  });
+
+  it('links the Devices stat to the Devices tab, and following it opens that tab (#9020)', async () => {
+    const user = userEvent.setup();
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-overview-stat-devices')).toBeTruthy());
+    const stat = screen.getByTestId('org-overview-stat-devices');
+    expect(stat.tagName).toBe('A');
+    expect(stat).toHaveAttribute('href', '#devices');
+    await user.click(stat);
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Devices' })).toHaveAttribute('aria-selected', 'true'));
   });
 
   it('opens the Tickets tab named in the URL hash, pinned to the record org', async () => {
@@ -217,11 +245,90 @@ describe('OrganizationRecordPage — happy path', () => {
     expect(typeof props.orgFetch).toBe('function');
   });
 
+  it('opens the Trust Center tab named in the URL hash and hands it the record orgFetch', async () => {
+    window.location.hash = '#trust';
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-trust-tab')).toBeTruthy());
+    const props = trustTabProps.mock.calls.at(-1)?.[0] as { orgId: string; orgFetch: unknown };
+    expect(props.orgId).toBe(RECORD_ORG);
+    expect(typeof props.orgFetch).toBe('function');
+  });
+
   it('#contacts renders ContactsCard scoped to the record org', async () => {
     window.location.hash = '#contacts';
     render(<OrganizationRecordPage orgId={RECORD_ORG} />);
     await waitFor(() => expect(screen.getByTestId('org-contacts-card')).toBeTruthy());
     await waitFor(() => expect(requestedUrls.some((u) => u.includes(`/orgs/organizations/${RECORD_ORG}/contacts`))).toBe(true));
+  });
+
+  // #9954: the header's primary contact comes from the summary, read once on
+  // load. A contact written on the Contacts tab must reach it without a reload.
+  it('refreshes the header primary contact after a contact is added on the Contacts tab', async () => {
+    let contactAdded = false;
+    const NEW_PRIMARY = { id: 'c9', name: 'Olga Orglevel', email: 'olga@acme.test', phone: null };
+    const pathOf = (url: string) => new URL(url, 'http://localhost').pathname;
+    const isRecordRead = (url: string) => pathOf(url).endsWith(`/orgs/organizations/${RECORD_ORG}`);
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/summary')) {
+        return json({
+          ...SUMMARY_BODY,
+          contacts: { count: contactAdded ? 4 : 3, primary: contactAdded ? NEW_PRIMARY : SUMMARY_BODY.contacts.primary },
+        });
+      }
+      if (url.includes(`/orgs/organizations/${RECORD_ORG}/contacts`) && init?.method === 'POST') {
+        contactAdded = true;
+        return json({ id: 'c9' }, 201);
+      }
+      if (isRecordRead(url)) return json(ORG_BODY);
+      return json({ data: [] });
+    });
+    window.location.hash = '#contacts';
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-primary-contact').textContent).toContain('Dana Reed'));
+    await waitFor(() => expect(screen.getByTestId('org-contacts-add-button')).toBeTruthy());
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId('org-contacts-add-button'));
+    await user.type(screen.getByTestId('contact-form-name-input'), 'Olga Orglevel');
+    await user.click(screen.getByTestId('contact-form-submit'));
+
+    await waitFor(() => expect(screen.getByTestId('org-record-primary-contact').textContent).toContain('Olga Orglevel'));
+    // Only the summary is re-read: the record itself is not reloaded (no loading flash).
+    expect(requestedUrls.filter((u) => u.includes('/summary'))).toHaveLength(2);
+    expect(requestedUrls.filter(isRecordRead)).toHaveLength(1);
+  });
+
+  it('keeps the last good header, and says so in the console, when the refresh after a contact change fails', async () => {
+    let contactAdded = false;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    fetchSpy.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/summary')) return contactAdded ? json({ error: 'boom' }, 500) : json(SUMMARY_BODY);
+      if (url.includes(`/orgs/organizations/${RECORD_ORG}/contacts`) && init?.method === 'POST') {
+        contactAdded = true;
+        return json({ id: 'c9' }, 201);
+      }
+      if (new URL(url, 'http://localhost').pathname.endsWith(`/orgs/organizations/${RECORD_ORG}`)) return json(ORG_BODY);
+      return json({ data: [] });
+    });
+    window.location.hash = '#contacts';
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-primary-contact').textContent).toContain('Dana Reed'));
+    await waitFor(() => expect(screen.getByTestId('org-contacts-add-button')).toBeTruthy());
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId('org-contacts-add-button'));
+    await user.type(screen.getByTestId('contact-form-name-input'), 'Olga Orglevel');
+    await user.click(screen.getByTestId('contact-form-submit'));
+
+    await waitFor(() =>
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(`summary refresh after a contact change failed for org ${RECORD_ORG}`)),
+    );
+    expect(screen.getByTestId('org-record-primary-contact').textContent).toContain('Dana Reed');
+    errorSpy.mockRestore();
   });
 
   it('#sites renders OrgSitesTab, pinned to the record org via orgIdOverride', async () => {
@@ -251,12 +358,121 @@ describe('OrganizationRecordPage — happy path', () => {
     for (const url of requestedUrls) expect(url).not.toContain(OTHER_ORG);
   });
 
-  it('switches the context and lands on the dashboard from Work in this org', async () => {
+  it('renders the active tab content in the tabpanel its tab points at (#9021)', async () => {
+    window.location.hash = '#activity';
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    const content = await screen.findByTestId('org-activity-tab');
+    const panel = content.closest('[role="tabpanel"]');
+    expect(panel).not.toBeNull();
+    expect(panel!.id).toBe('tab-activity-panel');
+    expect(panel!.getAttribute('aria-labelledby')).toBe('tab-activity');
+    const tab = document.getElementById('tab-activity');
+    expect(tab?.getAttribute('aria-controls')).toBe('tab-activity-panel');
+  });
+
+  // #9019: the switch used to hand the tech the dashboard, losing the record.
+  it('switches the context and STAYS on this record (same tab) from Work in this org', async () => {
     const user = userEvent.setup();
+    window.history.replaceState(null, '', `/organizations/${RECORD_ORG}#sites`);
     render(<OrganizationRecordPage orgId={RECORD_ORG} />);
     await waitFor(() => expect(screen.getByTestId('org-record-work-here')).toBeTruthy());
     await user.click(screen.getByTestId('org-record-work-here'));
-    expect(applyOrgSwitchMock).toHaveBeenCalledWith(RECORD_ORG, expect.stringContaining('Acme Dental'), '/');
+    expect(applyOrgSwitchMock).toHaveBeenCalledWith(
+      RECORD_ORG,
+      'Switched to Acme Dental',
+      `/organizations/${RECORD_ORG}#sites`,
+    );
+    expect(applyOrgSwitchMock).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), '/');
+    expect(navigateToMock).not.toHaveBeenCalled();
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('shows "Working here" instead of the button once the switcher points at this org', async () => {
+    seedStore([{ id: RECORD_ORG, name: 'Acme Dental' }], RECORD_ORG);
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-working-here')).toBeTruthy());
+    expect(screen.queryByTestId('org-record-work-here')).toBeNull();
+  });
+
+  it('swaps the button for "Working here" in place when the switch lands (no remount needed)', async () => {
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-scope-chip')).toBeTruthy());
+    // What applyOrgSwitch's selectOrganization does to the store.
+    act(() => useOrgStore.setState({ currentOrgId: RECORD_ORG, allOrgs: false } as never));
+    await waitFor(() => expect(screen.getByTestId('org-record-working-here')).toBeTruthy());
+    expect(screen.queryByTestId('org-record-scope-chip')).toBeNull();
+    expect(screen.queryByTestId('org-record-work-here')).toBeNull();
+  });
+});
+
+describe('OrganizationRecordPage — billing address country (#9024)', () => {
+  it("drops the billing country from the header when it is the partner's own", async () => {
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      '/orgs/partners/me': () => json({ id: 'p1', billingAddressCountry: 'US' }),
+      [`/orgs/organizations/${RECORD_ORG}`]: () =>
+        json({ ...ORG_BODY, billingAddressCity: 'Springfield', billingAddressCountry: 'US' }),
+    });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(requestedUrls.some((u) => u.includes('/orgs/partners/me'))).toBe(true));
+    await waitFor(() => expect(screen.getByTestId('org-record-billing-address').textContent).not.toContain('US'));
+    expect(screen.getByTestId('org-record-billing-address').textContent).toContain('Springfield');
+  });
+
+  it('keeps the full address (and says why in the console) when the partner read fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      '/orgs/partners/me': () => json({ error: 'boom' }, 500),
+      [`/orgs/organizations/${RECORD_ORG}`]: () =>
+        json({ ...ORG_BODY, billingAddressCity: 'Springfield', billingAddressCountry: 'US' }),
+    });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() =>
+      expect(warn.mock.calls.some(([msg]) => String(msg).includes('partner country unavailable'))).toBe(true),
+    );
+    expect(screen.getByTestId('org-record-billing-address').textContent).toContain('Springfield · US');
+  });
+
+  it('never asks a system-scope session for /orgs/partners/me (the route is partner-only)', async () => {
+    seedAuth(`h.${btoa(JSON.stringify({ scope: 'system' }))}.s`);
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      [`/orgs/organizations/${RECORD_ORG}`]: () =>
+        json({ ...ORG_BODY, billingAddressCity: 'Springfield', billingAddressCountry: 'US' }),
+    });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-billing-address')).toBeTruthy());
+    expect(screen.getByTestId('org-record-billing-address').textContent).toContain('US');
+    expect(requestedUrls.some((u) => u.includes('/orgs/partners/me'))).toBe(false);
+  });
+
+  it('does not ask for the partner at all when the org has no billing country', async () => {
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      [`/orgs/organizations/${RECORD_ORG}`]: () => json({ ...ORG_BODY, billingAddressCity: 'Springfield' }),
+    });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-record-billing-address')).toBeTruthy());
+    expect(requestedUrls.some((u) => u.includes('/orgs/partners/me'))).toBe(false);
+  });
+});
+
+describe('OrganizationRecordPage — archive (#8371)', () => {
+  it('refreshes the global org store after archiving so the header switcher drops the org', async () => {
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      '/archive': () => json({ status: 'offboarding', purgeAt: null }, 202),
+      [`/orgs/organizations/${RECORD_ORG}`]: () => json(ORG_BODY),
+    });
+    const storeFetch = vi.spyOn(useOrgStore.getState(), 'fetchOrganizations').mockResolvedValue(undefined);
+    useOrgStore.setState({ fetchOrganizations: storeFetch });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await userEvent.click(await screen.findByTestId('org-record-more'));
+    await userEvent.click(await screen.findByTestId('org-record-archive'));
+    storeFetch.mockClear();
+    await userEvent.click(await screen.findByTestId('org-archive-submit'));
+    await waitFor(() => expect(storeFetch).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -401,7 +617,7 @@ describe('OrganizationRecordPage — lifecycle states', () => {
     render(<OrganizationRecordPage orgId={RECORD_ORG} />);
     await waitFor(() => expect(screen.getByTestId('org-overview-summary-error')).toBeTruthy());
     expect(screen.getByTestId('org-record-header')).toBeTruthy();
-    expect(screen.queryByTestId('org-overview-tile-devices')).toBeNull();
+    expect(screen.queryByTestId('org-overview-stat-devices')).toBeNull();
   });
 });
 
@@ -420,6 +636,19 @@ describe('OrganizationRecordPage — permission gating', () => {
     // assertion below vacuous as well as breaking the positive one.
     expect(screen.queryByRole('tab', { name: 'Devices' })).toBeNull();
     expect(screen.getByRole('tab', { name: 'Overview' })).toBeTruthy();
+  });
+
+  it('does not link an Overview stat to a tab this user cannot open (#9020)', async () => {
+    // The summary still carries devices here (route stub), so the stat renders —
+    // but a link to #devices would bounce straight back to Overview.
+    seedAuth(PARTNER_TOKEN, [{ resource: 'organizations', action: 'read' }] as Permission[]);
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      [`/orgs/organizations/${RECORD_ORG}`]: () => json(ORG_BODY),
+    });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-overview-stat-devices')).toBeTruthy());
+    expect(screen.getByTestId('org-overview-stat-devices').tagName).not.toBe('A');
   });
 
   it('falls back to Overview when the hash names a tab this user cannot see', async () => {

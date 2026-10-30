@@ -5,6 +5,7 @@ import { partners, tickets } from '../../db/schema';
 import { zValidator } from '../../lib/validation';
 import { officeAddinTechAuthMiddleware, requireAddinCapability } from '../../middleware/officeAddinTechAuth';
 import { checkBudgetDetailed } from '../../services/aiCostTracker';
+import { aiDenialBody } from '../../services/aiDenialCode';
 import {
   isAiBudgetLockTimeout,
   markAiBudgetReservationIndeterminate,
@@ -46,6 +47,7 @@ import {
   type TicketActor,
 } from '../../services/ticketService';
 import type { OfficeAddinTechAuth } from '../../middleware/officeAddinTechAuth';
+import type { TicketType } from '@breeze/shared';
 import { draftSchema, fromEmailSchema, linkEmailSchema } from './schemas';
 
 /**
@@ -153,6 +155,7 @@ const SUMMARY_COLUMNS = {
   subject: tickets.subject,
   status: tickets.status,
   priority: tickets.priority,
+  ticketType: tickets.ticketType,
   updatedAt: tickets.updatedAt,
   submitterEmail: tickets.submitterEmail,
   emailThreadKey: tickets.emailThreadKey,
@@ -165,6 +168,7 @@ interface TicketRowForSummary {
   subject: string;
   status: string;
   priority: string | null;
+  ticketType?: TicketType;
   updatedAt: Date;
   submitterEmail: string | null;
   emailThreadKey?: string | null;
@@ -425,7 +429,7 @@ officeAddinTicketRoutes.post(
     // check does not replace it.
     const budgetDenial = await checkBudgetDetailed(input.orgId, resolved.funding);
     if (budgetDenial) {
-      return c.json({ error: budgetDenial.message }, 402);
+      return c.json(aiDenialBody(budgetDenial), 402);
     }
 
     const policy = await getOrgPolicy(input.orgId);
@@ -701,6 +705,11 @@ officeAddinTicketRoutes.post(
             submitterName: input.from.name ?? undefined,
             submittedBy,
             requesterContactId,
+            // #7900: omitted -> the service default (incident), unstamped.
+            ...(input.ticketType !== undefined ? { ticketType: input.ticketType } : {}),
+            // #8883 W5 (Gate B14): a follow-up continues a closed ticket, so
+            // routing is skipped (explicit provenance, never inferred).
+            ...(input.followUpOf ? { continuationOfTicketId: input.followUpOf.ticketId } : {}),
           },
           actor
         );

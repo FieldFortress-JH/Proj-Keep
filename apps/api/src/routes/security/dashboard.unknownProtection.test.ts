@@ -91,4 +91,45 @@ describe('GET /dashboard — unknown AV / firewall state', () => {
     // neither protected nor in the reported-off device's risk bucket.
     expect(data.protectedDevices).toBe(1);
   });
+
+  // #9643 — "BitLocker enabled" counts fully encrypted machines only; partial
+  // is reported separately instead of inflating the enabled number.
+  it('counts only fully encrypted devices as enabled and reports partial separately', async () => {
+    listStatusRowsMock.mockResolvedValue([
+      statusRow({ deviceId: 'w1', os: 'windows', encryptionStatus: 'encrypted' }),
+      statusRow({ deviceId: 'w2', os: 'windows', encryptionStatus: 'partial' }),
+      statusRow({ deviceId: 'w3', os: 'windows', encryptionStatus: 'unencrypted' }),
+      statusRow({ deviceId: 'm1', os: 'macos', encryptionStatus: 'encrypted' }),
+      statusRow({ deviceId: 'm2', os: 'macos', encryptionStatus: 'partial' }),
+    ]);
+
+    const res = await buildApp().request('/security/dashboard');
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+
+    expect(data.encryption).toEqual({
+      bitlockerEnabled: 1,
+      bitlockerPartial: 1,
+      filevaultEnabled: 1,
+      filevaultPartial: 1,
+      total: 5,
+    });
+  });
+
+  // #8538 — a failed collection is stored as provider 'unknown' and must get its
+  // own "Unknown" bucket in the provider breakdown, not be folded into "Other".
+  it('reports unknown-provider devices in an Unknown bucket, separate from Other', async () => {
+    listStatusRowsMock.mockResolvedValue([
+      statusRow({ deviceId: 'a', provider: 'other' }),
+      statusRow({ deviceId: 'b', provider: 'unknown', realTimeProtection: null, firewallEnabled: null }),
+      statusRow({ deviceId: 'c', provider: 'unknown', realTimeProtection: null, firewallEnabled: null }),
+    ]);
+
+    const res = await buildApp().request('/security/dashboard');
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    const byId = Object.fromEntries(data.providers.map((p: any) => [p.providerId, p]));
+    expect(byId.unknown).toMatchObject({ providerName: 'Unknown', deviceCount: 2 });
+    expect(byId.other).toMatchObject({ providerName: 'Other', deviceCount: 1 });
+  });
 });

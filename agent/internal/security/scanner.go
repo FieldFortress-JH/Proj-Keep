@@ -12,6 +12,7 @@ import (
 
 	"github.com/breeze-rmm/agent/internal/config"
 	"github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/internal/yarascan"
 )
 
 var log = logging.L("security")
@@ -29,6 +30,13 @@ type SecurityScanner struct {
 	Exclusions     []string
 	Timeout        time.Duration
 	AutoQuarantine bool
+
+	// #6263 W02 — the YARA engine for this scan, built by the handler from
+	// the payload's ruleSets. nil ⇒ the legacy signature table (W01).
+	Matcher yarascan.Matcher
+	// RuleCacheDir overrides the compiled-rules cache location (tests);
+	// empty ⇒ <data dir>/yara/cache.
+	RuleCacheDir string
 }
 
 // ScanResult captures the output of a security scan.
@@ -47,6 +55,19 @@ type ScanOutcome struct {
 	FilesScanned int
 	TimedOut     bool
 	Partial      bool
+
+	// #6263 W02. Engine is the matcher that actually ran ("yara" or
+	// "legacy"). EngineError marks a degraded run the caller must report,
+	// never as a clean YARA scan: either the YARA matcher could not start or
+	// lost every worker (Engine is then "legacy" — the scan fell back to the
+	// built-in signatures), or it failed on at least as many files as it
+	// scanned (Engine stays "yara").
+	Engine      string
+	EngineError string
+	// FilesFailed counts files the YARA walk could not read (locked,
+	// vanished, engine timeout). Always 0 for the legacy engine, whose
+	// per-file errors keep W01 semantics (they fail the scan).
+	FilesFailed int
 }
 
 // QuickScan performs a fast scan of common threat locations.
@@ -111,37 +132,45 @@ func (s *SecurityScanner) ScanWithContext(ctx context.Context, scanType string, 
 	// quarantine stay excluded whatever the policy says.
 	options.ExcludePaths = append(options.ExcludePaths, s.Exclusions...)
 
-	scanCtx := ctx
-	cancel := func() {}
-	if s.Timeout > 0 {
-		scanCtx, cancel = context.WithTimeout(ctx, s.Timeout)
-	}
+	scanCtx, cancel := s.scanContext(ctx)
 	defer cancel()
 
 	started := time.Now()
-	threats, filesScanned, scanErr := detectThreatsCtx(scanCtx, targets, options)
+	engine := yarascan.EngineLegacy
+	engineErr := ""
+	var res walkResult
+	var scanErr error
+	if s.Matcher != nil {
+		engine = s.Matcher.Engine()
+		res, scanErr = walkAndMatch(scanCtx, targets, options, s.Matcher, yaraWalkConfig())
+		switch {
+		case errors.Is(scanErr, ErrNoScanWorkers):
+			// Fallback = the legacy signatures, recorded as a degraded run.
+			// YARA hits found before the engine was lost are kept.
+			log.Warn("IOC scan engine unavailable; scanning with built-in signatures", "error", scanErr.Error())
+			engine, engineErr = yarascan.EngineLegacy, scanErr.Error()
+			partial := res.Threats
+			var legacyThreats []Threat
+			legacyThreats, res.FilesScanned, scanErr = detectThreatsCtx(scanCtx, targets, options)
+			res.Threats = append(partial, legacyThreats...)
+			res.FilesFailed = 0
+		case scanErr == nil && res.FilesFailed > 0 && res.FilesFailed >= res.FilesScanned:
+			// The engine ran but failed on at least as many files as it
+			// scanned: never let that read as a clean YARA scan.
+			engineErr = fmt.Sprintf("the YARA engine failed on %d of %d files", res.FilesFailed, res.FilesFailed+res.FilesScanned)
+			log.Warn("IOC scan degraded", "filesFailed", res.FilesFailed, "filesScanned", res.FilesScanned)
+		}
+	} else {
+		res.Threats, res.FilesScanned, scanErr = detectThreatsCtx(scanCtx, targets, options)
+	}
+	threats, filesScanned := res.Threats, res.FilesScanned
 	timedOut := errors.Is(scanErr, context.DeadlineExceeded) || errors.Is(scanErr, context.Canceled)
 	if timedOut {
 		scanErr = nil // a deadline is an outcome, reported through TimedOut
 	}
 
 	if s.AutoQuarantine && len(threats) > 0 {
-		dir := s.quarantineDir()
-		for i := range threats {
-			dest, qErr := QuarantineThreat(threats[i], dir)
-			if qErr != nil {
-				// A file we could not quarantine is still a real detection: report
-				// it undecorated rather than dropping it or failing the scan. But
-				// silently doing so would make "quarantined", "auto-quarantine
-				// off" and "attempted and failed" all report QuarantinedTo == ""
-				// and be indistinguishable server-side, so log it and flag the
-				// threat so the server can tell the three apart.
-				log.Warn("auto-quarantine failed", "path", threats[i].Path, "name", threats[i].Name, "error", qErr.Error())
-				threats[i].QuarantineFailed = true
-				continue
-			}
-			threats[i].QuarantinedTo = dest
-		}
+		s.autoQuarantine(threats)
 	}
 
 	status, statusErr := CollectStatus(s.Config)
@@ -165,7 +194,70 @@ func (s *SecurityScanner) ScanWithContext(ctx context.Context, scanType string, 
 		FilesScanned: filesScanned,
 		TimedOut:     timedOut,
 		Partial:      timedOut,
+		Engine:       engine,
+		EngineError:  engineErr,
+		FilesFailed:  res.FilesFailed,
 	}, scanErr
+}
+
+// autoQuarantine applies the policy's auto-quarantine to threats in place:
+//   - spec D7: a YARA hit (RuleSetID set) is quarantined only when its own
+//     rule set opted in as well; legacy hits follow the policy flag alone (W01);
+//   - each FILE is quarantined once even when several rules matched it, and
+//     every threat on that file reports the same outcome (a per-threat loop
+//     would report the second threat as failed because the file is gone);
+//   - the file's identity is re-verified against the scan-time sha256 first:
+//     a file that changed since it was scanned is not moved.
+//
+// A file that could not be quarantined is still a real detection: it is
+// reported with QuarantineFailed so the server can tell "quarantined", "not
+// attempted" and "attempted and failed" apart.
+func (s *SecurityScanner) autoQuarantine(threats []Threat) {
+	dir := s.quarantineDir()
+	done := map[string]string{} // path -> quarantinedTo ("" = attempted and failed)
+	for i := range threats {
+		th := &threats[i]
+		if th.RuleSetID != "" && !th.autoQuarantine {
+			continue
+		}
+		if dest, seen := done[th.Path]; seen {
+			th.QuarantinedTo, th.QuarantineFailed = dest, dest == ""
+			continue
+		}
+		if th.hashFailed {
+			log.Warn("skipping auto-quarantine: the file could not be hashed when it matched", "path", th.Path, "name", th.Name)
+			done[th.Path], th.QuarantineFailed = "", true
+			continue
+		}
+		if th.SHA256 != "" {
+			cur, err := fileSHA256(th.Path)
+			if err != nil {
+				log.Warn("skipping auto-quarantine: file unreadable at quarantine time", "path", th.Path, "name", th.Name, "error", err.Error())
+				done[th.Path], th.QuarantineFailed = "", true
+				continue
+			}
+			if cur != th.SHA256 {
+				log.Warn("skipping auto-quarantine: file changed since it was scanned", "path", th.Path, "name", th.Name)
+				done[th.Path], th.QuarantineFailed = "", true
+				continue
+			}
+		}
+		dest, qErr := QuarantineThreat(*th, dir)
+		if qErr != nil {
+			log.Warn("auto-quarantine failed", "path", th.Path, "name", th.Name, "error", qErr.Error())
+			done[th.Path], th.QuarantineFailed = "", true
+			continue
+		}
+		done[th.Path], th.QuarantinedTo = dest, dest
+	}
+}
+
+// RuleCacheDirOrDefault is where compiled YARA rules are cached.
+func (s *SecurityScanner) RuleCacheDirOrDefault() string {
+	if s.RuleCacheDir != "" {
+		return s.RuleCacheDir
+	}
+	return filepath.Join(config.GetDataDir(), "yara", "cache")
 }
 
 func (s *SecurityScanner) quarantineDir() string {
@@ -283,4 +375,26 @@ func filterExistingPaths(paths []string) []string {
 		}
 	}
 	return filtered
+}
+
+// MaxScanTimeout is the longest a scan may run: the policy ceiling
+// (SECURITY_SCAN_TIMEOUT_MINUTES_RANGE in packages/shared). #10057 — the server
+// releases a device's scan slot once a delivered scan has been silent past this
+// ceiling, so a scan with no deadline could overlap the next one.
+const MaxScanTimeout = 720 * time.Minute
+
+// effectiveTimeout is the scan's deadline: the delivered budget, or
+// MaxScanTimeout when there is none (zero or negative) or it exceeds the
+// ceiling. A scan is never unbounded.
+// scanContext is the context the scan walks under: ctx bounded by
+// effectiveTimeout. Split out so a test can assert the deadline exists.
+func (s *SecurityScanner) scanContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, s.effectiveTimeout())
+}
+
+func (s *SecurityScanner) effectiveTimeout() time.Duration {
+	if s.Timeout <= 0 || s.Timeout > MaxScanTimeout {
+		return MaxScanTimeout
+	}
+	return s.Timeout
 }

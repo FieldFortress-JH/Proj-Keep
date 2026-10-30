@@ -26,7 +26,7 @@ import {
 } from '../db/schema';
 import { recoveryTokens } from '../db/schema/recoveryTokens';
 import { backupSnapshotAttestations } from '../db/schema/backupSnapshotAttestations';
-import { eq, ne, and, or, desc, gt, sql, isNull, lt, inArray } from 'drizzle-orm';
+import { eq, ne, and, or, desc, gt, gte, sql, isNull, lt, inArray } from 'drizzle-orm';
 import { resolveAllBackupAssignedDevices } from '../services/featureConfigResolver';
 import { getBullMQConnection } from '../services/redis';
 import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
@@ -49,6 +49,8 @@ import { recordDispatchedExpectation } from '../services/agentWorkExpectation';
 import { attachWorkerObservability } from './workerObservability';
 import { recordBackupWriteDispatch } from '../services/backupMetrics';
 import { backupWriteRefusalMessage, brokerWorkerBackupPayload } from '../services/backupStorageWriteDelivery';
+import { resolveMintKeyRoot } from '../services/backupStorageWriteSessions';
+import { LEGACY_FLAT_ROOT, sameKeyRoot, snapshotKeyRootOf, type SnapshotKeyRoot } from '../services/backupKeyLayout';
 import { BACKUP_HELPER_UNREPORTED_MESSAGE, backupHelperProtocolsUnreported } from '../services/backupHelperProtocols';
 import { backupWriteHelperRefusal } from '../services/backupWriteHelperGate';
 import { captureException } from '../services/sentry';
@@ -998,7 +1000,15 @@ export type FullBackupFallbackReason =
   | 'base_retired_race'
   // The helper verifies its base and no candidate carries a verified
   // snapshot attestation.
-  | 'no_verified_base';
+  | 'no_verified_base'
+  // #7081 (I4): no candidate is recorded under the key root this run writes
+  // (the destination prefix changed); chains never span roots.
+  | 'key_root_changed'
+  // #7081: the newest snapshot records a key root this server cannot read.
+  | 'base_key_root_unreadable'
+  // #7081: the destination's key prefix is invalid, so this run has no key
+  // root to match a base against (mint refuses the write itself).
+  | 'invalid_destination_prefix';
 
 /**
  * The newest snapshot for this device+config ignoring EVERY eligibility
@@ -1007,6 +1017,9 @@ export type FullBackupFallbackReason =
 export interface BaseCandidateProbe {
   expiresAt: Date | null;
   storageIdentity: string | null;
+  /** The snapshot's recorded key root (#7081), verbatim. */
+  keyLayout: string | null;
+  keyPrefix: string | null;
   backupType: string | null;
   jobStatus: string | null;
   retired: boolean;
@@ -1029,10 +1042,13 @@ const INCREMENTAL_BASE_JOB_STATUSES = ['completed', 'completed_with_errors'] as 
 
 export function classifyMissingBaseReason(
   probe: BaseCandidateProbe | null,
-  ctx: { storageIdentity: string; mode: 'file' | 'system_image'; now: Date },
+  ctx: { storageIdentity: string; mode: 'file' | 'system_image'; now: Date; keyRoot: SnapshotKeyRoot },
 ): FullBackupFallbackReason {
   if (!probe) return 'no_prior_snapshot';
   if (probe.storageIdentity !== ctx.storageIdentity) return 'storage_identity_changed';
+  const probeRoot = snapshotKeyRootOf({ keyLayout: probe.keyLayout, keyPrefix: probe.keyPrefix });
+  if (!probeRoot) return 'base_key_root_unreadable';
+  if (!sameKeyRoot(probeRoot, ctx.keyRoot)) return 'key_root_changed';
   const typeMatches =
     ctx.mode === 'system_image'
       ? probe.backupType === 'system_image'
@@ -1070,6 +1086,8 @@ async function readBaseCandidateProbe(
     .select({
       expiresAt: backupSnapshots.expiresAt,
       storageIdentity: backupSnapshots.storageIdentity,
+      keyLayout: backupSnapshots.keyLayout,
+      keyPrefix: backupSnapshots.keyPrefix,
       backupType: backupSnapshots.backupType,
       jobStatus: backupJobs.status,
       retirementId: backupSnapshotRetirements.id,
@@ -1091,6 +1109,8 @@ async function readBaseCandidateProbe(
   return {
     expiresAt: row.expiresAt ?? null,
     storageIdentity: row.storageIdentity ?? null,
+    keyLayout: row.keyLayout ?? null,
+    keyPrefix: row.keyPrefix ?? null,
     backupType: row.backupType ?? null,
     jobStatus: row.jobStatus ?? null,
     retired: row.retirementId != null,
@@ -1159,6 +1179,10 @@ async function stampDispatchPinAndIdentity(params: {
   const leaseMs = resolveBackupBaseLeaseMs();
   const dispatchedAt = new Date();
   const publishLeaseExpiresAt = new Date(dispatchedAt.getTime() + leaseMs);
+  // #7081 (I4): the key root this run's new snapshot id will be reserved
+  // under. A dedupe base must be recorded under the same root, so a chain
+  // never spans roots; after a prefix change the first run is a full backup.
+  const mintRoot = resolveMintKeyRoot(params.provider, params.providerConfig);
 
   // #6351 review fix: the fallback-reason diagnosis runs AFTER the
   // transaction commits, never inside it. A failure in a purely explanatory
@@ -1183,7 +1207,10 @@ async function stampDispatchPinAndIdentity(params: {
     // to check the downloaded bytes against. No such candidate means a full
     // run. Older helpers keep the unrestricted selection.
     const [deviceRow] = await tx
-      .select({ integrityVersion: devices.backupIntegrityProtocolVersion })
+      .select({
+        integrityVersion: devices.backupIntegrityProtocolVersion,
+        incarnationStartedAt: devices.incarnationStartedAt,
+      })
       .from(devices)
       .where(eq(devices.id, params.deviceId))
       .limit(1);
@@ -1193,6 +1220,17 @@ async function stampDispatchPinAndIdentity(params: {
     const requireAttestedBase = deviceRow !== undefined
       && (deviceRow.integrityVersion === null || deviceRow.integrityVersion >= 1);
     const baseStatusIsLocal = storageIdentity.startsWith('local::');
+
+    if (!mintRoot.ok) {
+      // No root to match: no base. Mint refuses the write itself.
+      await tx
+        .update(backupJobs)
+        .set({ storageIdentity, publishLeaseExpiresAt, baseSnapshotId: null })
+        .where(eq(backupJobs.id, params.jobId));
+      pendingFallback = 'invalid_destination_prefix';
+      return { baseSnapshotId: '', publishLeaseExpiresAt, baseAttestation: null };
+    }
+    const runRoot = mintRoot.root;
 
     const eligible = and(
       eq(backupSnapshots.deviceId, params.deviceId),
@@ -1204,6 +1242,9 @@ async function stampDispatchPinAndIdentity(params: {
       // (scoped by storageIdentity) can never see, so retention would
       // retire and delete it out from under an in-flight run.
       eq(backupSnapshots.storageIdentity, storageIdentity),
+      // #7081 (I4): recorded under this run's key root.
+      eq(backupSnapshots.keyLayout, runRoot.layout),
+      runRoot.prefix === null ? isNull(backupSnapshots.keyPrefix) : eq(backupSnapshots.keyPrefix, runRoot.prefix),
       mode === 'system_image'
         ? eq(backupSnapshots.backupType, 'system_image')
         : or(eq(backupSnapshots.backupType, 'file'), isNull(backupSnapshots.backupType)),
@@ -1226,6 +1267,13 @@ async function stampDispatchPinAndIdentity(params: {
       or(isNull(backupSnapshots.expiresAt), gt(backupSnapshots.expiresAt, dispatchedAt)),
       inArray(backupJobs.status, INCREMENTAL_BASE_JOB_STATUSES),
       isNull(backupSnapshotRetirements.id),
+      // #8318 §5.4: a snapshot taken before the device's current install
+      // incarnation began was produced by an earlier install, so the chain
+      // stops there and the first backup of the new install is a full one.
+      // NULL (never reattached) adds no filter.
+      deviceRow?.incarnationStartedAt
+        ? gte(backupSnapshots.timestamp, deviceRow.incarnationStartedAt)
+        : undefined,
     );
     const retirementJoin = and(
       eq(backupSnapshotRetirements.storageIdentity, storageIdentity),
@@ -1349,7 +1397,12 @@ async function stampDispatchPinAndIdentity(params: {
       try {
         const probe = await readBaseCandidateProbe(params.deviceId, params.configId);
         logFullBackupFallback(
-          classifyMissingBaseReason(probe, { storageIdentity, mode, now: dispatchedAt }),
+          classifyMissingBaseReason(probe, {
+            storageIdentity,
+            mode,
+            now: dispatchedAt,
+            keyRoot: mintRoot.ok ? mintRoot.root : LEGACY_FLAT_ROOT,
+          }),
           logParams,
         );
       } catch (err) {

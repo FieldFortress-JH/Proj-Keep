@@ -156,7 +156,7 @@ require_grep 'minisign -V' .github/workflows/release.yml \
   "release workflow must verify the release artifact manifest signature before publishing"
 
 # Signing material (release-manifest private keys, Tauri updater key, Apple,
-# Azure Trusted Signing, SSL.com) is stored only in the signing-production /
+# SSL.com) is stored only in the signing-production /
 # signing-prerelease environments, whose deployment policy admits v* tags
 # alone. The per-job rule for every workflow lives in
 # .github/scripts/check-workflow-security.mjs
@@ -231,13 +231,13 @@ done
 # comment gives Dependabot no tag to resolve against, so it tracks the default
 # branch and each weekly group PR carries the next branch head forward. Four of
 # the six call sites are release.yml jobs that build signed customer binaries,
-# so the restored cache feeds compiled output. Pin every site to the 2.9.2
+# so the restored cache feeds compiled output. Pin every site to the 2.9.3
 # release commit and require the precise `# vX.Y.Z` comment, so a re-drift fails
 # here rather than inside a signed release build.
-RUST_CACHE_PIN='Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2'
+RUST_CACHE_PIN='Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3'
 for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
   require_grep "uses: ${RUST_CACHE_PIN//./\\.}\$" "$workflow" \
-    "$workflow must pin Swatinem/rust-cache to the v2.9.2 release commit"
+    "$workflow must pin Swatinem/rust-cache to the v2.9.3 release commit"
 done
 # require_grep only proves one good line exists; this proves no site deviates.
 # Capture the scan's own status rather than letting a trailing `|| true` absorb
@@ -601,8 +601,8 @@ require_grep '(directory: |^ +- )"/apps/web"$' .github/dependabot.yml \
   "Dependabot must cover Web Dockerfiles before digest pinning can be maintained"
 require_grep '(directory: |^ +- )"/docker"$' .github/dependabot.yml \
   "Dependabot must cover release/security Dockerfiles before digest pinning can be maintained"
-require_grep 'language: \[javascript-typescript, go\]' .github/workflows/codeql.yml \
-  "CodeQL must analyze both TypeScript and Go"
+require_grep 'language: \[javascript-typescript, go, actions\]' .github/workflows/codeql.yml \
+  "CodeQL must analyze TypeScript, Go and the Actions workflows"
 
 require_grep "severity: 'HIGH,CRITICAL'" .github/workflows/security.yml \
   "Trivy must fail on HIGH and CRITICAL vulnerabilities"

@@ -2,12 +2,40 @@ import { describe, expect, it, vi } from 'vitest';
 import { SYSTEM_CLEANUP_ACTION_IDS, systemCleanupRunBudgetMs } from '@breeze/shared/validators';
 import {
   BACKUP_JOB_ABSOLUTE_TIMEOUT_MS,
+  CALLER_VERIFY_TIMEOUT_MS,
   getCommandTimeoutMs,
+  RESTORE_POINT_CHECKPOINT_BUDGET_MS,
+  SCRIPT_GRACE_BUFFER_MS,
+  SECURITY_SCAN_COMMAND_GRACE_MS,
   SYSTEM_CLEANUP_RUN_MAX_TIMEOUT_MS,
 } from './commandTimeouts';
 import { CommandTypes } from './commandQueue';
+import { WORKSTATION_TIMEOUT_MAX_MS } from './callerVerification/workstationProtocol';
 
 describe('command timeouts', () => {
+  it('gives pam_request_notify an explicit 2-minute timeout without the unknown-type warning (#8928)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(getCommandTimeoutMs(CommandTypes.PAM_REQUEST_NOTIFY)).toBe(2 * 60 * 1000);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('times caller_verify out just past the longest prompt the helper can show (#6354 W02)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const timeout = getCommandTimeoutMs(CommandTypes.CALLER_VERIFY);
+      expect(timeout).toBe(CALLER_VERIFY_TIMEOUT_MS);
+      expect(timeout).toBeGreaterThan(WORKSTATION_TIMEOUT_MAX_MS);
+      expect(timeout).toBeLessThanOrEqual(WORKSTATION_TIMEOUT_MAX_MS + 60_000);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('gives backup_run the backup job ceiling instead of the unknown-type default (#7105)', () => {
     // backup_run used to fall through to the 30-minute default with an
     // "Unknown command type" warning. A file backup is governed by the
@@ -61,5 +89,105 @@ describe('command timeouts', () => {
     // 30 minutes: the agent caps its own estimation phase at 3, so this is a
     // pure backstop rather than a working budget.
     expect(getCommandTimeoutMs('system_cleanup_list')).toBe(30 * 60 * 1000);
+  });
+
+  describe('script deadline with a stamped restore-point block (#9162)', () => {
+    const block = (enabled: boolean) => ({
+      v: 1,
+      requestId: '00000000-0000-4000-8000-000000000001',
+      enabled,
+      label: 'Breeze: script',
+      resolvedAt: '2026-10-18T00:00:00.000Z',
+      policyRevision: '',
+      validUntil: '2026-10-19T00:00:00.000Z',
+    });
+
+    it('mirrors the agent checkpoint budget (systemrestore.CommandBudget = 5m)', () => {
+      expect(RESTORE_POINT_CHECKPOINT_BUDGET_MS).toBe(5 * 60 * 1000);
+    });
+
+    it('adds the checkpoint budget when the block is enabled', () => {
+      expect(
+        getCommandTimeoutMs(CommandTypes.SCRIPT, { timeoutSeconds: 60, restorePoint: block(true) }),
+      ).toBe(60_000 + SCRIPT_GRACE_BUFFER_MS + RESTORE_POINT_CHECKPOINT_BUDGET_MS);
+    });
+
+    it('adds it on top of the default script timeout too', () => {
+      expect(getCommandTimeoutMs(CommandTypes.SCRIPT, { restorePoint: block(true) })).toBe(
+        300_000 + SCRIPT_GRACE_BUFFER_MS + RESTORE_POINT_CHECKPOINT_BUDGET_MS,
+      );
+    });
+
+    it('leaves the deadline unchanged with no block, a disabled block, or a malformed one', () => {
+      const base = 60_000 + SCRIPT_GRACE_BUFFER_MS;
+      expect(getCommandTimeoutMs(CommandTypes.SCRIPT, { timeoutSeconds: 60 })).toBe(base);
+      expect(
+        getCommandTimeoutMs(CommandTypes.SCRIPT, { timeoutSeconds: 60, restorePoint: block(false) }),
+      ).toBe(base);
+      for (const restorePoint of [null, 'yes', true, { enabled: 'true' }, []]) {
+        expect(getCommandTimeoutMs(CommandTypes.SCRIPT, { timeoutSeconds: 60, restorePoint })).toBe(base);
+      }
+    });
+
+    it('does not extend non-script command types', () => {
+      expect(
+        getCommandTimeoutMs(CommandTypes.SOFTWARE_INSTALL, { restorePoint: block(true) }),
+      ).toBe(getCommandTimeoutMs(CommandTypes.SOFTWARE_INSTALL));
+      expect(
+        getCommandTimeoutMs(CommandTypes.INSTALL_PATCHES, { restorePoint: block(true) }),
+      ).toBe(getCommandTimeoutMs(CommandTypes.INSTALL_PATCHES));
+    });
+  });
+
+  // #10057: the server timeout used to be a flat 30 minutes, while a policy
+  // can give the agent up to 720 (SECURITY_SCAN_TIMEOUT_MINUTES_RANGE) and a
+  // scan with no policy has no agent deadline at all. The reaper then failed
+  // the command while the agent was still scanning.
+  describe('security_scan (#10057)', () => {
+    const MIN = 60_000;
+
+    it('derives the deadline from the scan budget the payload carries', () => {
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes: 120 })).toBe(
+        120 * MIN + SECURITY_SCAN_COMMAND_GRACE_MS,
+      );
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes: 720 })).toBe(
+        720 * MIN + SECURITY_SCAN_COMMAND_GRACE_MS,
+      );
+      // Never shorter than the agent's own deadline, at any budget.
+      for (const minutes of [5, 30, 31, 240, 719, 720]) {
+        expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes: minutes })).toBeGreaterThan(
+          minutes * MIN,
+        );
+      }
+    });
+
+    it('covers the rule-set load the agent does before its scan clock starts', () => {
+      // agent/internal/heartbeat/handlers_security.go ruleSetLoadTimeout = 5 min.
+      expect(SECURITY_SCAN_COMMAND_GRACE_MS).toBeGreaterThan(5 * MIN);
+    });
+
+    it('uses the 720-minute ceiling when no budget was sent (the agent then has no deadline)', () => {
+      const ceiling = 720 * MIN + SECURITY_SCAN_COMMAND_GRACE_MS;
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN)).toBe(ceiling);
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, null)).toBe(ceiling);
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { scanRecordId: 'x' })).toBe(ceiling);
+      for (const timeoutMinutes of [0, -5, '120', null, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes })).toBe(ceiling);
+      }
+    });
+
+    it('clamps an out-of-range budget into the policy range', () => {
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes: 5000 })).toBe(
+        720 * MIN + SECURITY_SCAN_COMMAND_GRACE_MS,
+      );
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_SCAN, { timeoutMinutes: 1 })).toBe(
+        5 * MIN + SECURITY_SCAN_COMMAND_GRACE_MS,
+      );
+    });
+
+    it('leaves the other security command types on their fixed tiers', () => {
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_THREAT_QUARANTINE, { timeoutMinutes: 720 })).toBe(30 * MIN);
+      expect(getCommandTimeoutMs(CommandTypes.SECURITY_COLLECT_STATUS, { timeoutMinutes: 720 })).toBe(5 * MIN);
+    });
   });
 });

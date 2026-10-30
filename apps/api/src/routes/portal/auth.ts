@@ -5,7 +5,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
-import { organizations, portalBranding, portalUsers } from '../../db/schema';
+import { organizations, partners, portalBranding, portalUsers } from '../../db/schema';
 import { hashPassword, isPasswordStrong, verifyPassword } from '../../services/password';
 import { getEmailService } from '../../services/email';
 import { getRedis } from '../../services/redis';
@@ -50,6 +50,7 @@ import {
   purgePortalSessionsForUsers,
 } from './helpers';
 import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbContextRoutes';
+import { portalOrgDbAccessContext } from './portalDbContext';
 import { purgeClientAiSessionsForUsers } from '../../services/clientAiSessionStore';
 import { portalSessionRevokedSql, revokePortalSessionDurably } from '../../services/portal/sessionRevocation';
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
@@ -420,20 +421,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // system-scoped sub-query must do runOutsideDbContext(() =>
   // withSystemDbAccessContext(...)) explicitly. Likewise, any un-awaited db.*
   // side effect must not capture this txn (mirror auditService's pattern).
-  return withDbAccessContext(
-    {
-      scope: 'organization',
-      orgId: user.orgId,
-      accessibleOrgIds: [user.orgId],
-      accessiblePartnerIds: [],
-      userId: null,
-      // Generic portal routes intentionally do not receive the partner-wide
-      // SELECT branch. Self-managed routes that explicitly need it (for
-      // example Network Visibility) opt in with the validated owning partner.
-      currentPartnerId: null,
-    },
-    () => next()
-  );
+  return withDbAccessContext(portalOrgDbAccessContext(user.orgId), () => next());
 }
 
 // ============================================
@@ -622,9 +610,11 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
         // no auth context and asserts the envelope that reaches the transport:
         // __tests__/integration/portalPasswordResetPartnerLane.integration.test.ts.
         partnerId: organizations.partnerId,
+        partnerName: partners.name,
       })
       .from(portalUsers)
       .innerJoin(organizations, eq(organizations.id, portalUsers.orgId))
+      .leftJoin(partners, eq(partners.id, organizations.partnerId))
       .where(
         orgId
           ? and(eq(portalUsers.orgId, orgId), eq(portalUsers.email, normalizedEmail), eq(portalUsers.authMethod, 'password'))
@@ -662,7 +652,8 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
           to: user.email,
           resetUrl,
           purpose: 'portal.password_reset',
-          partnerId: user.partnerId ?? null
+          partnerId: user.partnerId ?? null,
+          partnerName: user.partnerName ?? null,
         });
       } catch (error) {
         console.error('[portal] Failed to send password reset email:', error);

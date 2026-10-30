@@ -47,6 +47,7 @@ export const ERROR_IDS = {
   OAUTH_RESOURCE_ALIAS_NORMALIZED: 'OAUTH_RESOURCE_ALIAS_NORMALIZED',
   OAUTH_GRANT_TENANCY_MISSING: 'OAUTH_GRANT_TENANCY_MISSING',
   OAUTH_CLIENT_LAST_USED_STAMP_FAILED: 'OAUTH_CLIENT_LAST_USED_STAMP_FAILED',
+  OAUTH_CIMD_REFUSED: 'OAUTH_CIMD_REFUSED',
 } as const;
 
 export type OAuthErrorId = typeof ERROR_IDS[keyof typeof ERROR_IDS];
@@ -62,7 +63,9 @@ export function logOauthError(args: {
   // eslint-disable-next-line no-console
   console.error(`[oauth] ${errorId} ${message}`, {
     ...(context ?? {}),
-    error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+    ...(err !== undefined
+      ? { error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err }
+      : {}),
   });
   if (isSentryEnabled()) {
     const captured = err instanceof Error ? err : new Error(message);
@@ -107,7 +110,9 @@ export function logOauthWarn(args: {
   // eslint-disable-next-line no-console
   console.warn(`[oauth] ${errorId} ${message}`, {
     ...(context ?? {}),
-    error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+    ...(err !== undefined
+      ? { error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err }
+      : {}),
   });
   if (isSentryEnabled()) {
     const captured = err instanceof Error ? err : new Error(message);

@@ -79,6 +79,8 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'PUT /api/v1/agents/:id/connections': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
   // routes/agents/elevationRequests.ts
   'POST /api/v1/agents/:id/elevation-requests': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
+  // routes/agents/messageEvents.ts
+  'POST /api/v1/agents/:id/message-events': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
   // routes/agents/enrollment.ts
   'POST /api/v1/agents/enroll': 'device credential: Agent enrollment; one-time enrollment secret checked in handler, IP rate limited',
   // routes/agents/eventlogs.ts
@@ -100,10 +102,17 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/agents/renew-cert/challenge': 'device credential: agentBearerAuthMiddleware: agent bearer token + mTLS device identity',
   'POST /api/v1/agents/renew-cert': 'device credential: agentBearerAuthMiddleware: agent bearer token + mTLS device identity',
   'POST /api/v1/agents/renew-cert/confirm': 'device credential: agentBearerAuthMiddleware: agent bearer token + mTLS device identity',
+  // routes/agents/rebind.ts (#8318 wave 1b — reinstall reattach)
+  'POST /api/v1/agents/:id/rebind': 'device credential: agentAuthMiddleware (the SOURCE agent bearer token, main role), acts only on an intent naming this device and install as its source',
+  'POST /api/v1/agents/:id/rebind-confirm': 'confirm-only credential: the brz_rbc_ bearer compared in constant time with the intent\'s (or ledger\'s) confirmation hash for the source agent `:id`, rate-limited per id and per IP, mTLS-bound in enforce mode (outside agentAuthMiddleware by design)',
   // routes/agents/pamObservations.ts
   'POST /api/v1/agents/:id/commands/:commandId/pam-observations': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
   // routes/agents/pamReconciliation.ts
   'POST /api/v1/agents/:id/pam/reconciliation-bindings': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
+  // routes/agents/pamElevationUnable.ts (#9517)
+  'POST /api/v1/agents/:id/pam/elevation-unable': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
+  // routes/agents/elevationWithdraw.ts (#8971)
+  'POST /api/v1/agents/:id/elevation-requests/:requestId/withdraw': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
   // routes/agents/patches.ts
   'PUT /api/v1/agents/:id/patches/pending': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
   'PUT /api/v1/agents/:id/patches/installed': 'device credential: agentAuthMiddleware (agent bearer token), device-scoped',
@@ -224,6 +233,8 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/autopay/public/setup-return': 'public: Customer link token resolved by boundary(); no user session',
   'POST /api/v1/autopay/public/:token/setup-session': 'public: Customer link token resolved by boundary(); no user session',
   'POST /api/v1/autopay/public/:token/stop': 'public: Customer link token resolved by boundary(); no user session',
+  // routes/emailUnsubscribe.ts
+  'POST /api/v1/email/unsubscribe': 'public: RFC 8058 one-click unsubscribe; HMAC-signed link token, opts out its own user/topic only',
   'POST /api/v1/autopay/public/:token/skip': 'public: Customer link token resolved by boundary(); no user session',
   'POST /api/v1/autopay/public/:token/confirm': 'public: Customer link token resolved by boundary(); no user session',
   // routes/backup/bmr.ts
@@ -247,6 +258,7 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/desktop-ws/connect/exchange': 'device credential: one-time connect code exchange, live access re-authorized',
   'POST /api/v1/desktop-ws/:id/viewer/ws-ticket': 'device credential: viewer access token + session access validation',
   'POST /api/v1/desktop-ws/:id/viewer/offer': 'device credential: viewer access token + session access validation',
+  'POST /api/v1/desktop-ws/:id/viewer/ice': 'device credential: viewer access token + session access validation',
   'POST /api/v1/desktop-ws/:id/viewer/lease/renew': 'device credential: viewer access token bound to session owner',
   // routes/devPush.ts
   'POST /api/v1/dev/push': 'equivalent check: devPushAuth wraps requirePermission(DEVICES_EXECUTE)+requireMfa for API key',
@@ -320,10 +332,16 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   // routes/portal/profile.ts
   'PATCH /api/v1/portal/profile': 'portal session: portal session auth (portalAuthMiddleware)',
   'POST /api/v1/portal/profile/password': 'portal session: portal session auth (portalAuthMiddleware)',
+  // routes/portal/approvals.ts
+  'POST /api/v1/portal/approvals/:id/approve': 'portal session: portal session auth (portalAuthMiddleware); approver check against the session email + decision service re-check',
+  'POST /api/v1/portal/approvals/:id/deny': 'portal session: portal session auth (portalAuthMiddleware); approver check against the session email + decision service re-check',
   // routes/portal/quotes.ts
   'POST /api/v1/portal/quotes/:id/accept': 'portal session: portal session auth (portalAuthMiddleware)',
   'POST /api/v1/portal/quotes/:id/decline': 'portal session: portal session auth (portalAuthMiddleware)',
   'POST /api/v1/portal/quotes/:id/pay': 'portal session: portal session auth (portalAuthMiddleware)',
+  // routes/portal/agreements.ts (#9075 W3a)
+  'POST /api/v1/portal/agreements/:id/accept': 'portal session: portal session auth (portalAuthMiddleware) + portalFinancialMutationGuard; recipient-email match re-checked under the row lock by acceptAgreementRequest',
+  'POST /api/v1/portal/agreements/:id/decline': 'portal session: portal session auth (portalAuthMiddleware) + portalFinancialMutationGuard; recipient-email match re-checked under the row lock by declineAgreementRequest',
   // routes/portal/reports.ts
   'POST /api/v1/portal/reports/generate': 'portal session: portal session auth (portalAuthMiddleware)',
   // routes/portal/tickets.ts
@@ -331,9 +349,17 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/portal/tickets/:id/comments': 'portal session: portal session auth (portalAuthMiddleware)',
   'PATCH /api/v1/portal/tickets/:id/comments/:commentId': 'portal session: portal session auth (portalAuthMiddleware)',
   'DELETE /api/v1/portal/tickets/:id/comments/:commentId': 'portal session: portal session auth (portalAuthMiddleware)',
+  // routes/portal/trustPage.ts (Trust Center W3d)
+  'PUT /api/v1/portal/trust-page': 'portal session: portal session auth + requirePortalTrustPageEditor (org-admin contact role, flag)',
+  'POST /api/v1/portal/trust-page/preview-token': 'portal session: portal session auth + requirePortalTrustPageEditor (org-admin contact role, flag)',
+  'POST /api/v1/portal/trust-page/unpublish': 'portal session: portal session auth + requirePortalTrustPageEditor (org-admin contact role, flag)',
+  // routes/agreementsPublic.ts (#9075 W2b)
+  'POST /api/v1/agreements/public/:token/accept': 'public: Signed agreement-request link token; persisted jti + partner continuity checked in resolveAgreementLink(); durable single-use in the service',
+  'POST /api/v1/agreements/public/:token/decline': 'public: Signed agreement-request link token; persisted jti + partner continuity checked in resolveAgreementLink(); durable single-use in the service',
   // routes/quotesPublic.ts
   'POST /api/v1/quotes/public/:token/accept': 'public: Signed public quote link token; single-use claims checked in resolve()',
   'POST /api/v1/quotes/public/:token/decline': 'public: Signed public quote link token; single-use claims checked in resolve()',
+  'POST /api/v1/quotes/public/:token/pay': 'public: Signed public quote link token; spent only by the accepting jti (durable row record); mints Checkout for the quote\'s own converted invoice under its org',
   // routes/sso.ts
   'POST /api/v1/sso/link/start/:providerId': 'own account: Starts linking caller\'s own SSO identity; MFA required',
   'POST /api/v1/sso/reauth/start': 'own account: Caller\'s own IdP re-authentication start',
@@ -341,10 +367,14 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/sso/link/confirm': 'public: Link confirm via pending-link cookie and password',
   // routes/supportPublic.ts
   'POST /api/v1/support/redeem': 'public: one-time support code redemption, rate limited',
+  // routes/callerVerifyPublic.ts
+  'POST /api/v1/verify/:token': 'public: caller-verification SMS/email link token is the credential; single CAS decision, per-IP/per-token/miss budgets',
   // routes/system.ts
   'POST /api/v1/system/setup-complete': 'own account: sets caller\'s own setupCompletedAt',
   // routes/tickets/emailWebhook.ts
   'POST /api/v1/webhooks/tickets/email-inbound': 'webhook: Inbound email provider HMAC verified via provider.verify',
+  // routes/topology/interfaceRole.ts
+  'PATCH /api/v1/topology/interfaces/:id/role': 'equivalent check: requireTopologySiteAccess(write) on the interface\'s own site via assertTopologySiteWrite; the site comes from the interface row, not a path param',
   // routes/topology/templateApplications.ts
   'POST /api/v1/topology/template-applications/preview': 'equivalent check: requireTopologySiteAccess(write) per site in service; writes preview journal',
   'POST /api/v1/topology/template-applications': 'equivalent check: requireTopologySiteAccess(write) re-checked per site at apply',
@@ -353,6 +383,11 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'PATCH /api/v1/topology/templates/:templateId': 'equivalent check: hasPermission(topology+devices write) in templateLibrary service',
   'POST /api/v1/topology/templates/:templateId/versions': 'equivalent check: hasPermission(topology+devices write) in templateLibrary service',
   'POST /api/v1/topology/templates/:templateId/versions/:versionId/publish': 'equivalent check: hasPermission(topology+devices write) in templateLibrary service',
+  // routes/trustAccessPublic.ts (Trust Center W02d) — anonymous by design: no staff JWT exists on these requests
+  'POST /api/v1/trust/access/requests': 'public: anonymous gated-document access request; rate-limited per IP/address/page, generic 202/404 (spec trust-center §12)',
+  'POST /api/v1/trust/access/verify': 'public: one-shot hashed email-verification token in the POST body is the credential; rate-limited, generic 404',
+  'POST /api/v1/trust/access/grant': 'public: hashed download token in the POST body is the credential; read-only grant view; rate-limited, generic 404',
+  'POST /api/v1/trust/access/download': 'public: hashed download token in the POST body + approved, unexpired grant re-checked per call; rate-limited, generic 404',
   // routes/tunnels.ts
   'POST /api/v1/tunnels/:id/ws-ticket': 'equivalent check: requireMfa + owner check + authorizeRemoteSessionContinuation (REMOTE_ACCESS/DEVICES_EXECUTE)',
   'POST /api/v1/tunnels/:id/http-ticket': 'equivalent check: requireMfa + owner check + authorizeRemoteSessionContinuation (REMOTE_ACCESS/DEVICES_EXECUTE)',
@@ -362,11 +397,16 @@ const WRITE_ROUTES_WITHOUT_PERMISSION_GATE: Record<string, string> = {
   'POST /api/v1/vnc-viewer/downgrade-to-vnc': 'device credential: Viewer token (requireViewerToken) plus live session authority re-check',
   // routes/users.ts
   'PATCH /api/v1/users/me/ticket-push-preferences': 'own account: Caller edits own profile/preferences/avatar only (auth.user.id)',
+  'PATCH /api/v1/users/me/email-preferences': 'own account: Caller toggles own email opt-outs only (auth.user.id)',
   'PUT /api/v1/users/me/ticket-pushover': 'own account: Caller sets own Pushover key only (auth.user.id)',
   'DELETE /api/v1/users/me/ticket-pushover': 'own account: Caller clears own Pushover key only (auth.user.id)',
   'PATCH /api/v1/users/me': 'own account: Caller edits own profile/preferences/avatar only (auth.user.id)',
   'POST /api/v1/users/me/avatar': 'own account: Caller edits own profile/preferences/avatar only (auth.user.id)',
   'DELETE /api/v1/users/me/avatar': 'own account: Caller edits own profile/preferences/avatar only (auth.user.id)',
+  // routes/flowWebhooks.ts
+  'POST /api/v1/webhooks/flows/:flowId': 'webhook: signature/token authenticated (services/flows/webhook/verify.ts), no user permission',
+  // routes/webhooks/edr.ts
+  'POST /api/v1/webhooks/edr/:connectionId': 'webhook: EDR push hint; connection lookup + adapter secret verification in handler',
   // routes/webhooks/emailProvider.ts
   'POST /api/v1/webhooks/email-provider/resend': 'webhook: Svix signature verified with configured webhook secret',
   // routes/webhooks/quickbooks.ts

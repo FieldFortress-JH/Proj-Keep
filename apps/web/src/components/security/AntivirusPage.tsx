@@ -19,16 +19,23 @@ type DeviceStatus = {
   // null = unknown: the agent's collector failed or never reported (#8252).
   realTimeProtection: boolean | null;
   provider: {
+    // 'unknown' = collection failed (#8538); rendered via i18n, not `name`.
+    id?: string;
     name: string;
     vendor: string;
   } | null;
 };
+// Only the slices of `/security/dashboard` this page reads. Its
+// protectedDevices / atRiskDevices / totalDevices are fleet posture-risk
+// counts, not antivirus coverage — do not use them here (#10378).
 type DashboardStats = {
-  totalDevices: number;
-  protectedDevices: number;
-  atRiskDevices: number;
-  unprotectedDevices: number;
-  offlineDevices: number;
+  // Real-time protection per device with a security status row; null readings
+  // land in `unknown` (#8252). Same buckets as the /security overview card.
+  antivirus?: {
+    protected: number;
+    unprotected: number;
+    unknown: number;
+  };
   providers: Array<{
     providerId: string;
     providerName: string;
@@ -167,15 +174,25 @@ export default function AntivirusPage() {
   // that to 0 painted "Total 0 / Protected 0 / Coverage 0%" with no banner at all
   // — a fabricated all-clear for a fleet we simply failed to read. Show an em
   // dash for the unknown instead of inventing a zero. (#2472)
-  const hasDashboard = dashboard !== null;
-  const total = dashboard?.totalDevices ?? 0;
-  const prot = dashboard?.protectedDevices ?? 0;
-  const unprot = dashboard?.unprotectedDevices ?? 0;
+  //
+  // The tiles count real-time protection from the `antivirus` block (#10378) —
+  // the same buckets as the /security overview card and this page's Real-time
+  // column. Total includes unknown readings; coverage counts only confirmed
+  // protection, so an unread device is never reported as covered.
+  const antivirus = dashboard?.antivirus;
+  const hasDashboard = antivirus != null;
+  const prot = antivirus?.protected ?? 0;
+  const unprot = antivirus?.unprotected ?? 0;
+  const total = prot + unprot + (antivirus?.unknown ?? 0);
   const coveragePercent = total ? Math.round((prot / total) * 100) : 0;
   const stat = (value: number) => (hasDashboard ? formatNumber(value) : "—");
+  // Failed collection is stored as provider 'unknown' (#8538); localize it
+  // here — the server `providerName` is only an English fallback.
+  const providerLabel = (p: { providerId: string; providerName: string }) =>
+    p.providerId === "unknown" ? t("securityAntivirusPage.unknown") : p.providerName;
   const pieData = (dashboard?.providers ?? [])
     .filter((p) => p.deviceCount > 0)
-    .map((p) => ({ name: p.providerName, value: p.deviceCount }));
+    .map((p) => ({ name: providerLabel(p), value: p.deviceCount }));
   return (
     <div className="space-y-6">
       <SecurityPageHeader
@@ -191,23 +208,27 @@ export default function AntivirusPage() {
         <SecurityStatCard
           icon={ShieldCheck}
           label={t("securityAntivirusPage.totalDevices")}
+          testId="antivirus-stat-total"
           value={stat(total)}
         />
         <SecurityStatCard
           icon={ShieldCheck}
           label={t("securityAntivirusPage.protected")}
+          testId="antivirus-stat-protected"
           value={stat(prot)}
           variant={hasDashboard ? "success" : "default"}
         />
         <SecurityStatCard
           icon={ShieldOff}
           label={t("securityAntivirusPage.unprotected")}
+          testId="antivirus-stat-unprotected"
           value={stat(unprot)}
           variant={hasDashboard ? "danger" : "default"}
         />
         <SecurityStatCard
           icon={ShieldCheck}
           label={t("securityAntivirusPage.coverage")}
+          testId="antivirus-stat-coverage"
           value={hasDashboard ? `${coveragePercent}%` : "—"}
           variant={
             !hasDashboard
@@ -264,7 +285,7 @@ export default function AntivirusPage() {
                         PIE_DOT_CLASSES[i % PIE_DOT_CLASSES.length],
                       )}
                     />
-                    <span className="truncate">{p.providerName}</span>
+                    <span className="truncate">{providerLabel(p)}</span>
                   </div>
                   <span className="font-medium">{p.deviceCount}</span>
                 </div>
@@ -367,7 +388,9 @@ export default function AntivirusPage() {
                         {d.os}
                       </td>
                       <td className="px-4 py-3 text-sm">
-                        {d.provider?.name ?? t("securityAntivirusPage.unknown")}
+                        {d.provider && d.provider.id !== "unknown"
+                          ? d.provider.name
+                          : t("securityAntivirusPage.unknown")}
                       </td>
                       <td className="px-4 py-3">
                         <span

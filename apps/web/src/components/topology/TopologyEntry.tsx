@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'rea
 import { useTranslation } from 'react-i18next';
 import { useHashState } from '../../lib/useHashState';
 import { formatTopologyHash, parseTopologyHash, writeTopologyHash } from './topologyHash';
-import { topologyApi, topologyNodeListSchema, topologyRead, TopologyReadError, type TopologySettings } from './topologyApi';
+import { setTopologyOrgPin, topologyApi, topologyNodeListSchema, topologyRead, TopologyReadError, type TopologySettings } from './topologyApi';
 import { clearTopologyPrefetch, prefetchTopologyGraph, prefetchTopologySettings, takePrefetchedSettings } from './topologyPrefetch';
 import TopologyEmptyState from './TopologyEmptyState';
 const loadExplorer = () => import('./TopologyExplorer');
@@ -14,10 +14,14 @@ type LinkedSite = 'checking' | 'switching' | 'sameOrg' | 'missing' | 'failed';
  * than read from the org store so this component stays free of store wiring for site-bound callers.
  */
 export type TopologyOrganization = { currentOrgId: string | null; selectOrganization: (orgId: string) => void };
-export default function TopologyEntry({ siteId, sites = [], deviceId, assetId, legacy, organization }: {
-  siteId?: string | null; sites?: { id: string; name: string }[]; deviceId?: string; assetId?: string; legacy?: ReactNode; organization?: TopologyOrganization;
+export default function TopologyEntry({ siteId, sites = [], deviceId, assetId, legacy, organization, orgId }: {
+  /** The org that owns the device/asset shown, when it may differ from the working org (#9258). */
+  orgId?: string | null; siteId?: string | null; sites?: { id: string; name: string }[]; deviceId?: string; assetId?: string; legacy?: ReactNode; organization?: TopologyOrganization;
 }) {
   const { t } = useTranslation('topology');
+  // Set during render so the first (child/effect) reads already carry it; cleared on unmount.
+  setTopologyOrgPin(orgId);
+  useEffect(() => () => setTopologyOrgPin(null), []);
   const [hashSite, setHashSite] = useHashState<string | undefined>(undefined, (hash) => parseTopologyHash(hash)?.siteId);
   // A linked site is shown only once this organization's list contains it: never fall back to another site (#7880).
   const linkedSite = !siteId && hashSite && !sites.some((site) => site.id === hashSite) ? hashSite : undefined;
@@ -35,6 +39,9 @@ export default function TopologyEntry({ siteId, sites = [], deviceId, assetId, l
    * org is not a user switch.
    */
   const linkOwner = useRef<{ siteId: string; orgId: string | null } | undefined>(undefined);
+  // The pin belongs to the link that set it (#8335): once the hash no longer names that site (a tab click, a router
+  // hash reset), a later link to the same site is a new link, not evidence of a user switch away from the old one.
+  if (linkOwner.current && linkOwner.current.siteId !== hashSite) linkOwner.current = undefined;
   if (!siteId && hashSite && currentOrgId && sites.some((site) => site.id === hashSite)) linkOwner.current = { siteId: hashSite, orgId: currentOrgId };
   useEffect(() => clearTopologyPrefetch, [currentOrgId]);
   const [settings, setSettings] = useState<TopologySettings>(), [focus, setFocus] = useState<string>(), [error, setError] = useState<string>(), [bindingResolved, setBindingResolved] = useState(false);
@@ -114,7 +121,22 @@ export default function TopologyEntry({ siteId, sites = [], deviceId, assetId, l
   // explorer remounted it on every site change (the explorer unmounts while the new site loads), which
   // dropped keyboard focus to <body>.
   const [toolbarSlot, setToolbarSlot] = useState<HTMLDivElement | null>(null);
-  return <div className={siteId ? 'space-y-4' : 'space-y-3'} data-testid="topology-entry">
+  // Expanded map (2026-10-25): the whole entry (site select, toolbar, map) fills the window above the app chrome
+  // (z-40: the chrome-overlay band, under modals and toasts). It stays expanded across site changes. Escape leaves it
+  // unless a field (a search box clears itself) or a panel (the inspector closing) already handled that Escape.
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    if (!maximized) return;
+    const leave = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (event.target instanceof HTMLElement && event.target.closest('input, select, textarea, [contenteditable="true"]')) return;
+      setMaximized(false);
+    };
+    document.addEventListener('keydown', leave);
+    return () => document.removeEventListener('keydown', leave);
+  }, [maximized]);
+  const frame = maximized ? 'fixed inset-0 z-40 space-y-3 overflow-y-auto bg-background p-3 md:p-4' : siteId ? 'space-y-4' : 'space-y-3';
+  return <div className={frame} data-testid="topology-entry" data-topology-maximized={maximized ? 'true' : undefined}>
     {!siteId && <div data-testid="topology-entry-toolbar" className="flex flex-wrap items-center gap-2">
       <label className="flex items-center gap-2 text-sm text-muted-foreground">{t('site')}<select data-testid="topology-site" className="h-9 rounded-md border bg-background px-2 text-sm text-foreground" value={selectedSite ?? ''} onChange={(event) => { setHashSite(event.target.value); writeTopologyHash({ siteId: event.target.value, view: 'overview', search: '' }); }}><option value="">{t('chooseSite')}</option>{sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}</select></label>
       <div ref={setToolbarSlot} className="contents" />
@@ -126,6 +148,7 @@ export default function TopologyEntry({ siteId, sites = [], deviceId, assetId, l
     {error && <p role="alert" className="text-destructive">{error}</p>}
     {selectedSite && !settings && !error && <p role="status">{t('loading')}</p>}
     {settings && !settings.capabilities.ui.available && (legacy ?? <TopologyEmptyState reason={settings.capabilities.ui.reason} />)}
-    {settings?.capabilities.ui.available && bindingResolved && selectedSite && (siteId || toolbarSlot) && <Suspense fallback={<p role="status">{t('loading')}</p>}><TopologyExplorer key={`${selectedSite}/${focus ?? ''}`} siteId={selectedSite} siteName={sites.find((site) => site.id === selectedSite)?.name} focusNodeId={focus} settings={settings} toolbarSlot={siteId ? undefined : toolbarSlot ?? undefined} /></Suspense>}
+    {settings?.capabilities.ui.available && bindingResolved && selectedSite && (siteId || toolbarSlot) && <Suspense fallback={<p role="status">{t('loading')}</p>}><TopologyExplorer key={`${selectedSite}/${focus ?? ''}`} siteId={selectedSite} siteName={sites.find((site) => site.id === selectedSite)?.name} focusNodeId={focus} settings={settings} toolbarSlot={siteId ? undefined : toolbarSlot ?? undefined}
+      maximized={maximized} onToggleMaximized={() => setMaximized(!maximized)} /></Suspense>}
   </div>;
 }

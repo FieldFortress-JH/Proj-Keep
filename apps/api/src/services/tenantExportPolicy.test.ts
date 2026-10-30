@@ -341,6 +341,23 @@ describe('buildTenantExportPlan', () => {
 });
 
 describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
+  it('exports software_policies.managed_by_link_id (#6960): a plain row identifier, no secret', () => {
+    expect(CORE_TENANT_EXPORT_POLICY.software_policies!.columns.managed_by_link_id).toMatchObject({
+      decision: 'include',
+    });
+  });
+
+  it('classifies every security_agent_device_status column as included (#6960 W03): typed columns, no open container', () => {
+    const policy = CORE_TENANT_EXPORT_POLICY.security_agent_device_status;
+    expect(policy).toBeDefined();
+    for (const column of [
+      'id', 'org_id', 'device_id', 'vendor_endpoint_id', 'vendor', 'state', 'reason_code', 'detail',
+      'policy_id', 'last_evaluated_at', 'state_changed_at', 'created_at',
+    ]) {
+      expect(policy!.columns[column], column).toMatchObject({ decision: 'include' });
+    }
+  });
+
   it('exports deployment dependency fingerprints as reviewed integrity provenance', () => {
     expect(
       CORE_TENANT_EXPORT_POLICY.software_deployments!.columns.dependency_fingerprint,
@@ -603,14 +620,39 @@ describe('retiring columns (#7606)', () => {
     expect(findTenantExportPolicyIssues(tables, cols('id'), registry())).toEqual(['ai_script_policies.org_id: classification has no live column']);
   });
 
-  it('the core registry carries every W08 retired column as retiring (#7606)', () => {
+  it('W08b dropped the retired columns, so the core registry no longer classifies them (#7606)', () => {
     for (const [table, col] of [
       ['ai_script_policies', 'reviewer_model'],
       ['client_ai_org_policies', 'allowed_models'],
       ['ai_agents', 'model'],
       ['ai_budgets', 'allowed_models'],
     ] as const) {
-      expect(CORE_TENANT_EXPORT_POLICY[table]!.columns[col], `${table}.${col}`).toMatchObject({ decision: 'exclude', mayBeAbsent: true });
+      expect(CORE_TENANT_EXPORT_POLICY[table]!.columns[col], `${table}.${col}`).toBeUndefined();
     }
+  });
+
+  it('the W08b archive exports its metadata and excludes the jsonb value as an open container (#7606)', () => {
+    const archive = CORE_TENANT_EXPORT_POLICY.ai_model_registry_legacy_archive!;
+    expect(archive.organizationKey).toBe('org_id');
+    expect(archive.columns.value).toMatchObject({ decision: 'exclude', openContainerReviewed: true });
+    expect(archive.columns.value!.mayBeAbsent).toBeUndefined();
+    for (const col of ['id', 'partner_id', 'org_id', 'source_table', 'source_id', 'source_column', 'had_cutover', 'archived_at']) {
+      expect(archive.columns[col], col).toMatchObject({ decision: 'include' });
+    }
+  });
+});
+
+describe('software install-script columns are classified (#6958 PR C)', () => {
+  it('includes software_catalog.builtin_package_key (a varchar package key, not an open container)', () => {
+    const cols = CORE_TENANT_EXPORT_POLICY['software_catalog']!.columns;
+    expect(cols['builtin_package_key'], 'software_catalog.builtin_package_key unclassified').toBeDefined();
+    expect(cols['builtin_package_key']!.decision).toBe('include');
+  });
+
+  it('software_versions stays parent-keyed with no export entry of its own', () => {
+    // software_versions has no org_id; it follows software_catalog
+    // (orgMergeRegistry `follows-parent`), so install_scripts_enabled needs no
+    // classification. If an entry is ever added, classify that column too.
+    expect(CORE_TENANT_EXPORT_POLICY['software_versions']).toBeUndefined();
   });
 });

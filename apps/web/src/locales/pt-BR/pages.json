@@ -23,9 +23,12 @@
     "adminUsersDetailDevices": "Dispositivos do usuário",
     "aiAgentsImpact": "Impacto da IA",
     "aiAgentsFixMemory": "Memória de correções",
+    "flows": "Fluxos",
+    "flowDetail": "Fluxo",
+    "flowRun": "Execução de fluxo",
     "aiAgentsRunsDetail": "Detalhes da execução",
     "aiAgentsRuns": "Execuções de agentes",
-    "aiForOffice": "IA para Office",
+    "aiForOffice": "Breeze AI for Office",
     "aiRisk": "Motor de risco de IA",
     "alertsDelivery": "Alertas – Entrega",
     "alertsCorrelations": "Correlações de alertas",
@@ -70,10 +73,10 @@
     "dnsSecurity": "Segurança de DNS",
     "dr": "Recuperação de desastres",
     "extensionsNamePath": "Extensão",
-    "fleet": "Orquestração de frota",
+    "fleet": "Descobertas",
     "forgotPassword": "Esqueci minha senha",
     "incidentsDetail": "Detalhes do incidente",
-    "incidents": "Incidentes",
+    "incidents": "Incidentes de segurança",
     "dashboard": "Painel",
     "integrations": "Integrações",
     "integrationsPsa": "Integrações PSA",
@@ -94,6 +97,7 @@
     "policies": "Políticas",
     "policiesNew": "Nova política",
     "quick": "Suporte rápido",
+    "verify": "Confira uma solicitação de suporte",
     "registerPartner": "Cadastre sua empresa",
     "remoteFilesDevice": "Gerenciador de arquivos remoto",
     "remoteFiles": "Iniciar transferência de arquivos",
@@ -138,6 +142,7 @@
     "settingsBilling": "Configurações de faturamento",
     "settingsCatalog": "Catálogo de produtos",
     "settingsConnectedApps": "Aplicativos conectados",
+    "settingsDeliverableTemplates": "Modelos de entregáveis",
     "settingsCustomFields": "Campos personalizados",
     "settingsEnrollmentKeys": "Chaves de registro",
     "settingsFilters": "Filtros salvos",
@@ -151,6 +156,7 @@
     "settingsProfile": "Configurações de perfil",
     "settingsRoles": "Funções",
     "settingsSitesDetail": "Configurações do site",
+    "settingsSites": "Sites",
     "settingsSso": "Login único (SSO)",
     "settingsUsers": "Usuários",
     "settingsVariables": "Variáveis",
@@ -164,7 +170,6 @@
     "ticketsNew": "Criar chamado",
     "timesheet": "Folha de horas",
     "vulnerabilities": "Vulnerabilidades",
-    "workspace": "Assistente de IA",
     "aiAgentsFleetDesign": "Design de frota",
     "agreementTemplates": "Modelos de acordo",
     "agreementTemplateDetail": "Modelo de acordo",
@@ -174,7 +179,19 @@
     "securityScans": "Varreduras de IOC",
     "devicesTime": "Sincronização de horário",
     "adminAiModels": "Modelos de IA",
-    "billingAutopay": "Automatic payments"
+    "adminWisp": "Wisp",
+    "billingAutopay": "Pagamentos automáticos",
+    "endpointMessages": "Mensagens para dispositivos",
+    "securityDetectionRules": "Regras de detecção",
+    "settingsPlan": "Plano e recursos",
+    "settingsWispMemory": "Memória do Wisp",
+    "wispThread": "Conversa do Wisp",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "Tarefas de IA",
+    "aiTask": "Tarefa de IA",
+    "settingsAi": "Configurações de IA",
+    "settingsFlowLimits": "Limites de fluxos"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Monitoramento e Gerenciamento Remoto",
@@ -182,6 +199,10 @@
   },
   "authShell": {
     "tagline": "A plataforma RMM moderna feita para velocidade, clareza e escala."
+  },
+  "authFooter": {
+    "reportAbuse": "Denunciar abuso",
+    "security": "Segurança"
   },
   "errorPage": {
     "notFoundBody": "A página que você está procurando não existe ou pode ter sido movida.",
@@ -224,7 +245,7 @@
       },
       "connectedApps": {
         "title": "Aplicativos Conectados",
-        "description": "Revise e revogue assistentes de IA e clientes MCP autorizados a acessar seu locatário."
+        "description": "Revise e revogue clientes de IA autorizados a acessar seu locatário."
       },
       "officeAddinBindings": {
         "title": "Vínculos do Suplemento do Outlook",
@@ -253,6 +274,18 @@
       },
       "alertTemplates": {
         "title": "Modelos de alerta"
+      },
+      "plan": {
+        "title": "Plano e recursos",
+        "description": "Seu plano, quais recursos ele inclui e de onde vem cada um."
+      },
+      "wispMemory": {
+        "title": "Memória do Wisp",
+        "description": "Revise, confirme e retire o que o Wisp lembra."
+      },
+      "flowLimits": {
+        "title": "Limites de fluxos",
+        "description": "Limites mensais de execuções e limite de tokens de IA para os fluxos."
       }
     },
     "groups": {
@@ -275,7 +308,7 @@
   },
   "settingsConnectedAppsPage": {
     "heading": "Aplicativos conectados",
-    "description": "Assistentes de IA e outros clientes MCP autorizados a acessar seu locatário via OAuth. Revogue o acesso a qualquer momento — o token do aplicativo será rejeitado em até 10 minutos."
+    "description": "Clientes de IA que foram autorizados a acessar seu locatário via OAuth. Revogue o acesso a qualquer momento — o token do aplicativo será rejeitado em até 10 minutos."
   },
   "settingsOrganizationBillingPage": {
     "backLink": "← Configurações da organização",

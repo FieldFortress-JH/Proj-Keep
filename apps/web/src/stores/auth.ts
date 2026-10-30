@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { launchPurchaseSelectionSchema, type LaunchPurchaseSelection } from '@breeze/shared';
 import { persist } from 'zustand/middleware';
 import {
   startAuthentication,
@@ -9,15 +10,22 @@ import {
   type RegistrationResponseJSON
 } from '@simplewebauthn/browser';
 import { extractApiError } from '@/lib/apiError';
+import { runLogoutHooks } from './logoutHooks';
+// #9427 W3: stores register through ./logoutHooks directly (see that module).
+export { registerLogoutHook } from './logoutHooks';
 import { resetPartnerCurrencyCache } from '@/lib/partnerCurrencyCache';
+import { resetEntitlementsCache } from '@/lib/entitlementsCache';
 import { resetApproximateTotalCache } from '@/lib/approximateTotalCache';
+import { clearSsoReauthGrant } from '@/lib/ssoReauthGrant';
 import { getSafeNext, loginPathWithNext } from '@/lib/authNext';
+import { isGlobalScopeRoute } from '@/lib/routeScope';
 import {
   parseMfaChallengeResponse,
   type MfaChallenge,
   type MfaMethod,
+  type MfaPrimaryMethod,
 } from '@/lib/mfaChallenge';
-export type { MfaAllowedMethods, MfaChallenge, MfaMethod } from '@/lib/mfaChallenge';
+export type { MfaAllowedMethods, MfaChallenge, MfaMethod, MfaPrimaryMethod } from '@/lib/mfaChallenge';
 import {
   applyAppearancePreferences,
   applyResolvedLocalePreferences,
@@ -42,6 +50,11 @@ export interface UserPreferences {
    * falls back to the tenant default server-side rather than failing a launch.
    */
   remoteAccessProviderId?: string;
+  /**
+   * #9348 (WCAG 2.1.4): single-character keyboard shortcuts (`g`/`c` chords,
+   * `/`, `?`, `[`, ticket-queue keys). Absent = on; only `false` disables.
+   */
+  characterKeyShortcuts?: boolean;
 }
 
 /** A single permission grant ({ resource, action }), mirroring the API. */
@@ -55,6 +68,7 @@ export interface User {
   email: string;
   name: string;
   mfaEnabled: boolean;
+  mfaMethod?: MfaMethod | null;
   avatarUrl?: string;
   requiresSetup?: boolean;
   // True only for platform operators. Gates platform-admin-only nav (e.g.
@@ -132,7 +146,8 @@ interface AuthState {
   login: (user: User, tokens: Tokens) => void;
   logout: () => void;
   updateUser: (user: Partial<User>) => void;
-  commitMfaEnrollmentIfCurrent: (generation: number, tokens: Tokens) => boolean;
+  commitMfaEnrollmentIfCurrent: (generation: number, method: MfaPrimaryMethod, tokens?: Tokens) => boolean;
+  commitMfaDisableIfCurrent: (generation: number, tokens?: Tokens) => boolean;
   commitReissuedSessionIfCurrent: (generation: number, tokens: Tokens) => boolean;
   setAuthThrottledUntil: (until: number | null) => void;
 }
@@ -207,10 +222,15 @@ export const useAuthStore = create<AuthState>()(
         // A partner switch in the same tab must never render the previous
         // partner's currency (lib/usePartnerCurrency caches per page).
         resetPartnerCurrencyCache();
+        // Same for the partner's plan entitlements (hooks/useEntitlement).
+        resetEntitlementsCache();
         // Reporting totals are converted into the VIEWER's partner reporting
         // currency (lib/useApproximateTotal), so they must not outlive the
         // session either.
         resetApproximateTotalCache();
+        // #8862: the profile page's stashed SSO re-auth grant is bound to this
+        // session; never let the next sign-in on this tab restore it.
+        clearSsoReauthGrant();
         // An evicted session must never come back via a stray throttle-recovery
         // reload — the redirect to /login owns navigation from here.
         cancelThrottleReload();
@@ -256,7 +276,7 @@ export const useAuthStore = create<AuthState>()(
         return committed;
       },
 
-      commitMfaEnrollmentIfCurrent: (generation, tokens) => {
+      commitMfaEnrollmentIfCurrent: (generation, method, tokens) => {
         let committed = false;
         set((state) => {
           if (
@@ -266,8 +286,25 @@ export const useAuthStore = create<AuthState>()(
           ) return state;
           committed = true;
           return {
-            tokens,
-            user: { ...state.user, mfaEnabled: true },
+            ...(tokens ? { tokens } : {}),
+            user: { ...state.user, mfaEnabled: true, mfaMethod: method },
+          };
+        });
+        return committed;
+      },
+
+      commitMfaDisableIfCurrent: (generation, tokens) => {
+        let committed = false;
+        set((state) => {
+          if (
+            state.sessionGeneration !== generation
+            || !state.isAuthenticated
+            || !state.user
+          ) return state;
+          committed = true;
+          return {
+            ...(tokens ? { tokens } : {}),
+            user: { ...state.user, mfaEnabled: false, mfaMethod: null },
           };
         });
         return committed;
@@ -311,6 +348,25 @@ export const useAuthStore = create<AuthState>()(
 let _getOrgId: (() => string | null) | null = null;
 export function registerOrgIdProvider(fn: () => string | null) {
   _getOrgId = fn;
+}
+
+/**
+ * Pure read of the org selection `orgStore` persists ('breeze-org', zustand
+ * persist envelope). Used only until orgStore registers its provider. Mirrors
+ * the provider: null on global-scope routes and when All-orgs is selected.
+ */
+function readPersistedOrgId(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    if (isGlobalScopeRoute(window.location.pathname)) return null;
+    const raw = window.localStorage.getItem('breeze-org');
+    if (!raw) return null;
+    const state = (JSON.parse(raw) as { state?: { currentOrgId?: unknown; allOrgs?: unknown } } | null)?.state;
+    if (!state || state.allOrgs === true) return null;
+    return typeof state.currentOrgId === 'string' && state.currentOrgId ? state.currentOrgId : null;
+  } catch {
+    return null;
+  }
 }
 
 // API helper functions
@@ -1339,8 +1395,13 @@ export async function fetchWithAuth(rawUrl: string, options: FetchWithAuthOption
   // fail invisibly rather than loudly.
   const { skipOrgIdInjection, skipUnauthorizedRetry, orgIdOverride, ...init } = options;
 
-  // Auto-inject orgId from the org store so partner/system users always scope API calls
-  const url = applyOrgId(rawUrl, { skipOrgIdInjection, orgIdOverride, ambient: _getOrgId?.() ?? null });
+  // Auto-inject orgId from the org store so partner/system users always scope API calls.
+  // Astro islands hydrate independently: a page island can reach this before the
+  // header island has imported orgStore (which registers the provider). Fall back
+  // to a side-effect-free read of the persisted selection (no orgStore import, so
+  // no store bootstrap or network) so the first request is scoped (#9642).
+  const ambient = _getOrgId ? _getOrgId() : readPersistedOrgId();
+  const url = applyOrgId(rawUrl, { skipOrgIdInjection, orgIdOverride, ambient });
 
   const { tokens: initialTokens, isAuthenticated, setTokens } = useAuthStore.getState();
   let tokens = initialTokens;
@@ -1800,7 +1861,8 @@ export async function apiRegisterPartner(
   companyName: string,
   email: string,
   password: string,
-  name: string
+  name: string,
+  purchaseSelection?: LaunchPurchaseSelection
 ): Promise<
   | { success: true; message: string }
   | { success: false; error: string; action?: { url: string; label: string } }
@@ -1810,7 +1872,7 @@ export async function apiRegisterPartner(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ companyName, email, password, name, acceptTerms: true })
+      body: JSON.stringify({ companyName, email, password, name, acceptTerms: true, ...(purchaseSelection ? { purchaseSelection } : {}) })
     });
 
     const data = await response.json();
@@ -1847,11 +1909,15 @@ export type CfTerminalLogoutPreparationOutcome =
   | Readonly<{ kind: 'partial'; message: string }>;
 
 function evictLocalAuthState(): void {
+  // #9427 W3: clear runtime AI state (workspace tabs, attach readers) BEFORE
+  // any storage removal, or a persist write would put the old tabs back.
+  runLogoutHooks();
   useAuthStore.getState().logout();
   try {
     localStorage.removeItem('breeze-auth');
     localStorage.removeItem('breeze-org');
     localStorage.removeItem('breeze-ai-chat');
+    localStorage.removeItem('breeze-workspace');
   } catch {
     // localStorage may be unavailable
   }
@@ -1965,7 +2031,41 @@ export async function apiPrepareCfTerminalLogout(
   return outcome;
 }
 
+/**
+ * Session generation that `ensureSessionPermissions` last asked /users/me for.
+ * Keyed on `sessionGeneration`, so every login / logout / user switch re-arms it
+ * without a logout hook, and a failed read is not retried in a loop.
+ */
+let permissionsSelfHealGeneration: number | null = null;
+
+/**
+ * #9927 / #9586: the sidebar gates every permission-gated item on
+ * `user.permissions` and treats `undefined` as hidden. Some sessions reach the
+ * dashboard with a user object that never carried the field — the signup
+ * auto-login (`/auth/verify-email` returns a bare user), the forced-MFA
+ * hand-off, or a `breeze-auth` blob persisted before /users/me resolved — and
+ * nothing re-read /users/me until the next login-page sign-in.
+ *
+ * Called from the dashboard shell (AuthOverlay). Once the session has an access
+ * token and its user still has no permission list, pull /users/me once for this
+ * session generation. Missing permissions stay "hidden" until the server
+ * answers (a failed read leaves the nav closed); the API still enforces every
+ * permission server-side, so this only fixes what the nav shows.
+ */
+export function ensureSessionPermissions(): Promise<void> {
+  const { user, isAuthenticated, tokens, sessionGeneration } = useAuthStore.getState();
+  if (!isAuthenticated || !user || !tokens?.accessToken) return Promise.resolve();
+  if (Array.isArray(user.permissions)) return Promise.resolve();
+  if (permissionsSelfHealGeneration === sessionGeneration) return Promise.resolve();
+  permissionsSelfHealGeneration = sessionGeneration;
+  return fetchAndApplyPreferences();
+}
+
 export async function fetchAndApplyPreferences(): Promise<void> {
+  // Fence on the session: a same-document sign-out followed by another
+  // account's sign-in must never receive the previous account's /users/me
+  // (permissions, platform-admin flag, preferences, locale).
+  const generation = useAuthStore.getState().sessionGeneration;
   try {
     const response = await fetchWithAuth('/users/me');
     if (!response.ok) {
@@ -1976,6 +2076,17 @@ export async function fetchAndApplyPreferences(): Promise<void> {
     }
 
     const data = await response.json();
+    if (useAuthStore.getState().sessionGeneration !== generation) {
+      console.warn('[fetchAndApplyPreferences] session changed while /users/me was in flight; response dropped');
+      return;
+    }
+    // A refresh cookie for a different account than the persisted user (another
+    // tab signed in elsewhere) must not graft that account's grants onto it.
+    const storedUserId = useAuthStore.getState().user?.id;
+    if (typeof data.id === 'string' && storedUserId && data.id !== storedUserId) {
+      console.warn('[fetchAndApplyPreferences] /users/me answered for a different user; response dropped');
+      return;
+    }
     // isPlatformAdmin rides along with this refresh: fresh logins carry it in
     // the login payload, but sessions persisted before the field existed only
     // learn it here — without the merge, the platform-admin nav stays hidden
@@ -1987,6 +2098,10 @@ export async function fetchAndApplyPreferences(): Promise<void> {
     // the field existed still pick up their grants without a re-login.
     if (Array.isArray(data.permissions)) {
       useAuthStore.getState().updateUser({ permissions: data.permissions });
+    } else if (!Array.isArray(useAuthStore.getState().user?.permissions)) {
+      // The nav keeps every permission-gated item hidden in this state (#9927);
+      // make that diagnosable instead of a silently empty sidebar.
+      console.warn('[fetchAndApplyPreferences] GET /users/me returned no permissions list; gated navigation stays hidden');
     }
     // #4018: same rationale — the password-login path stores `data.user` from
     // /auth/login, which carries no hasPassword, and sessions persisted before
@@ -2077,6 +2192,7 @@ export async function apiVerifyEmail(token: string): Promise<{
   user?: User;
   tokens?: Tokens;
   status?: 'sign_in';
+  purchaseSelection?: LaunchPurchaseSelection;
   redirectUrl?: string;
 }> {
   try {
@@ -2095,7 +2211,8 @@ export async function apiVerifyEmail(token: string): Promise<{
     // Registration-completion path bounced to sign-in (address already taken).
     // 200 body but `verified: false` — surface the status, not success.
     if (data.verified === false && data.status === 'sign_in') {
-      return { success: false, error: 'already_registered', status: 'sign_in' };
+      const selected = launchPurchaseSelectionSchema.safeParse(data.purchaseSelection);
+      return { success: false, error: 'already_registered', status: 'sign_in', ...(selected.success ? { purchaseSelection: selected.data } : {}) };
     }
 
     return {

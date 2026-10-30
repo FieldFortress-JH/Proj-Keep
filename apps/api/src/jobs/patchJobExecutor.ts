@@ -24,9 +24,9 @@ import {
   coerceAppRuleList,
   type CategoryRule,
   type PolicyAppRule,
-  type PolicyAutoApproveConfig,
   type RingConfig,
 } from '../services/patchApprovalEvaluator';
+import { ringFeatureUpdatesSchema, DEFAULT_RING_FEATURE_UPDATES, type RingFeatureUpdates } from '@breeze/shared/validators';
 // W02 (#5748): the DB-facing resolver moved to patchEligibility.ts; the call
 // below and its behaviour are unchanged (golden-fixture parity test there).
 import { resolveApprovedPatchesForDevice } from '../services/patchEligibility';
@@ -43,17 +43,13 @@ import {
   type PatchDeviceTerminal,
 } from '../services/patchJobFinalizer';
 import { captureException } from '../services/sentry';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  linkRestorePointCommand,
+  restorePointPayloadField,
+} from '../services/restorePointRequest';
 import { attachWorkerObservability } from './workerObservability';
-
-// Strict shape for patches.policyAutoApprove as stored in the job JSONB.
-// deferralDays must be a valid non-negative integer when present — a malformed
-// value must NOT be coerced to 0, because that silently removes the deferral
-// safety window. Absent deferralDays is fine and defaults to 0.
-const jobPolicyAutoApproveSchema = z.object({
-  enabled: z.boolean(),
-  severities: z.array(z.string()),
-  deferralDays: z.number().int().min(0).optional(),
-});
 
 // Strict shape for one patches.categoryRules entry as stored in the job JSONB.
 // Matches the evaluator's CategoryRule: severityFilter is the legacy stored
@@ -112,6 +108,22 @@ export function parseJobAppRules(
     return undefined;
   }
   return rules;
+}
+
+/**
+ * Parse the ring's Windows feature-release policy from a job snapshot
+ * (`ringFeatureUpdates`). Absent → block: a job frozen before the control
+ * existed never offered feature releases, so block is what it meant. Present
+ * but malformed → block, loudly (never widen to allow).
+ */
+export function parseJobFeatureUpdates(value: unknown, patchJobId: string): RingFeatureUpdates {
+  if (value === undefined) return DEFAULT_RING_FEATURE_UPDATES;
+  const parsed = ringFeatureUpdatesSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.ringFeatureUpdates; treating Windows feature updates as blocked`;
+  console.warn(`${message}:`, JSON.stringify(value));
+  captureException(new Error(message));
+  return DEFAULT_RING_FEATURE_UPDATES;
 }
 
 const { db } = dbModule;
@@ -1115,7 +1127,7 @@ async function prepareDeviceExecution(
   }
 
   const [device] = await db
-    .select({ id: devices.id })
+    .select({ id: devices.id, osType: devices.osType })
     .from(devices)
     .where(and(eq(devices.id, deviceId), eq(devices.orgId, patchJob.orgId)))
     .limit(1);
@@ -1135,9 +1147,11 @@ async function prepareDeviceExecution(
     excludeCategories?: unknown;
     autoApprove?: unknown;
     sources?: unknown;
-    policyAutoApprove?: unknown;
+    // Frozen snapshots may also carry `policyAutoApprove`; it was never
+    // consulted by the evaluator and is not read (#8188).
     apps?: unknown;
     ringAppRules?: unknown;
+    ringFeatureUpdates?: unknown;
   };
   const targets = patchJob.targets as {
     deployment?: { rebootPolicy?: string; offlineBehavior?: string };
@@ -1166,26 +1180,10 @@ async function prepareDeviceExecution(
     return { kind: 'skipped', skipped: true, reason: 'Invalid patch source filter' };
   }
 
-  // Malformed auto-approve config degrades to disabled because silently
-  // ENABLING auto-approval is the dangerous direction.
-  let policyAutoApprove: PolicyAutoApproveConfig | undefined;
-  if (patchesConfig?.policyAutoApprove !== undefined) {
-    const parsed = jobPolicyAutoApproveSchema.safeParse(patchesConfig.policyAutoApprove);
-    if (parsed.success) {
-      policyAutoApprove = {
-        enabled: parsed.data.enabled,
-        severities: parsed.data.severities,
-        deferralDays: parsed.data.deferralDays ?? 0,
-      };
-    } else {
-      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.policyAutoApprove; treating as disabled`;
-      console.warn(`${message}:`, JSON.stringify(patchesConfig.policyAutoApprove));
-      captureException(new Error(message));
-    }
-  }
-
-  // App rules from the policy (`apps`) and from the ring (`ringAppRules`,
-  // #8184) are parsed identically and both enforced by the evaluator.
+  // App rules from the ring (`ringAppRules`, #8184) and the legacy `apps` key
+  // are parsed identically and both enforced by the evaluator. New snapshots
+  // no longer write `apps` (#8188), but jobs frozen before that still carry
+  // it, so it is still parsed.
   const jobApps = parseJobAppRules(patchesConfig?.apps, patchJobId, 'apps');
   const jobRingAppRules = parseJobAppRules(patchesConfig?.ringAppRules, patchJobId, 'ringAppRules');
   // A present-but-unparseable `ringAppRules` skips the device rather than
@@ -1232,7 +1230,7 @@ async function prepareDeviceExecution(
   }
 
   // Category rules were the one snapshot field cast blind while every sibling
-  // (sources, apps, policyAutoApprove, categories) is validated loudly — and a
+  // (sources, apps, categories) is validated loudly — and a
   // matching rule is now TERMINAL in the evaluator, so a malformed entry
   // silently became a deny. Mirror the apps posture: a rule with a usable
   // category but bad shape coerces to an explicit deny (fail-closed, matching
@@ -1275,9 +1273,9 @@ async function prepareDeviceExecution(
     categories: jobCategories,
     excludeCategories: jobExcludeCategories,
     sources: jobSources,
-    policyAutoApprove,
     apps: jobApps,
     ringAppRules: jobRingAppRules,
+    featureUpdates: parseJobFeatureUpdates(patchesConfig?.ringFeatureUpdates, patchJobId),
   };
 
   // If we have a ringId, load deferralDays and partnerId from the ring.
@@ -1313,15 +1311,51 @@ async function prepareDeviceExecution(
 
   // 3. Send install_patches command
   const patchIds = approvedPatches.map((p) => p.patchId);
-  const patchRecords = await db
-    .select({
-      id: patches.id,
-      source: patches.source,
-      externalId: patches.externalId,
-      title: patches.title,
-    })
-    .from(patches)
-    .where(inArray(patches.id, patchIds));
+
+  // #4609 W05: the System Restore checkpoint decision is made HERE, when the
+  // concrete per-device command is created. Null (no policy, non-Windows)
+  // leaves the payload exactly as it was before the feature. A resolution
+  // failure fails this device visibly rather than dispatching an install the
+  // policy may have wanted protected.
+  let restorePoint;
+  try {
+    restorePoint = await buildRestorePointRequest({
+      deviceId,
+      orgId,
+      osType: device.osType,
+      trigger: 'patch',
+      label: `install ${patchIds.length} update${patchIds.length === 1 ? '' : 's'}`,
+      patchJobId,
+    });
+  } catch (err) {
+    console.error(
+      `[PatchJobExecutor] System Restore checkpoint policy resolution failed for device ${deviceId}:`,
+      err instanceof Error ? err.message : err,
+    );
+    captureException(err);
+    await markDeviceSkipped(patchJobId, deviceId, 'error_resolving_restore_point');
+    return { kind: 'error', error: 'Failed to resolve the System Restore checkpoint policy' };
+  }
+
+  let patchRecords;
+  try {
+    patchRecords = await db
+      .select({
+        id: patches.id,
+        source: patches.source,
+        externalId: patches.externalId,
+        title: patches.title,
+        // Only alongside a stamped block: the agent's definitions-only skip
+        // (W07) needs it, and without a block the payload stays byte-identical.
+        ...(restorePoint ? { category: patches.category } : {}),
+      })
+      .from(patches)
+      .where(inArray(patches.id, patchIds));
+  } catch (err) {
+    // No command can exist yet, so the requested row would be a false record.
+    await discardRestorePointRequest(restorePoint);
+    throw err;
+  }
 
   // Enqueue through the single dispatch seam so offline devices can wait for delivery.
   // `patchJobId` is now in the payload: it is what lets a result arriving days
@@ -1341,12 +1375,14 @@ async function prepareDeviceExecution(
   const res = await dispatchDeviceCommand({
     deviceId,
     type: 'install_patches',
-    payload: { patchJobId, patchIds, patches: patchRecords },
+    payload: { patchJobId, patchIds, patches: patchRecords, ...restorePointPayloadField(restorePoint) },
     expectedOrgId: patchJob.orgId,
     offlinePolicy: offline.policy,
   });
 
   if (!res.ok) {
+    // No command exists, so nothing was asked of the agent.
+    await discardRestorePointRequest(restorePoint);
     // An offline device with `offlineBehavior: 'skip'` is still recorded
     // skipped, with the seam's own code as the reason. A stale-deadline
     // fallback gets its own reason so it is not mistaken for a configured skip.
@@ -1362,9 +1398,12 @@ async function prepareDeviceExecution(
 
   const commandId = res.command?.id;
   if (!commandId) {
+    await discardRestorePointRequest(restorePoint);
     await markDeviceSkipped(patchJobId, deviceId, 'command_creation_failed');
     return { kind: 'error', error: 'Failed to create command' };
   }
+
+  await linkRestorePointCommand(restorePoint, commandId);
 
   if (res.delivery === 'queued_offline') {
     await recordDeviceQueued(patchJobId, deviceId, approvedPatches);

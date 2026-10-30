@@ -192,6 +192,29 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['credits_exhausted', { error: 'out of credits', code: 'credits_exhausted' }],
+      ['plan_not_eligible', { error: 'out of credits', code: 'plan_not_eligible' }],
+      [undefined, { error: 'out of credits' }],
+    ] as const)('returns a gate denial (%s) as 402 with its code (#9450)', async (billingCode, expected) => {
+      vi.mocked(runPreFlightChecks).mockResolvedValue({
+        ok: false,
+        error: 'out of credits',
+        status: 402,
+        ...(billingCode ? { billingCode } : {}),
+      });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(402);
+      expect(await res.json()).toEqual(expected);
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
     it('returns ai_not_configured as 503 before touching the SDK manager', async () => {
       vi.mocked(runPreFlightChecks).mockResolvedValue({ ok: false, error: 'ai_not_configured', status: 503 });
 
@@ -226,8 +249,11 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
 
     it('#3127: waits and reserves with no DB context held; reads and writes each run in a short one', async () => {
       const depths: Record<string, number> = {};
-      vi.mocked(runPreFlightChecks).mockImplementation(async () => {
+      vi.mocked(runPreFlightChecks).mockImplementation(async (...args) => {
+        // #10415: called with no context held, handed a runner that opens one
+        // per DB phase (the Redis rate limit runs between phases).
         depths.preflight = dbCtx.depth;
+        await args[6]!(async () => { depths.preflightPhase = dbCtx.depth; });
         return {
           ok: true,
           session: {
@@ -286,7 +312,7 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
 
       expect(res.status).toBe(200);
       await res.text();
-      expect(depths).toEqual({ preflight: 1, settle: 0, reserve: 0, getOrCreate: 1, insert: 1 });
+      expect(depths).toEqual({ preflight: 0, preflightPhase: 1, settle: 0, reserve: 0, getOrCreate: 1, insert: 1 });
       expect(activeSession.inputController.pushMessage).toHaveBeenCalledWith('Hello');
       expect(dbCtx.depth).toBe(0);
     });

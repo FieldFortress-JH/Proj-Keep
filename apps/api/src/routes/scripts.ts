@@ -27,6 +27,11 @@ import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/pe
 import { writeRouteAudit } from '../services/auditEvents';
 import { executeScriptOnDevices } from '../services/scriptExecution';
 import {
+  resolveScriptRunTargets,
+  type ResolvedScriptRunGroup,
+  type ScriptRunTargetFailureCode,
+} from '../services/scriptRunTargets';
+import {
   canManagePartnerWidePolicies,
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
 } from '../services/partnerWideAccess';
@@ -51,6 +56,8 @@ import {
 import { scriptBundleRoutes } from './scriptBundle';
 import { cloneScript, isScriptCloneError } from '../services/scriptClone';
 import { cutScriptVersion } from '../services/scriptVersions';
+import { scriptExecutionRestorePointSql } from '../services/restorePointInline';
+import { scriptLastRunAtSql, type ScriptLastRunScope } from '../services/scriptLastRun';
 
 import {
   MAX_GRACE_SECONDS,
@@ -368,6 +375,11 @@ scriptRoutes.get(
     // Exclude soft-deleted scripts
     conditions.push(isNull(scripts.deletedAt) as ReturnType<typeof eq>);
 
+    // #9563 — whose executions may feed each row's lastRunAt. Set alongside
+    // the script-visibility filter below so the two cannot drift: a caller
+    // never sees a run from an org it could not list scripts for.
+    let lastRunScope: ScriptLastRunScope = { kind: 'all' };
+
     // Filter by org access based on scope
     if (auth.scope === 'organization') {
       if (!auth.orgId) {
@@ -378,6 +390,7 @@ scriptRoutes.get(
       if (auth.partnerId) ors.push(eq(scripts.partnerId, auth.partnerId));
       if (query.includeSystem === 'true') ors.push(eq(scripts.isSystem, true));
       conditions.push(or(...ors) as ReturnType<typeof eq>);
+      lastRunScope = { kind: 'orgs', orgIds: [auth.orgId] };
     } else if (auth.scope === 'partner') {
       if (query.orgId) {
         const hasAccess = ensureOrgAccess(query.orgId, auth);
@@ -388,6 +401,7 @@ scriptRoutes.get(
         if (auth.partnerId) ors.push(eq(scripts.partnerId, auth.partnerId));
         if (query.includeSystem === 'true') ors.push(eq(scripts.isSystem, true));
         conditions.push(or(...ors) as ReturnType<typeof eq>);
+        lastRunScope = { kind: 'orgs', orgIds: [query.orgId] };
       } else {
         const orgIds = auth.accessibleOrgIds ?? [];
         const ors: ReturnType<typeof eq>[] = [];
@@ -396,10 +410,12 @@ scriptRoutes.get(
         if (query.includeSystem === 'true') ors.push(eq(scripts.isSystem, true) as ReturnType<typeof eq>);
         if (ors.length === 0) return c.json({ data: [], pagination: { page, limit, total: 0 } });
         conditions.push(or(...ors) as ReturnType<typeof eq>);
+        lastRunScope = { kind: 'orgs', orgIds };
       }
     } else if (auth.scope === 'system') {
       if (query.orgId) {
         conditions.push(eq(scripts.orgId, query.orgId));
+        lastRunScope = { kind: 'orgs', orgIds: [query.orgId] };
       }
       // System scope sees everything, no additional filter needed
     }
@@ -453,6 +469,9 @@ scriptRoutes.get(
             AND sv.version = ${sql.identifier('scripts')}.${sql.identifier('version')}
             AND sv.review_id IS NOT NULL
         )`,
+        // #9563 — newest execution per script, as a correlated subquery so
+        // the page stays one statement with its LIMIT/OFFSET intact.
+        lastRunAt: scriptLastRunAtSql(lastRunScope, getAllowedSiteIds(c)),
       })
       .from(scripts)
       .where(whereCondition)
@@ -468,12 +487,13 @@ scriptRoutes.get(
 
     return c.json({
       // A row from a pre-existing test mock (or a stale read path) may lack
-      // these two fields entirely — default to a plain, unreviewed human
-      // script rather than surface `undefined` to the client.
+      // these fields entirely — default to a plain, unreviewed human script
+      // that never ran rather than surface `undefined` to the client.
       data: scriptList.map((row: Record<string, unknown>) => ({
         ...row,
         origin: row.origin ?? 'human',
         reviewedAtHead: row.reviewedAtHead ?? false,
+        lastRunAt: row.lastRunAt ?? null,
       })),
       pagination: { page, limit, total }
     });
@@ -1299,6 +1319,53 @@ scriptRoutes.post(
     const auth = c.get('auth');
     const { id: scriptId } = c.req.valid('param');
     const data = c.req.valid('json');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+
+    // #8598 — a device-group `target` is resolved to concrete device ids HERE,
+    // in its own short context that commits before dispatch (#7103: no
+    // connection is held across the dispatch loop). From this point on the run
+    // is an ordinary explicit-device run: the admission pipeline below applies
+    // org access, the site allowlist, OS, maintenance and decommission checks
+    // per device exactly as it does for `deviceIds`.
+    let groupRun: {
+      target: NonNullable<typeof data.target>;
+      warnings: string[];
+      resolvedGroups: ResolvedScriptRunGroup[];
+    } | null = null;
+    let deviceIds: string[];
+    if (data.target) {
+      const target = data.target;
+      const resolution = await withAuthDbAccessContext(auth, () => resolveScriptRunTargets({
+        auth,
+        permissions,
+        target,
+      }));
+      if (!resolution.ok) {
+        auditScriptGroupTarget(c, {
+          scriptId,
+          orgId: singleOrgId(resolution.resolvedGroups) ?? auth.orgId ?? null,
+          target,
+          resolvedGroups: resolution.resolvedGroups ?? [],
+          deviceIds: [],
+          count: resolution.count ?? 0,
+          outcome: 'rejected',
+          code: resolution.code,
+        });
+        return c.json({
+          error: resolution.error,
+          code: resolution.code,
+          ...(resolution.groupIds ? { groupIds: resolution.groupIds } : {}),
+          ...(resolution.count !== undefined ? { count: resolution.count } : {}),
+          ...(resolution.perGroupCounts ? { perGroupCounts: resolution.perGroupCounts } : {}),
+          ...(resolution.warnings?.length ? { warnings: resolution.warnings } : {}),
+        }, resolution.status);
+      }
+      groupRun = { target, warnings: resolution.warnings, resolvedGroups: resolution.resolvedGroups };
+      deviceIds = resolution.deviceIds;
+    } else {
+      // The schema's exactly-one-of refine guarantees deviceIds here.
+      deviceIds = data.deviceIds!;
+    }
 
     // #7103 — registered in middleware/selfManagedDbContextRoutes.ts, so no
     // request transaction is held here. The service reads and creates every
@@ -1307,21 +1374,48 @@ scriptRoutes.post(
     // row the result path cannot see yet.
     const result = await executeScriptOnDevices({
       scriptId,
-      deviceIds: data.deviceIds,
+      deviceIds,
       parameters: data.parameters,
       triggerType: data.triggerType,
       runAs: data.runAs,
       targetSessionId: data.targetSessionId,
       auth,
-      permissions: c.get('permissions') as UserPermissions | undefined,
+      permissions,
       runInDbContext: (fn) => withAuthDbAccessContext(auth, fn),
     });
 
     if (!result.ok) {
+      if (groupRun) {
+        auditScriptGroupTarget(c, {
+          scriptId,
+          orgId: singleOrgId(groupRun.resolvedGroups) ?? auth.orgId ?? null,
+          target: groupRun.target,
+          resolvedGroups: groupRun.resolvedGroups,
+          deviceIds,
+          count: deviceIds.length,
+          outcome: 'rejected',
+          code: 'SCRIPT_NOT_FOUND',
+        });
+      }
       return c.json({ error: result.error }, result.status);
     }
 
-    if (result.admission.targets.some((target) => target.admission === 'admitted')) {
+    const anyAdmitted = result.admission.targets.some((target) => target.admission === 'admitted');
+    if (groupRun) {
+      auditScriptGroupTarget(c, {
+        scriptId,
+        scriptName: result.script.name,
+        orgId: result.auditOrgId,
+        target: groupRun.target,
+        resolvedGroups: groupRun.resolvedGroups,
+        deviceIds,
+        count: deviceIds.length,
+        outcome: anyAdmitted ? 'admitted' : 'none_admitted',
+        requestId: result.admission.requestId,
+      });
+    }
+
+    if (anyAdmitted) {
       const batchIds = [...new Set(
         result.admission.targets.flatMap((target) => target.batchId ? [target.batchId] : []),
       )];
@@ -1340,13 +1434,60 @@ scriptRoutes.post(
           runAs: result.runAs,
           // Keys only. Caller-supplied values must never enter the audit row.
           ignoredParameterKeys: result.ignoredParameters,
+          // #8598 — only on group-target runs; a deviceIds run's row is unchanged.
+          ...(groupRun ? { target: groupRun.target, resolvedGroups: groupRun.resolvedGroups } : {}),
         }
       });
     }
 
-    return c.json(result.admission, 201);
+    // Additive, and only on group-target runs: a deviceIds response is unchanged.
+    return c.json(groupRun ? { ...result.admission, warnings: groupRun.warnings } : result.admission, 201);
   }
 );
+
+function singleOrgId(groups: ResolvedScriptRunGroup[] | undefined): string | null {
+  const orgIds = new Set((groups ?? []).map((group) => group.orgId));
+  return orgIds.size === 1 ? [...orgIds][0]! : null;
+}
+
+/**
+ * #8598 — `script.execute` is written only when at least one target is
+ * admitted, so a group run where every device was refused, excluded or
+ * suppressed (or the request itself was rejected) would leave no record of
+ * which groups were asked for. This row is written for EVERY group-target
+ * request that reaches resolution, admitted or not. `deviceIds` is the set
+ * resolved for this run, so the record survives later membership changes.
+ */
+function auditScriptGroupTarget(c: Parameters<typeof writeRouteAudit>[0], input: {
+  scriptId: string;
+  scriptName?: string;
+  orgId: string | null;
+  target: { type: 'groups'; groupIds: string[] };
+  resolvedGroups: ResolvedScriptRunGroup[];
+  deviceIds: string[];
+  count: number;
+  outcome: 'admitted' | 'none_admitted' | 'rejected';
+  code?: ScriptRunTargetFailureCode | 'SCRIPT_NOT_FOUND';
+  requestId?: string;
+}): void {
+  writeRouteAudit(c, {
+    orgId: input.orgId,
+    action: 'script.execute_group_target',
+    resourceType: 'script',
+    resourceId: input.scriptId,
+    ...(input.scriptName ? { resourceName: input.scriptName } : {}),
+    result: input.outcome === 'rejected' ? 'failure' : 'success',
+    details: {
+      target: input.target,
+      resolvedGroups: input.resolvedGroups,
+      deviceIds: input.deviceIds,
+      count: input.count,
+      outcome: input.outcome,
+      ...(input.code ? { code: input.code } : {}),
+      ...(input.requestId ? { requestId: input.requestId } : {}),
+    },
+  });
+}
 
 // GET /scripts/:id/executions - List executions for a script
 scriptRoutes.get(
@@ -1424,7 +1565,11 @@ scriptRoutes.get(
         runAs: scriptExecutions.runAs,
         targetSessionId: scriptExecutions.targetSessionId,
         deviceHostname: devices.hostname,
-        deviceOsType: devices.osType
+        deviceOsType: devices.osType,
+        // #9563 — a `queued` row only says the command was not delivered (no
+        // live agent session); the device's own status is what tells the UI
+        // whether it is actually offline or just awaiting pickup.
+        deviceStatus: devices.status
       })
       .from(scriptExecutions)
       .leftJoin(devices, eq(scriptExecutions.deviceId, devices.id))
@@ -1472,6 +1617,9 @@ scriptRoutes.get(
         // NULL for every run that emitted no marker. Wave 2 renders it; without
         // it here the summary would be stored but unreachable by any caller.
         customFieldResult: scriptExecutions.customFieldResult,
+        // #4759 — newest System Restore ledger row for this execution (NULL
+        // when Breeze never asked). Drives the inline badge in ExecutionDetails.
+        restorePoint: scriptExecutionRestorePointSql(scriptExecutions.id),
         createdAt: scriptExecutions.createdAt,
         // #4888 — see the list endpoint above.
         runAs: scriptExecutions.runAs,
@@ -1488,6 +1636,8 @@ scriptRoutes.get(
         approvalMethod: scriptExecutions.approvalMethod,
         deviceHostname: devices.hostname,
         deviceOsType: devices.osType,
+        // #9563 — see the list endpoint above.
+        deviceStatus: devices.status,
         deviceOrgId: devices.orgId,
         deviceSiteId: devices.siteId
       })

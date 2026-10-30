@@ -216,7 +216,7 @@ import {
   verifyIdTokenSignature,
 } from '../services/sso';
 import { mintStepUpGrant } from '../services/mfaStepUpGrant';
-import { writeRouteAudit } from '../services/auditEvents';
+import { derivePartnerAttribution, writeRouteAudit } from '../services/auditEvents';
 import { authMiddleware } from '../middleware/auth';
 import { withHostTimeZone } from '../testUtils/hostTimeZone';
 
@@ -224,6 +224,7 @@ const USER_ID = '00000000-0000-4000-8000-000000000020';
 const OTHER_USER_ID = '00000000-0000-4000-8000-0000000000aa';
 const PROVIDER_ID = '00000000-0000-4000-8000-000000000001';
 const ORG_ID = '00000000-0000-4000-8000-000000000010';
+const PARTNER_ID = '00000000-0000-4000-8000-0000000000b0';
 const SID = '00000000-0000-4000-8000-0000000000fa';
 
 const ACTIVE_OIDC_PROVIDER = {
@@ -245,6 +246,21 @@ const ACTIVE_OIDC_PROVIDER = {
   attributeMapping: { email: 'email', name: 'name' },
   defaultRoleId: null
 };
+
+// A partner-axis provider (DB CHECK: org_id XOR partner_id).
+const PARTNER_OIDC_PROVIDER = { ...ACTIVE_OIDC_PROVIDER, orgId: null, partnerId: PARTNER_ID };
+
+// #9377: the partner_id the audit row would PERSIST for this writeRouteAudit
+// call. writeRouteAudit is mocked here, so feed its argument to the real
+// derivation with a no-auth, no-ambient-scope context — exactly the state of
+// the unauthenticated /callback, where the only attribution source left is an
+// explicit top-level `partnerId` (a `details.partnerId` is not one).
+const persistedPartnerIdFor = (action: string, reason?: string): Array<string | null> =>
+  vi.mocked(writeRouteAudit).mock.calls
+    .map(([, event]) => event)
+    .filter((event) => event.action === action
+      && (reason === undefined || (event.details as { reason?: unknown } | undefined)?.reason === reason))
+    .map((event) => derivePartnerAttribution({ req: { header: () => undefined } } as any, event));
 
 describe('POST /sso/reauth/start', () => {
   let app: Hono;
@@ -381,6 +397,26 @@ describe('POST /sso/reauth/start', () => {
     // the precedent at sso.test.ts:1082-1083.
     expect(runOutsideDbContext).toHaveBeenCalled();
     expect(withSystemDbAccessContext).toHaveBeenCalled();
+  });
+
+  // #9377: symmetric with the callback rows below — the started row names the
+  // provider's partner explicitly instead of relying on the caller's scope.
+  it('attributes sso.reauth.started to the partner for a partner-level provider', async () => {
+    mockUserRow({ id: USER_ID, passwordHash: null });
+    mockSsoIdentityRows([{ providerId: PROVIDER_ID }]);
+    mockProviderRow(PARTNER_OIDC_PROVIDER);
+    captureInsert();
+
+    const res = await app.request('/sso/reauth/start', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: 'sso.reauth.started', orgId: null, partnerId: PARTNER_ID })
+    );
   });
 
   // #4018 Finding 1: the entire plan hinges on this route NOT being gated by
@@ -908,6 +944,76 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(mintStepUpGrant).not.toHaveBeenCalled();
   });
 
+  // #8862: Entra answers max_age=0 with an id_token that is already expired on
+  // arrival. The verify failure used to fall into the shared catch and dump a
+  // signed-in user on /login?error=sso_error, abandoning enrollment.
+  it('keeps an id_token verification failure on the profile page, namespaced and audited', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    primeReauthCallback();
+    vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+      new Error('ID token signature verification failed: "exp" claim timestamp check failed')
+    );
+
+    const res = await doCallback();
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=idp_verify_failed');
+    expect(mintStepUpGrant).not.toHaveBeenCalled();
+    expect(getUserInfo).not.toHaveBeenCalled();
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        result: 'denied',
+        details: expect.objectContaining({ mode: 'reauth', reason: 'idp_verify_failed', userId: USER_ID }),
+      })
+    );
+    expect(writeRouteAudit).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: 'sso.reauth.completed' })
+    );
+  });
+
+  // A nonce mismatch is a replay/injection signal, not an IdP clock quirk: the
+  // audit row must say which, even though the user-facing code stays coarse.
+  it.each([
+    ['nonce', 'nonce'],
+    ['claims', 'claims'],
+    ['timing', 'timing'],
+    ['evil', 'unknown'],
+    [undefined, 'unknown'],
+  ] as const)('records failureKind=%s on the audit row (as %s)', async (thrownKind, auditedKind) => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    primeReauthCallback();
+    vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+      Object.assign(new Error('Invalid nonce'), thrownKind ? { failureKind: thrownKind } : {})
+    );
+
+    const res = await doCallback();
+
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=idp_verify_failed');
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        details: expect.objectContaining({ reason: 'idp_verify_failed', failureKind: auditedKind }),
+      })
+    );
+  });
+
+  it('verifies the re-auth id_token with the bounded clock tolerance', async () => {
+    primeReauthCallback();
+
+    await doCallback();
+
+    expect(verifyIdTokenSignature).toHaveBeenCalledWith(
+      'h.p.s',
+      expect.anything(),
+      'nonce',
+      { clockToleranceSeconds: 300, mode: 'reauth' }
+    );
+  });
+
   // #4045: the mint site now picks the grant's PURPOSE from the account's
   // factor state (via the same userIsMfaProtected predicate both redemption
   // sites use). An unprotected account gets enroll_first_factor — the only
@@ -988,5 +1094,100 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
     expect(createTokenPair).not.toHaveBeenCalled();
     expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  // ── #9377: partner-level provider rows reach the partner's audit trail ──
+  //
+  // /callback is unauthenticated: no request auth and no ambient partner
+  // scope. For a partner provider orgId is NULL, so unless partnerId is passed
+  // top-level the row persists partner_id NULL and the partner audit view
+  // (org_id IS NULL AND partner_id = caller) never shows it.
+  describe('partner-level provider audit attribution (#9377)', () => {
+    it('sso.reauth.completed', async () => {
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+      expect(persistedPartnerIdFor('sso.reauth.completed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — idp_verify_failed (the failureKind replay/nonce row)', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+      vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+        Object.assign(new Error('Invalid nonce'), { failureKind: 'nonce' })
+      );
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.reauth.rejected', 'idp_verify_failed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — not fresh', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', auth_time: secondsAgo(3600) },
+      });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toContain('ssoReauthError=reauth_not_fresh');
+      expect(persistedPartnerIdFor('sso.reauth.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — binding failure', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        reauthUser: { ...ACTIVE_REAUTH_USER, status: 'suspended' },
+      });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toContain('ssoReauthError=session_invalid');
+      expect(persistedPartnerIdFor('sso.reauth.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — grant_mint_failed', async () => {
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+      vi.mocked(mintStepUpGrant).mockResolvedValueOnce(null);
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.reauth.rejected', 'grant_mint_failed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.callback.rejected — provider generation changed mid-flight', async () => {
+      primeReauthCallback({ provider: { ...PARTNER_OIDC_PROVIDER, configVersion: 8 } });
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.callback.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.callback.rejected — email_verified=false', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', email_verified: false, auth_time: secondsAgo(5) },
+      });
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.callback.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    // Control: an org-level provider's rows stay org rows (partner_id NULL is
+    // the DB CHECK audit_logs_partner_only_without_org_chk invariant).
+    it('keeps an org-level provider row org-attributed with no partner_id', async () => {
+      primeReauthCallback();
+
+      await doCallback();
+
+      expect(writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: 'sso.reauth.completed', orgId: ORG_ID })
+      );
+      expect(persistedPartnerIdFor('sso.reauth.completed')).toEqual([null]);
+    });
   });
 });

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { approvalFriendly } from '../../lib/ticketApproval';
 import { Loader2 } from 'lucide-react';
 import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
@@ -129,6 +130,12 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
 
   const issue = useCallback(async (alsoSend: boolean, opts?: ComposedInvoiceEmail) => {
     if (issuing) return;
+    // Issue's own 409 refusals: held for a block of hours (#8970), then the
+    // customer-approval codes (409 SOURCE_AWAITING_APPROVAL, #8196).
+    const approval = approvalFriendly(stableT);
+    const issueFriendly = (code: string) => (code === 'SOURCE_HELD_FOR_HOUR_BLOCK'
+      ? stableT('invoiceActions.sourceHeldForHourBlock')
+      : approval(code));
     setIssuing(true);
     try {
       if (alsoSend) {
@@ -142,6 +149,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
             body: JSON.stringify(opts ?? {}),
           }),
           errorFallback: stableT('invoiceActions.issueSendError'),
+          friendly: issueFriendly,
           onUnauthorized: UNAUTHORIZED,
         });
         if (result?.data?.reason === 'notice_queued') {
@@ -156,6 +164,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
           request: () => fetchWithAuth(`/invoices/${invoice.id}/issue`, { method: 'POST' }),
           errorFallback: stableT('invoiceActions.issueError'),
           successMessage: stableT('invoiceActions.issueSuccess'),
+          friendly: issueFriendly,
           onUnauthorized: UNAUTHORIZED,
         });
       }
@@ -575,6 +584,12 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         onSend={(opts) => isDraft ? void issue(true, opts) : void resend(opts)}
         orgId={invoice.orgId}
         invoiceNumber={invoice.invoiceNumber}
+        dueDate={invoice.dueDate}
+        currencyCode={currency}
+        amountPaid={invoice.amountPaid}
+        balance={invoice.balance}
+        depositDue={invoice.depositDue ?? null}
+        documentLocale={invoice.documentLocale ?? null}
         isDraft={isDraft}
         title={isDraft
           ? t('invoiceActions.issueSendConfirm.title')

@@ -130,6 +130,7 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'devices', action: 'write', description: 'Create and update devices' },
   { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },
   { resource: 'devices', action: 'execute', description: 'Execute commands on devices' },
+  { resource: 'devices', action: 'recover_agent', description: 'Restart or start the agent through the watchdog' },
 
   { resource: 'agent_rollback', action: 'create', description: 'Authorize a signed agent rollback' },
 
@@ -204,6 +205,9 @@ export const DEFAULT_PERMISSIONS = [
   // Agreement templates + signed agreements (agreements vocabulary & IA split, W02).
   { resource: 'agreements', action: 'read', description: 'View agreement templates and signed agreements' },
   { resource: 'agreements', action: 'write', description: 'Create, edit, publish and archive agreement templates; link signed agreements' },
+  // #9075 W2a (OD7 B): send / copy link / void / remind / record-signed. Byte-identical
+  // to 2027-01-05-110000-agreements-send-permission.sql (seed.test.ts asserts it).
+  { resource: 'agreements', action: 'send', description: 'Send agreements for signature, copy signing links, void requests, and record agreements signed elsewhere' },
 
   // Quotes / Proposals (billing program)
   { resource: 'quotes', action: 'read', description: 'View quotes and proposals' },
@@ -235,6 +239,10 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'sites', action: 'write', description: 'Create and edit sites' },
   { resource: 'sites', action: 'delete', description: 'Delete sites' },
   { resource: 'sites', action: 'set_location', description: "Pin a site's map location from the field" },
+
+  // Endpoint messaging (#8741)
+  { resource: 'endpoint_messages', action: 'send', description: "Send messages to end users' desktops" },
+  { resource: 'endpoint_messages', action: 'read', description: 'View sent endpoint messages and delivery receipts' },
 
   // Remote access
   { resource: 'remote', action: 'access', description: 'Remote access to devices' },
@@ -273,6 +281,10 @@ export const DEFAULT_PERMISSIONS = [
   // it. Granted to no system role; partners grant it deliberately.
   { resource: 'ai_models', action: 'premium',
     description: 'Use AI model offerings that require the premium-model permission' },
+  // Wisp W02 (spec §4.6): execute-class gate on the sandbox workspace tools.
+  // Granted to no system role by name; Partner Admin matches it via `*:*`.
+  { resource: 'ai_workspace', action: 'execute',
+    description: 'Stage, run and collect code in AI sandbox workspaces' },
 
   // Tool sources (BYO MCP/OpenAPI tool catalog, #5215/#5216, spec 2026-09-07 §5):
   // managing the registrations is an admin task; calling the tools they expose
@@ -349,7 +361,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     forceMfa: false,
     permissions: [
       'backup:read', 'backup:write',
-      'devices:read', 'devices:execute',
+      'devices:read', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:execute',
       'alerts:read', 'alerts:acknowledge',
       // #4251: a technician works tickets — comments, status, assignment — and
@@ -402,7 +415,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'quotes:read', 'quotes:write', 'quotes:send', 'quotes:accept',
       'invoices:read', 'invoices:write', 'invoices:send', 'invoices:export',
       'contracts:read', 'contracts:write', 'contracts:manage',
-      'agreements:read', 'agreements:write'
+      'agreements:read', 'agreements:write', 'agreements:send'
     ]
   },
   {
@@ -425,7 +438,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     forceMfa: false,
     permissions: [
       'backup:read', 'backup:write', 'backup:cross_site_restore',
-      'devices:read', 'devices:write', 'devices:delete', 'devices:execute',
+      'devices:read', 'devices:write', 'devices:delete', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:write', 'scripts:delete', 'scripts:execute',
       'alerts:read', 'alerts:write', 'alerts:acknowledge',
       'tickets:read', 'tickets:write', 'tickets:manage', 'tickets:record_approval',
@@ -489,7 +503,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     description: 'Execute scripts and manage devices',
     forceMfa: false,
     permissions: [
-      'devices:read', 'devices:write', 'devices:execute',
+      'devices:read', 'devices:write', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:execute',
       'alerts:read', 'alerts:acknowledge',
       'tickets:read',

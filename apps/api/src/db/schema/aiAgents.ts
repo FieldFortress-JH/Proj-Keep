@@ -171,6 +171,10 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   computeWallMs: bigint('compute_wall_ms', { mode: 'number' }),
   computeCents: integer('compute_cents'),
   computeReservedCents: integer('compute_reserved_cents'),
+  // #9451: this attempt's compute settlement claim (every billing source).
+  // Only the settle that sets it writes compute_cents, the rollups and the
+  // credit debit intent; the enqueue_failed reclaim (a new attempt) clears it.
+  computeSettledAt: timestamp('compute_settled_at', { withTimezone: true }),
   workspaceId: uuid('workspace_id'),
   errorCode: varchar('error_code', { length: 64 }),
   correlationId: varchar('correlation_id', { length: 64 }),
@@ -195,6 +199,24 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   taskId: uuid('task_id'),
   taskStepKey: text('task_step_key'),
   taskAttemptOrdinal: integer('task_attempt_ordinal'),
+  // Wisp W02 (Wisp design §4.3): the delegation grant + the revision this run
+  // was admitted under. Both NULL for every non-Wisp run, both set otherwise
+  // (`ai_agent_runs_grant_link_chk`). FKs (grant_revision_id, grant_id) ->
+  // wisp_grant_revisions(id, grant_id) (ON DELETE SET NULL, erasure only) and
+  // grant_id -> wisp_grants(id) (ON DELETE RESTRICT) are SQL-ONLY
+  // (migrations/2027-01-04-100100-wisp-grants.sql), like `taskId` above.
+  grantId: uuid('grant_id'),
+  grantRevisionId: uuid('grant_revision_id'),
+  // Wisp W07 (w00 A11): specialist lineage. A child run requested by Wisp's
+  // assessment run carries depth 1, the requesting run and the grant revision
+  // the request was made under; every other row is depth 0 with both NULL
+  // (`ai_agent_runs_depth_chk`). FKs are SQL-ONLY
+  // (migrations/2027-01-05-100400-wisp-specialist-lineage.sql): the
+  // (requested_by_run_id, org_id) self-FK uses `ON DELETE SET NULL
+  // (requested_by_run_id)`, which Drizzle cannot model.
+  requestedByRunId: uuid('requested_by_run_id'),
+  parentGrantRevisionId: uuid('parent_grant_revision_id'),
+  depth: smallint('depth').notNull().default(0),
   // Spec §6.2: no prompt registry exists yet, so runs 1 and 4 of one task may
   // use different released prompts. That drift is accepted but must be
   // RECORDED. `resolvedModel` because runLoop.ts may fall back to the org's
@@ -217,6 +239,8 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   servedFailoverHop: smallint('served_failover_hop'),
   /** W09: why it failed over; restores the ledger provenance on a re-driven run. */
   servedFailoverCause: text('served_failover_cause'),
+  /** #7787: the offering the run was routed to BEFORE its failover (the ledger's failover_from_offering_id). No FK (provenance id). */
+  servedFailoverFromOfferingId: uuid('served_failover_from_offering_id'),
 }, (table) => ({
   // Tenant-scoped (see 2026-09-02-ai-agents.sql): a global unique on
   // dedupe_key is enforced below RLS and leaks cross-tenant existence.

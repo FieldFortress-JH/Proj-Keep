@@ -9,11 +9,14 @@ import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 
 vi.mock('../../stores/auth', () => ({
-  fetchWithAuth: vi.fn()
+  fetchWithAuth: vi.fn(),
+  waitForPendingRefresh: vi.fn().mockResolvedValue(undefined)
 }));
 
+const storeFetchOrganizations = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const storeSelectOrganization = vi.hoisted(() => vi.fn());
 vi.mock('../../stores/orgStore', () => ({
-  useOrgStore: vi.fn()
+  useOrgStore: Object.assign(vi.fn(), { getState: () => ({ fetchOrganizations: storeFetchOrganizations, selectOrganization: storeSelectOrganization, recordRecentOrg: vi.fn() }) })
 }));
 
 vi.mock('../shared/Toast', () => ({
@@ -317,6 +320,35 @@ describe('OrgSettingsPage general tab — name editing', () => {
     });
   });
 
+  it('refreshes the global org store (header switcher) after a successful rename (#8371)', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({ ...orgDetails, name: 'Acme IT' }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+    render(<OrgSettingsPage orgId="org-1" />);
+    const input = (await screen.findByTestId('org-name-input')) as HTMLInputElement;
+    await userEvent.clear(input);
+    await userEvent.type(input, 'Acme IT');
+    await userEvent.click(screen.getByTestId('org-name-save'));
+    await waitFor(() => expect(storeFetchOrganizations).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not refresh the org store when the rename fails (#8371)', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({ error: 'nope' }, false, 500));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+    render(<OrgSettingsPage orgId="org-1" />);
+    const input = (await screen.findByTestId('org-name-input')) as HTMLInputElement;
+    await userEvent.clear(input);
+    await userEvent.type(input, 'Acme IT');
+    await userEvent.click(screen.getByTestId('org-name-save'));
+    await waitFor(() => expect(fetchWithAuthMock.mock.calls.some(([, i]) => i?.method === 'PATCH')).toBe(true));
+    expect(storeFetchOrganizations).not.toHaveBeenCalled();
+  });
+
   it('re-fetches and reflects the server-returned name after a successful save', async () => {
     // Server normalizes the name; the input should reflect the refetched value.
     fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
@@ -423,6 +455,18 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
     await screen.findByTestId('org-name-input');
     expect(screen.queryByText(/saved at/i)).toBeNull();
     expect(screen.queryByText(/unsaved changes/i)).toBeNull();
+  });
+
+  it('uses the full content width, not a centred max-width column (matches Partner Settings, #9400)', async () => {
+    render(<OrgSettingsPage orgId="org-1" />);
+
+    await screen.findByTestId('org-name-input');
+    const heading = screen.getByRole('heading', { name: /Organization Settings/i });
+    const root = heading.closest('header')!.parentElement!;
+    expect(root.className).not.toMatch(/\bmax-w-/);
+    expect(root.className).not.toMatch(/\bmx-auto\b/);
+    expect(heading.className).toMatch(/\btext-2xl\b/);
+    expect(screen.getByTestId('org-settings-tab-general')).not.toBeNull();
   });
 
   it('renders the sections as grouped links and marks the active one with aria-current', async () => {
@@ -650,6 +694,17 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
 
     await waitFor(() => expect(navigateToMock).toHaveBeenCalledWith('/organizations/org-1#contacts', { replace: true }));
     expect(screen.queryByTestId('contacts-card')).not.toBeInTheDocument();
+  });
+
+  it('offers a Cloud tenants entry that switches the workspace to THIS org, then opens the integrations hash (#9318)', async () => {
+    render(<OrgSettingsPage orgId="org-9" />);
+
+    await screen.findByTestId('org-name-input');
+    await userEvent.click(screen.getByRole('link', { name: /cloud tenants/i }));
+
+    await waitFor(() => expect(navigateToMock).toHaveBeenCalledWith('/integrations#cloud-tenants', { replace: true }));
+    expect(storeSelectOrganization).toHaveBeenCalledWith('org-9');
+    expect(storeSelectOrganization.mock.invocationCallOrder[0]).toBeLessThan(navigateToMock.mock.invocationCallOrder[0]!);
   });
 
   it('offers the compact section select for narrow viewports', async () => {

@@ -12,6 +12,7 @@
         "low": "Bassa",
         "medium": "Media"
       },
+      "customRangeIncomplete": "Scegli una data di inizio e una di fine (prima l'inizio, al massimo 366 giorni di distanza) per applicare un intervallo personalizzato.",
       "dashboardOptions": {
         "capacity": "Pianificazione capacità",
         "operations": "Panoramica operativa",
@@ -31,7 +32,8 @@
       "subtitle": "Insight su flotta e servizi",
       "title": "Analisi",
       "trend": {
-        "operationalHealth": "Stato operativo"
+        "operationalHealth": "Stato operativo",
+        "weekOf": "Settimana del {{date}}"
       },
       "widgets": {
         "alertTable": {
@@ -40,7 +42,7 @@
           "title": "Statistiche avvisi"
         },
         "capacity": {
-          "title": "Previsione capacità"
+          "title": "Previsione capacità disco"
         },
         "complianceGauge": {
           "policiesEvaluated": "{{count}} policy valutate",
@@ -61,7 +63,7 @@
           "title": "Sessioni remote"
         },
         "uptime": {
-          "label": "Uptime della flotta",
+          "label": "Online ora",
           "title": "Uptime"
         }
       },
@@ -104,6 +106,7 @@
     },
     "gaugeWidget": {
       "criticalValue": "Critico {{value}}",
+      "noData": "Nessun controllo di conformità da valutare",
       "warnValue": "Avviso {{value}}"
     },
     "queryBuilder": {
@@ -114,7 +117,8 @@
         "p95": "P95",
         "sum": "Somma"
       },
-      "description": "Configura metriche e aggregazioni per la dashboard",
+      "coverageNote": "Le query coprono solo i primi {{count}} dispositivi online. I dispositivi offline e il resto di una flotta più grande non sono inclusi.",
+      "description": "Scegli una metrica e un'aggregazione per interrogare i dispositivi online",
       "errors": {
         "failedToExecuteQuery": "Impossibile eseguire la query",
         "noDevicesSelected": "Nessun dispositivo selezionato per la query"
@@ -150,7 +154,16 @@
     "slaComplianceCard": {
       "defaultPeriodLabel": "Ultimi 30 giorni",
       "downtime": "Downtime {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Finestre di manutenzione escluse",
+        "maintenanceSkipped": "Finestre di manutenzione non escluse: troppi dispositivi da verificare",
+        "maintenanceUnavailable": "Finestre di manutenzione non escluse: stato non disponibile",
+        "none": "Nessuna esclusione",
+        "title": "Esclusioni",
+        "weekends": "Fine settimana esclusi"
+      },
       "incidents": "{{count}} incidenti",
+      "noDevices": "Nessun dispositivo ancora misurato",
       "status": {
         "atRisk": "A rischio",
         "breach": "Violazione",
@@ -158,6 +171,34 @@
       },
       "targetUptime": "Obiettivo {{target}}% uptime",
       "title": "Conformità SLA"
+    },
+    "slaEmptyState": {
+      "create": "Crea definizione SLA",
+      "created": "Definizione SLA creata",
+      "description": "Una definizione SLA stabilisce l'obiettivo di disponibilità con cui questa scheda misura i tuoi dispositivi. Creane una per iniziare a monitorare la conformità.",
+      "errors": {
+        "create": "Impossibile creare la definizione SLA"
+      },
+      "form": {
+        "cancel": "Annulla",
+        "excludeMaintenance": "Escludi i dispositivi in una finestra di manutenzione",
+        "excludeWeekends": "Escludi i fine settimana",
+        "measurementWindow": "Periodo di misurazione",
+        "name": "Nome",
+        "organization": "Organizzazione",
+        "scopeNote": "Misura tutti i dispositivi dell'organizzazione.",
+        "selectOrganization": "Seleziona un'organizzazione",
+        "submit": "Crea",
+        "uptimeTarget": "Obiettivo di disponibilità (%)",
+        "uptimeTargetInvalid": "Inserisci un valore compreso tra 0 e 100.",
+        "windows": {
+          "daily": "Giornaliero",
+          "monthly": "Mensile",
+          "weekly": "Settimanale"
+        }
+      },
+      "noPermission": "Chiedi a un amministratore con accesso alla gestione delle organizzazioni di creare una definizione SLA.",
+      "title": "Nessuna definizione SLA"
     },
     "tableWidget": {
       "filterPlaceholder": "Filtra",
@@ -248,6 +289,12 @@
     },
     "reportEditPage": {
       "backToReports": "Torna ai report",
+      "backupPreview": {
+        "description": "Genera lo snapshot di backup corrente con le opzioni sopra. Viene eseguito solo su richiesta.",
+        "error": "Impossibile generare l'anteprima.",
+        "run": "Genera anteprima",
+        "title": "Anteprima"
+      },
       "description": "Aggiorna la configurazione per \"{{name}}\".",
       "errors": {
         "fetchReport": "Impossibile recuperare il report",
@@ -330,6 +377,9 @@
         "technician_time_billability": "Tempo e fatturabilità dei tecnici",
         "ar_aging": "Analisi anzianità crediti (AR aging)",
         "ai_usage_by_client": "Utilizzo dell'IA per cliente",
+        "mrr_renewals": "MRR e rinnovi",
+        "quote_win_rate": "Tasso di successo dei preventivi",
+        "client_profitability": "Redditività per cliente",
         "backup_status": "Stato dei backup"
       },
       "threatDetection": {
@@ -433,6 +483,9 @@
         "technician_time_billability": "Tempo e fatturabilità dei tecnici",
         "ar_aging": "Analisi anzianità crediti (AR aging)",
         "ai_usage_by_client": "Utilizzo dell'IA per cliente",
+        "mrr_renewals": "MRR e rinnovi",
+        "quote_win_rate": "Tasso di successo dei preventivi",
+        "client_profitability": "Redditività per cliente",
         "backup_status": "Stato dei backup"
       },
       "runsTable": {
@@ -982,6 +1035,9 @@
         "technician_time_billability": "Tempo e fatturabilità dei tecnici",
         "ar_aging": "Analisi anzianità crediti (AR aging)",
         "ai_usage_by_client": "Utilizzo dell'IA per cliente",
+        "mrr_renewals": "MRR e rinnovi",
+        "quote_win_rate": "Tasso di successo dei preventivi",
+        "client_profitability": "Redditività per cliente",
         "backup_status": "Stato dei backup"
       },
       "schedules": {
@@ -1055,6 +1111,18 @@
           "name": "Utilizzo dell'IA per cliente",
           "description": "Utilizzo dell'IA della piattaforma per cliente nel periodo: richieste, token, costo Breeze, importo da addebitare in base al profilo di fatturazione del cliente e quanto è già stato fatturato. L'utilizzo incluso e i modelli senza prezzo sono mostrati separatamente, mai sommati."
         },
+        "mrr_renewals": {
+          "name": "MRR e rinnovi",
+          "description": "Ricavi ricorrenti mensili e annuali dei contratti attivi, misurati il giorno in cui il report viene eseguito, con i contratti in rinnovo entro l'orizzonte scelto e ciò che è stato effettivamente fatturato come ricorrente. Un set di totali per valuta, senza conversione."
+        },
+        "quote_win_rate": {
+          "name": "Tasso di successo dei preventivi",
+          "description": "La quota di preventivi inviati che sono stati vinti, contata per opportunità, così un preventivo rivisto e reinviato conta una sola volta. Il tasso principale riguarda solo le opportunità concluse, con il numero di quelle ancora aperte accanto. I valori sono al netto delle imposte, un insieme per valuta, senza conversione."
+        },
+        "client_profitability": {
+          "name": "Redditività per cliente",
+          "description": "Ricavi fatturati per cliente nel periodo, per fonte (ricorrenti, manodopera, prodotti, IA, altro), con le ore registrate e una stima facoltativa del costo del lavoro basata su un'unica tariffa oraria. I valori che usano quella tariffa sono indicati come stime. Un insieme di totali per valuta, mai convertito."
+        },
         "backup_status": {
           "name": "Report sullo stato dei backup",
           "description": "Stato di backup di ogni dispositivo su Breeze e sui provider di backup collegati, in un’unica istantanea: categorie di copertura, ultimo backup riuscito e cronologia di 28 giorni per dispositivo."
@@ -1067,6 +1135,13 @@
         "business": "Attività",
         "general": "Generale",
         "businessDescription": "Numeri interni dell’MSP — rispetto degli SLA, fatturabilità dei tecnici e crediti scaduti — riservati al personale."
+      },
+      "delivery": {
+        "contactsLoading": "Caricamento dei contatti dell’organizzazione…",
+        "contactsFailed": "Impossibile caricare i contatti di questa organizzazione. Puoi comunque aggiungere indirizzi email.",
+        "noContacts": "Questa organizzazione non ha contatti con un indirizzo email.",
+        "removeEmail": "Rimuovi {{email}}",
+        "recipientsFailed": "Il report \"{{name}}\" è stato creato, ma non è stato possibile aggiungere tutti i destinatari. Aggiungili dal report."
       }
     },
     "threatDetectionOptions": {
@@ -1170,6 +1245,46 @@
       },
       "periodNote": "Gli addebiti sono fatturati per mese di calendario UTC. Un periodo impostato in un altro fuso orario può differire dalla fattura per l'utilizzo vicino ai confini del mese.",
       "unpricedNote": "L'utilizzo di un modello senza tariffa nel profilo di fatturazione del cliente viene conteggiato come senza prezzo. Non è mai considerato gratuito.",
+      "cancel": "Annulla",
+      "createReport": "Crea report"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "Questo report è sempre misurato il giorno in cui viene eseguito. Non ci sono periodi o date di riferimento da impostare.",
+      "groupBy": "Raggruppa per",
+      "groupByValues": {
+        "organization": "Organizzazione",
+        "contract": "Contratto"
+      },
+      "renewalHorizon": "Orizzonte di rinnovo",
+      "renewalHorizonOption": "Prossimi {{days}} giorni",
+      "renewalHorizonHelp": "I contratti la cui scadenza cade in questa finestra sono elencati come rinnovi.",
+      "cancel": "Annulla",
+      "createReport": "Crea report"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Raggruppa per",
+      "groupByAutomatic": "Automatico: per organizzazione per tutte le organizzazioni, per autore per una singola organizzazione",
+      "groupByValues": {
+        "organization": "Organizzazione",
+        "author": "Autore",
+        "currency": "Valuta"
+      },
+      "periodNote": "Il periodo si riferisce alla data del primo invio del preventivo. Un preventivo rivisto e reinviato conta una sola volta, come una singola opportunità.",
+      "cancel": "Annulla",
+      "createReport": "Crea report"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Raggruppa per",
+      "groupByDefault": "Predefinito per l'ambito del report",
+      "groupByValues": {
+        "organization": "Organizzazione",
+        "source": "Fonte"
+      },
+      "groupByHelp": "Per impostazione predefinita si raggruppa per organizzazione in un report di tutte le organizzazioni e per fonte per una singola organizzazione.",
+      "laborEnabled": "Stima il costo del lavoro",
+      "laborAmount": "Costo del lavoro per ora",
+      "laborCurrency": "Valuta",
+      "laborHelp": "Un’unica tariffa per tutti i tecnici. I valori che la usano sono indicati come stime.",
       "cancel": "Annulla",
       "createReport": "Crea report"
     },

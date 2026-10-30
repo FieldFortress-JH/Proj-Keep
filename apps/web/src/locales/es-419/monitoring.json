@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Probar en un dispositivo",
       "selectDevice": "Dispositivo",
-      "run": "Ejecutar prueba"
+      "run": "Ejecutar prueba",
+      "saveToTest": "Guarde para probar sus cambios"
     },
     "deliveryPreview": {
       "selectOrg": "Selecciona una organización para ver la entrega.",
@@ -192,7 +193,8 @@
     "script": "Verificación de script",
     "network_check": "Verificación de red",
     "hardware_health": "Estado del hardware",
-    "time_sync": "Sincronización de hora"
+    "time_sync": "Sincronización de hora",
+    "container_image_currency": "Actualización de imágenes de contenedor"
   },
   "fields": {
     "operator": "Comparación",
@@ -244,7 +246,9 @@
     "expectedValue": "Valor esperado",
     "nameserver": "Servidor DNS",
     "degradedIsFailure": "Tratar degradado como falla",
-    "maxResponseMs": "Fallar si tarda más de (ms)"
+    "maxResponseMs": "Fallar si tarda más de (ms)",
+    "eventLogCollectionNoSource": "Los eventos de aplicación de nivel Información y Advertencia solo se recopilan de {{providers}}. Los eventos de otros orígenes solo coinciden con esta regla en los niveles Error o Crítico, a menos que una directiva de configuración de registros de eventos incluya el origen (Directiva de configuración → Registros de eventos → Proveedores de aplicaciones).",
+    "eventLogCollectionSourceNotCollected": "El agente no recopila eventos de aplicación de nivel Información o Advertencia de «{{source}}», a menos que una directiva de configuración de registros de eventos lo incluya (Directiva de configuración → Registros de eventos → Proveedores de aplicaciones). De lo contrario, esta regla solo coincide con sus eventos de Error o Crítico. Proveedores integrados: {{providers}}."
   },
   "operators": {
     "gt": "mayor que",
@@ -268,6 +272,7 @@
     "system": "Sistema"
   },
   "eventLevels": {
+    "info": "Información",
     "warning": "Advertencia",
     "error": "Error",
     "critical": "Crítico"
@@ -328,10 +333,13 @@
     "cancel": "Cancelar",
     "detachConfirm": "¿Separar de {{policy}}?",
     "errors": {
+      "loadGroups": "No se pudieron cargar los grupos de dispositivos.",
       "attach": "No se pudo adjuntar el monitor",
       "detach": "No se pudo separar el monitor",
       "linkedFeature": "Los monitores de esta política provienen de una política de función compartida. Edite esa política o elija otra."
-    }
+    },
+    "partnerWideGroups": "Todas las org. (de todo el socio)",
+    "organizationGroups": "Grupos de la organización"
   },
   "policyTab": {
     "title": "Monitores",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Reglas de alerta heredadas",
     "description": "Reglas de alerta independientes que no son gestionadas por un monitor. Conviértalas para obtener respuestas, entrega y escalamiento en un solo lugar.",
-    "empty": "No hay reglas heredadas.",
+    "empty": "Ninguna regla de alerta independiente necesita conversión.",
     "columns": {
       "name": "Nombre",
       "template": "Plantilla",
@@ -535,11 +543,13 @@
       "more": "Cargar más",
       "empty": "No hay historial de conversión.",
       "system": "Sistema",
+      "unknownUser": "Usuario desconocido",
       "reverted": "Revertido",
       "deadline": "Deshacer no está disponible cuando el retiro de alertas heredadas elimina el evaluador de origen."
     },
     "errorCodes": {
       "preview_stale": "La política cambió desde esta vista previa. Genera otra vista previa antes de convertir.",
+      "conversion_contended": "Otros cambios simultáneos interrumpieron la conversión. No se modificó nada. Inténtalo de nuevo.",
       "preview_failed": "No se pudo generar la vista previa. Inténtalo más tarde.",
       "equivalence_delta": "Los monitores convertidos no se comportarían como las reglas heredadas en todos los dispositivos. Revisa la vista previa antes de convertir.",
       "CONVERSION_PREREQUISITE_MISSING": "Aún no se implementó una actualización necesaria de la plataforma, así que no se puede convertir.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "No se aplicó la política de hora",
           "policy_conflict_gpo": "Una directiva de grupo controla la configuración de hora"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Días mínimos desactualizada"
       }
     }
   },

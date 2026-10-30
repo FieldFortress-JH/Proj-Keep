@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -79,6 +80,17 @@ const (
 	// helper can differentiate "never got to auth" from "auth was rejected".
 	TypePreAuthReject = "pre_auth_reject"
 
+	// Endpoint messaging (#8293 W1). agent -> assist helper: show / pull a
+	// persistent branded message card. helper -> agent: the card was drawn
+	// (correlated reply to message_show; unsolicited after a replay), the user
+	// acknowledged it, or it closed without an ack (user or expiry). All need
+	// ScopeMessaging. New typ values only — the envelope framing is unchanged.
+	TypeMessageShow      = "message_show"
+	TypeMessageRetract   = "message_retract"
+	TypeMessagePresented = "message_presented"
+	TypeMessageAck       = "message_ack"
+	TypeMessageDismissed = "message_dismissed"
+
 	// Desktop revocation-lease bridge. A helper-hosted session's SessionManager
 	// has no command WebSocket of its own, so its lease renewals travel over
 	// IPC: the helper asks (desktop_lease_renew), the agent turns that into a
@@ -93,6 +105,16 @@ const (
 	// carrying a generation is never admitted by a helper that has not yet
 	// learned what the service already knows.
 	TypeDesktopFenceSync = "desktop_fence_sync" // agent -> helper
+
+	// Trickle ICE for helper-hosted desktop sessions (#9182). The helper
+	// queues the local candidates it gathers after its answer until the
+	// service, having recorded it as the session's owner, sends
+	// desktop_ice_trickle_begin; it then sends each one (and the
+	// end-of-gathering marker) as desktop_local_ice_candidate. Viewer
+	// candidates the API relays come back as desktop_remote_ice_candidate.
+	TypeDesktopICETrickleBegin    = "desktop_ice_trickle_begin"    // agent -> helper
+	TypeDesktopLocalICECandidate  = "desktop_local_ice_candidate"  // helper -> agent
+	TypeDesktopRemoteICECandidate = "desktop_remote_ice_candidate" // agent -> helper
 
 	// Remote-session consent + banner
 	TypeConsentRequest = "consent_request"
@@ -195,6 +217,15 @@ const (
 	// (ScopeConsentUI) is connected. Granted only on explicit advertisement so
 	// older helpers keep helper_absent semantics instead of timing out.
 	ScopeConsentUIFallback = "consent_ui_fallback"
+
+	// ScopeMessaging lets an Assist helper receive endpoint message cards
+	// (message_show/message_retract) and report message_presented/ack/dismissed.
+	// Granted per session only when the helper advertised
+	// AuthRequest.SupportsMessaging, so an Assist build that predates the card
+	// never receives a message it cannot render. Deliberately separate from
+	// ScopeConsentUI: that scope carries Breeze-owned consent wording only and
+	// must never carry operator-chosen text.
+	ScopeMessaging = "messaging"
 )
 
 const (
@@ -240,6 +271,42 @@ type AuthRequest struct {
 	// ConsentProtocolVersion advertises the consent prompt exchange this
 	// helper speaks (see ConsentProtocolVersion). Absent/0 means version 1.
 	ConsentProtocolVersion int `json:"consentProtocolVersion,omitempty"`
+
+	// SupportsMessaging advertises that this Assist helper renders endpoint
+	// message cards. Drives the messaging scope grant. Additive: absent/false
+	// on older helpers, which therefore get the native fallback.
+	SupportsMessaging bool `json:"supportsMessaging,omitempty"`
+
+	// SupportsChat advertises that this Assist helper renders endpoint live
+	// chat windows (#8743). Drives the chat scope grant. Additive.
+	SupportsChat bool `json:"supportsChat,omitempty"`
+
+	// SupportsTargetedPamDismiss advertises that this SYSTEM helper honours
+	// PamDismissConsentRequest.Instance (dismiss one specific consent.exe and
+	// nothing else). Additive: older helpers omit it and are never sent a
+	// targeted dismissal, because they would ignore the target (#8995).
+	SupportsTargetedPamDismiss bool `json:"supportsTargetedPamDismiss,omitempty"`
+
+	// PromptProtocolVersion advertises the prompt host contract this
+	// renderer speaks (ipc.PromptProtocolVersion; absent = 0 = none). The
+	// broker clamps it to its own. Additive (#10190).
+	PromptProtocolVersion int `json:"promptProtocolVersion,omitempty"`
+
+	// PromptKinds lists the prompt kinds this renderer can draw, each with
+	// its own version ("restart.prompt@1"). The broker grants the prompt /
+	// prompt_operator scopes only for advertised kinds of that copy class and
+	// the helper's role; unknown or malformed entries are ignored.
+	PromptKinds []string `json:"promptKinds,omitempty"`
+
+	// RendererVersion is the renderer build's version, recorded on the
+	// session for the technician-side observation (W02 promptHost telemetry).
+	RendererVersion string `json:"rendererVersion,omitempty"`
+
+	// UILocale is the signed-in user's UI language as the helper probed it
+	// (BCP 47 or POSIX, e.g. "de-DE", "fr_CA.UTF-8"; empty = unknown). The
+	// prompt host negotiates it to a catalog locale (promptcatalog.Negotiate)
+	// for the strings it renders for this session. Additive (#10190 W03).
+	UILocale string `json:"uiLocale,omitempty"`
 }
 
 // AuthResponse is sent by the root daemon back to the user helper.
@@ -261,6 +328,14 @@ type AuthResponse struct {
 	// — in on-demand mode this is the NORMAL answer for a logon-task helper
 	// and the helper should exit 0), "duplicate_key".
 	Code string `json:"code,omitempty"`
+
+	// AgentHandlesTCCNotice tells a macOS helper that the agent shows the
+	// permission notice itself, from this helper's tcc_status reports, so the
+	// helper must not show its own reminder (#10190 W04 skew rule). Additive:
+	// an older agent omits it (false) and the helper keeps reminding, and an
+	// older helper ignores it while the agent never sets it for a helper whose
+	// live advertisement lacks notice.info@1.
+	AgentHandlesTCCNotice bool `json:"agentHandlesTCCNotice,omitempty"`
 }
 
 // Capabilities is sent by the user helper after successful auth.
@@ -270,6 +345,10 @@ type Capabilities struct {
 	CanCapture    bool   `json:"canCapture"`
 	CanClipboard  bool   `json:"canClipboard"`
 	DisplayServer string `json:"displayServer"`
+	// CallerVerify is advertised by an Assist helper that can render the
+	// caller-verification card (#6354 W02). Old helpers omit it (false). The
+	// broker keeps it only for an assist-role session holding consent_ui.
+	CallerVerify bool `json:"callerVerify"`
 }
 
 // IPCCommand is a command forwarded from root daemon to user helper.
@@ -342,7 +421,25 @@ type PamDialogResult struct {
 // the broker time to receive the helper's correlated response.
 type PamDismissConsentRequest struct {
 	DeadlineUnixMs int64 `json:"deadlineUnixMs"`
+	// Instance, when set, restricts the dismissal to that one consent.exe
+	// process: the helper must leave every other UAC prompt alone and report
+	// no_consent_window if the instance is gone. Absent on the deny path, which
+	// keeps its untargeted behaviour. Only sent to helpers that advertised
+	// AuthRequest.SupportsTargetedPamDismiss — an older helper would ignore the
+	// field and dismiss whatever prompt it found (#8995).
+	Instance *PamConsentInstance `json:"instance,omitempty"`
 }
+
+// PamConsentInstance identifies one consent.exe process by PID plus its
+// creation time (Unix nanoseconds, from GetProcessTimes), so a reused PID can
+// never be mistaken for the original prompt.
+type PamConsentInstance struct {
+	PID             uint32 `json:"pid"`
+	CreatedUnixNano int64  `json:"createdUnixNano"`
+}
+
+// Valid reports whether both halves of the identity are present.
+func (i PamConsentInstance) Valid() bool { return i.PID != 0 && i.CreatedUnixNano > 0 }
 
 // PamDismissConsentResult reports whether the helper dismissed consent.exe.
 type PamDismissConsentResult struct {
@@ -558,11 +655,16 @@ type LaunchProcessResult struct {
 // TCCStatus reports macOS TCC (Transparency, Consent, Control) permission
 // state from the user helper to the root daemon.
 type TCCStatus struct {
-	ScreenRecording bool      `json:"screenRecording"`
-	Accessibility   bool      `json:"accessibility"`
-	FullDiskAccess  bool      `json:"fullDiskAccess"`
-	RemoteDesktop   *bool     `json:"remoteDesktop,omitempty"`
-	CheckedAt       time.Time `json:"checkedAt"`
+	ScreenRecording bool `json:"screenRecording"`
+	// ScreenRecordingState is what the non-capturing check could establish
+	// (#8390): "granted", "denied" or "unknown". Unknown (macOS 26+ only,
+	// where preflight can misreport) keeps ScreenRecording true so a session
+	// can be attempted; its own capture is the precise check.
+	ScreenRecordingState string    `json:"screenRecordingState,omitempty"`
+	Accessibility        bool      `json:"accessibility"`
+	FullDiskAccess       bool      `json:"fullDiskAccess"`
+	RemoteDesktop        *bool     `json:"remoteDesktop,omitempty"`
+	CheckedAt            time.Time `json:"checkedAt"`
 }
 
 // SessionInfoItem describes one interactive Windows session for the
@@ -645,6 +747,13 @@ type StateSync struct {
 	// ignore it, and LastHeartbeat stays empty so they cannot mistake it for
 	// a successful heartbeat.
 	AuthRejectedAt string `json:"authRejectedAt,omitempty"`
+	// ServerUnavailableAt (RFC3339) is set instead of LastHeartbeat when the
+	// agent's heartbeat loop is alive but the server answered with an
+	// overload status (429/502/503/504). The watchdog treats a fresh value as
+	// "running, server overloaded" and does not restart the agent for its
+	// stale heartbeat (#8934). Same compatibility contract as AuthRejectedAt:
+	// older watchdogs ignore it and LastHeartbeat stays empty.
+	ServerUnavailableAt string `json:"serverUnavailableAt,omitempty"`
 }
 
 // IntegrityCheck asks the agent to verify the integrity of the given targets.
@@ -684,6 +793,11 @@ type DesktopPrompt struct {
 	NotifyOnEnd bool `json:"notifyOnEnd"`
 	// ShowIndicator controls whether the on-screen session banner is displayed.
 	ShowIndicator bool `json:"showIndicator"`
+	// AllowUserEndSession lets the person at the keyboard end the session
+	// from the session indicator (remote access policy
+	// allow_user_end_session, #10190 W06 OD-5). Absent, as from an older
+	// server, means false: no End session action is offered anywhere.
+	AllowUserEndSession bool `json:"allowUserEndSession,omitempty"`
 }
 
 // ConsentRequest is sent from the service (via the helper) to the desktop
@@ -737,4 +851,122 @@ type BannerShowRequest struct {
 	SessionID       string `json:"sessionId"`
 	Label           string `json:"label"`
 	StartedAtUnixMs int64  `json:"startedAtUnixMs"`
+}
+
+// MessageBranding is the sender identity resolved server-side at send time.
+// The helper composes the fixed "From <CompanyName>" slot from it; the message
+// body can never replace that slot.
+type MessageBranding struct {
+	CompanyName string `json:"companyName"`
+	DisplayName string `json:"displayName"`
+	Accent      string `json:"accent,omitempty"`
+}
+
+// MessageShow asks the Assist helper to draw a persistent message card.
+// ExpiresAt is RFC3339; the helper closes the card (and reports
+// message_dismissed reason "expired") when it passes. Replay is true when the
+// agent resends a still-pending card after the helper (re)authenticated.
+type MessageShow struct {
+	MessageID   string          `json:"messageId"`
+	BatchID     string          `json:"batchId"`
+	Title       string          `json:"title"`
+	Body        string          `json:"body"`
+	Severity    string          `json:"severity"`
+	RequiresAck bool            `json:"requiresAck"`
+	ExpiresAt   string          `json:"expiresAt"`
+	Branding    MessageBranding `json:"branding"`
+	Replay      bool            `json:"replay,omitempty"`
+}
+
+// MessageRef names one message: the message_presented / message_ack payload
+// and the message_retract request.
+type MessageRef struct {
+	MessageID string `json:"messageId"`
+}
+
+// MessagePresented is the helper's reply to message_show (same envelope id).
+// Status is empty when the card is on screen. A helper that cannot or will
+// not draw it says so instead of staying silent, so the agent neither waits
+// out its timeout nor shows a message the user already closed.
+type MessagePresented struct {
+	MessageID string `json:"messageId"`
+	Status    string `json:"status,omitempty"`
+}
+
+// MessagePresented.Status values.
+const (
+	// MessagePresentedAlreadyResolved: this helper already saw the user
+	// acknowledge, close or outlive this message. Nothing is drawn and the
+	// agent must not fall back to a native toast.
+	MessagePresentedAlreadyResolved = "already_resolved"
+	// MessagePresentedFailed: the card could not be drawn (invalid content,
+	// window error). The agent falls back to the native path at once.
+	MessagePresentedFailed = "failed"
+)
+
+// Message dismissal reasons carried by message_dismissed.
+const (
+	MessageDismissReasonUser    = "user"
+	MessageDismissReasonExpired = "expired"
+)
+
+// MessageDismissed reports a card closed without an acknowledgement.
+type MessageDismissed struct {
+	MessageID string `json:"messageId"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// MaxICECandidateBytes bounds one ICE candidate line on every hop (#9182).
+const MaxICECandidateBytes = 1024
+
+// ICECandidate is an RTCIceCandidateInit on the IPC wire.
+type ICECandidate struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
+}
+
+// Validate bounds an ICE candidate from another process. An empty candidate
+// line is the browser's end-of-candidates signal, never a candidate to add.
+func (c ICECandidate) Validate() error {
+	if c.Candidate == "" {
+		return fmt.Errorf("ICE candidate is empty")
+	}
+	if len(c.Candidate) > MaxICECandidateBytes {
+		return fmt.Errorf("ICE candidate too large")
+	}
+	if c.SDPMid != nil && len(*c.SDPMid) > 64 {
+		return fmt.Errorf("ICE candidate sdpMid too large")
+	}
+	if c.UsernameFragment != nil && len(*c.UsernameFragment) > 256 {
+		return fmt.Errorf("ICE candidate usernameFragment too large")
+	}
+	return nil
+}
+
+// DesktopICETrickleBegin tells the helper hosting SessionID to start sending
+// its late local candidates, tagged with StartGeneration.
+type DesktopICETrickleBegin struct {
+	SessionID       string `json:"sessionId"`
+	StartGeneration string `json:"startGeneration,omitempty"`
+}
+
+// DesktopLocalICECandidate is one helper trickle entry: a local candidate, or
+// the end-of-gathering marker (Complete, no Candidate). Seq orders a
+// session's entries.
+type DesktopLocalICECandidate struct {
+	SessionID       string        `json:"sessionId"`
+	StartGeneration string        `json:"startGeneration,omitempty"`
+	Seq             int           `json:"seq"`
+	Candidate       *ICECandidate `json:"candidate,omitempty"`
+	Complete        bool          `json:"complete,omitempty"`
+}
+
+// DesktopRemoteICECandidate is a viewer candidate relayed to the helper that
+// hosts SessionID.
+type DesktopRemoteICECandidate struct {
+	SessionID       string       `json:"sessionId"`
+	StartGeneration string       `json:"startGeneration,omitempty"`
+	Candidate       ICECandidate `json:"candidate"`
 }

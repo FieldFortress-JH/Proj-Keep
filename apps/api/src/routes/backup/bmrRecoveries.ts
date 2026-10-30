@@ -17,6 +17,7 @@ import {
 } from '../../db/schema';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { refreshReadinessAfterRecovery } from '../../services/bareMetalReadinessRefresh';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveScopedOrgId } from './helpers';
 import { authorizeRouteResilienceResources, resolveRouteAuthorizedDeviceIds } from './resilienceAuthorization';
@@ -38,8 +39,10 @@ import {
 import {
   asRecord,
   BMR_MIN_HELPER_VERSION,
+  bootstrapServesKeyLayout,
   buildAuthenticatedBootstrapPayload,
   isHelperVersionAtLeast,
+  RECOVERY_REQUIRES_TOKEN_MODE,
   generateRecoveryToken,
   hashRecoveryToken,
   isValidRecoveryTokenFormat,
@@ -400,7 +403,7 @@ async function buildRecoveryExchangeBootstrap(
     .where(eq(devices.id, tokenRow.deviceId))
     .limit(1);
 
-  return buildAuthenticatedBootstrapPayload({
+  const payload = buildAuthenticatedBootstrapPayload({
     tokenId: tokenRow.id,
     deviceId: tokenRow.deviceId,
     snapshotId: snapshot.id,
@@ -455,6 +458,23 @@ async function buildRecoveryExchangeBootstrap(
     fileIndex: negotiated?.fileIndex,
     integrity,
   });
+  // #7081 R19: a prefixed snapshot is recoverable only through the
+  // token-mode download; never hand out a bootstrap without one.
+  if (!bootstrapServesKeyLayout(snapshot.keyLayout, payload)) {
+    console.error('[bmrRecoveries] refused an exchange bootstrap: the snapshot uses a key prefix and no token-mode download was issued', {
+      tokenId: tokenRow.id,
+      recoveryId: recovery.id,
+      snapshotId: snapshot.snapshotId,
+      keyLayout: snapshot.keyLayout,
+    });
+    // The one-time code is already claimed by the time the bootstrap is
+    // built, so the operator also needs a new code.
+    return {
+      ...RECOVERY_REQUIRES_TOKEN_MODE,
+      message: `${RECOVERY_REQUIRES_TOKEN_MODE.message.replace(/\.$/, '')}, then reissue the recovery code.`,
+    };
+  }
+  return payload;
 }
 
 bmrRecoveryPublicRoutes.post(
@@ -728,6 +748,17 @@ bmrRecoveryPublicRoutes.post(
         resolvedSnapshot
       );
       if ('error' in bootstrap) {
+        if (bootstrap.error === RECOVERY_REQUIRES_TOKEN_MODE.error) {
+          writeAuditEvent(c, {
+            orgId: rec.orgId,
+            action: 'bmr.recovery.bootstrap_refused',
+            resourceType: 'bare_metal_recovery',
+            resourceId: rec.id,
+            result: 'failure',
+            details: { tokenId: tokenRow!.id, snapshotId: rec.snapshotId, reason: RECOVERY_REQUIRES_TOKEN_MODE.code },
+            errorMessage: bootstrap.message,
+          });
+        }
         return c.json(bootstrap, 409);
       }
 
@@ -829,6 +860,9 @@ bmrRecoveryPublicRoutes.post(
       }
 
       await db.update(bareMetalRecoveries).set(set).where(eq(bareMetalRecoveries.id, rec.id));
+      if (targetStatus === 'completed' || targetStatus === 'failed') {
+        refreshReadinessAfterRecovery(rec.orgId, rec.deviceId);
+      }
 
       writeAuditEvent(c, {
         orgId: rec.orgId,

@@ -37,6 +37,7 @@ import { currencyLabel, currencyOptions } from '../../lib/currencies';
 import { useStableT } from '@/lib/i18n/useStableT';
 import { ACCOUNTING_PROVIDER_NAMES, accountingPath, useActivePushProvider } from '../../lib/accountingProviders';
 import { useCreateIntent } from '../../lib/keyboard/createIntent';
+import { localDateInputValue } from '../../lib/localDate';
 
 interface Organization {
   id: string;
@@ -51,8 +52,9 @@ const STATUS_OPTION_VALUES: ('' | InvoiceStatus)[] = ['', ...INVOICE_STATUSES];
 
 /** Mirrors the API's BlockedCurrencySummary (invoiceService.ts, #3776). */
 interface BlockedCurrencyGroup { currencyCode: string; count: number; amount: string }
+interface HeldForHourBlock { count: number; hours: number }
 interface AssembleResult {
-  data: { id?: string; invoice?: { id?: string }; blockedByCurrency?: BlockedCurrencyGroup[] };
+  data: { id?: string; invoice?: { id?: string }; blockedByCurrency?: BlockedCurrencyGroup[]; heldForHourBlock?: HeldForHourBlock };
 }
 
 type SortKey = 'issued' | 'due' | 'total' | 'balance';
@@ -292,8 +294,8 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
     setAssembleSites([]);
     const today = new Date();
     const monthAgo = new Date(today.getTime() - 30 * 86400000);
-    setAssembleFrom(monthAgo.toISOString().slice(0, 10));
-    setAssembleTo(today.toISOString().slice(0, 10));
+    setAssembleFrom(localDateInputValue(monthAgo));
+    setAssembleTo(localDateInputValue(today));
     setAssembleCurrency('');
     setBlockedGroups([]);
     setAssembleOpen(true);
@@ -337,6 +339,11 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
       for (const g of result?.data?.blockedByCurrency ?? []) {
         showToast({ type: 'warning', message: t('invoicesPage.dialog.blockedByCurrency', { count: g.count, code: g.currencyCode }) });
       }
+      // Entries inside a block-hours window are held until the block period closes (#4547).
+      const held = result?.data?.heldForHourBlock;
+      if (held && held.count > 0) {
+        showToast({ type: 'warning', message: t('invoicesPage.dialog.heldForHourBlock', { count: held.count, hours: Number(Number(held.hours).toFixed(2)) }) });
+      }
       // assemble nests under data.invoice.id; blank create returns the row at data.id.
       const newId = result?.data?.invoice?.id ?? result?.data?.id;
       if (newId) void navigateTo(`/billing/invoices/${newId}`);
@@ -349,6 +356,14 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
           ?.details?.blockedByCurrency ?? [];
         setBlockedGroups(groups);
         return;
+      }
+      if (err instanceof ActionError && err.code === 'NOTHING_TO_INVOICE') {
+        // runAction already toasted the server's message; say WHY when the work is merely held for a block.
+        const held = (err.body as { details?: { heldForHourBlock?: HeldForHourBlock } } | undefined)?.details?.heldForHourBlock;
+        if (held && held.count > 0) {
+          showToast({ type: 'warning', message: t('invoicesPage.dialog.heldForHourBlock', { count: held.count, hours: Number(Number(held.hours).toFixed(2)) }) });
+          return;
+        }
       }
       handleActionError(err, t('invoicesPage.dialog.createGenericError'));
     } finally {

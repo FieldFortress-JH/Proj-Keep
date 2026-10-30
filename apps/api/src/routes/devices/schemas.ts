@@ -217,6 +217,14 @@ export const updateDeviceSchema = z.object({
   deviceRole: z.enum(DEVICE_ROLES).optional(),
   // Hardware Lifecycle report — see createManualAssetSchema.purchaseDate.
   purchaseDate: purchaseDateSchema,
+  // Site-move hardening (topology site location W1, spec S§12). Guard fields, never written:
+  // `expectedSiteId` is the site the caller believes the device is in (409 if it is not);
+  // `siteMoveTrigger` labels the `device.site_move` audit; it is a client-asserted hint, not verified
+  // (W3 derives suggestion evidence server-side). Client-supplied evidence is never accepted:
+  // an `evidence` key is a 400 (z.never), not silently stripped, so a client cannot believe it was recorded.
+  expectedSiteId: z.string().guid().optional(),
+  siteMoveTrigger: z.enum(['manual', 'topology_suggestion']).optional(),
+  evidence: z.never().optional(),
 });
 
 // POST /devices/provision — admin pre-creates a device row + downloadable
@@ -445,3 +453,27 @@ export const BULK_LIFECYCLE_MAX_DEVICES = 500;
 export const bulkDeviceIdsSchema = z.object({
   deviceIds: z.array(z.string().guid()).min(1).max(BULK_LIFECYCLE_MAX_DEVICES),
 });
+
+/**
+ * Per-request cap on POST /devices/bulk/site (#9796, plan Gate B item 2: 100, the 50-per-batch
+ * bulk-restore precedent doubled). Each device is a row lock + guarded UPDATE + denormalized
+ * rewrite in its own short transaction, so the request stays well inside a normal timeout.
+ * The web mirrors this constant (apps/web/src/components/devices/bulkActionGating.ts) and disables — never
+ * chunks — a larger selection.
+ */
+export const BULK_SITE_MOVE_CAP = 100;
+
+/** Lower-cased so a duplicate that differs only in case is caught, and `toSiteId === device.siteId` holds. */
+const lowerCaseGuid = z.string().guid().transform((value) => value.toLowerCase());
+
+/**
+ * `POST /devices/bulk/site` body. `expectedSiteId` is REQUIRED and non-null: `devices.site_id` is
+ * NOT NULL and the list row always knows its site, so every move carries the stale-view guard.
+ * Duplicate ids are rejected by the route (whole batch, Gate B item 3), not deduplicated here.
+ */
+export const bulkSiteMoveSchema = z.object({
+  siteId: lowerCaseGuid,
+  devices: z.array(z.object({ id: lowerCaseGuid, expectedSiteId: lowerCaseGuid }).strict())
+    .min(1)
+    .max(BULK_SITE_MOVE_CAP),
+}).strict();

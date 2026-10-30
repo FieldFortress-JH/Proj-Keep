@@ -203,6 +203,7 @@
       "scanQueued": "Varredura de descoberta enfileirada para \"{{name}}\"",
       "profileCreated": "Perfil de descoberta \"{{name}}\" criado",
       "profileUpdated": "Perfil de descoberta \"{{name}}\" atualizado",
+      "profileDeleted": "Perfil de descoberta \"{{name}}\" excluído",
       "profileMoved": "Perfil movido para {{site}}.",
       "assetsMoved_one": "{{count}} dispositivo de rede movido",
       "assetsMoved_other": "{{count}} dispositivos de rede movidos",
@@ -269,11 +270,15 @@
       "time": "Horário",
       "timeout": "Tempo limite (ms)",
       "timezone": "Fuso horário",
-      "username": "Nome de usuário"
+      "username": "Nome de usuário",
+      "scanAgent": "Agente de varredura"
     },
     "options": {
       "everyHours": "A cada {{count}} horas",
-      "selectSite": "Selecione um local..."
+      "selectSite": "Selecione um local...",
+      "automaticAgent": "Automático (preferir um agente nestas sub-redes)",
+      "agentOffline": "{{name}} (desconectado)",
+      "pinnedAgentUnlisted": "Agente fixado (não está neste site)"
     },
     "placeholders": {
       "profileName": "Varredura da matriz",
@@ -313,7 +318,13 @@
       "moveAssets_one": "Mover também o {{count}} dispositivo de rede descoberto por este perfil para o novo site",
       "moveAssets_other": "Mover também os {{count}} dispositivos de rede descobertos por este perfil para o novo site",
       "moveAssetsUnknown": "Mover também os dispositivos de rede descobertos por este perfil para o novo site"
-    }
+    },
+    "scanAgentHelp": {
+      "automatic": "É preferido um agente online deste site com um endereço em uma das sub-redes.",
+      "pinned": "As varreduras são executadas somente a partir deste agente. Se ele estiver offline, a varredura falha em vez de usar outro agente.",
+      "loadError": "Não foi possível carregar os agentes deste site. A seleção automática continua disponível."
+    },
+    "subnetTopologyNote": "As sub-redes aqui também identificam as redes deste site no mapa de topologia."
   },
   "discoveryProfileList": {
     "actions": {
@@ -332,6 +343,8 @@
       "subnets": "Sub-redes"
     },
     "configuredCount": "{{count}} perfis configurados",
+    "configuredCount_one": "{{count}} perfil configurado",
+    "configuredCount_other": "{{count}} perfis configurados",
     "empty": "Ainda não há perfis de descoberta. Crie o primeiro perfil para iniciar as varreduras.",
     "lastRun": "Última execução {{time}}",
     "loading": "Carregando perfis de descoberta...",
@@ -427,7 +440,10 @@
       "interval": "O intervalo da varredura deve ser de 1 a 168 horas.",
       "selectSite": "Selecione um local antes de salvar."
     },
-    "configuredCount": "{{count}} linhas de base configuradas"
+    "configuredCount": "{{count}} linhas de base configuradas",
+    "configuredCount_one": "{{count}} linha de base configurada",
+    "configuredCount_other": "{{count}} linhas de base configuradas",
+    "subnetTopologyNote": "As sub-redes aqui também identificam as redes deste site no mapa de topologia."
   },
   "networkChangeDetailModal": {
     "acknowledgeTitle": "Reconhecer evento",

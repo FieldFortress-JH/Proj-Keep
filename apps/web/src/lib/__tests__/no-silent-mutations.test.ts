@@ -33,7 +33,49 @@ const FIXTURE_ROOT = resolve(__dirname, 'fixtures/no-silent-mutations/src');
 // WS-A "targeted set": files that have ADOPTED runAction and must not regress
 // to silent mutations. Grows as more handlers migrate (see the backlog).
 const TARGET_GLOBS = [
+  // Partner-wide groups: creation and policy assignment mutations surface outcomes.
+  'src/components/devices/CreateGroupModal.tsx',
+  'src/components/configurationPolicies/PartnerGroupAssignmentSection.tsx',
+  // Tool Catalog W4 (#5219): flow enable/disable/run/cancel mutations go through runAction.
+  'src/components/flows/api.ts',
+  // Trust Center W1 (#8768): publish/unpublish/preview/partner-home are the public-exposure
+  // mutations; the sections (Task 16) add their own entries.
+  'src/components/trustCenter/TrustCenterTab.tsx',
+  'src/components/trustCenter/TrustStatusCard.tsx',
+  'src/components/trustCenter/TrustPublishDialog.tsx',
+  'src/components/trustCenter/TrustControlsSection.tsx',
+  'src/components/trustCenter/TrustContentSection.tsx',
+  'src/components/trustCenter/TrustDocumentsSection.tsx',
+  // Trust Center W2 (#8770): W02a pre-lists every W2 section that will mutate (stubs until W02b/d/e/f/g fill
+  // them) and the W02i OrganizationForm slug-rename warning, so no sub-wave edits this shared list.
+  'src/components/trustCenter/TrustDeclarationsSection.tsx',
+  'src/components/trustCenter/TrustFrameworksSection.tsx',
+  'src/components/trustCenter/TrustSubprocessorsSection.tsx',
+  'src/components/trustCenter/TrustFaqSection.tsx',
+  'src/components/trustCenter/TrustHistorySection.tsx',
+  'src/components/trustCenter/TrustAccessSection.tsx',
+  'src/components/trustCenter/TrustTemplateSettings.tsx',
+  'src/components/trustCenter/TrustEmbedSection.tsx',
+  'src/components/settings/OrganizationForm.tsx',
+  // Caller verification W04 (#6354): technician client + the three components that mutate through it.
+  'src/lib/api/callerVerification.ts',
+  'src/components/callerVerification/VerifyCallerModal.tsx',
+  'src/components/callerVerification/ContactVerificationDrawer.tsx',
+  'src/components/callerVerification/CallerVerificationPolicyForm.tsx',
+  // #8385: vault sync/deactivate/save mutations must surface failures (they were silently swallowed)
+  'src/components/backup/VaultDashboard.tsx',
+  'src/components/backup/VaultConfigDialog.tsx',
   'src/components/settings/TicketPushoverSettings.tsx',
+  // Business-hours calendars (#8973): every mutation through runAction.
+  'src/components/settings/BusinessHoursCard.tsx',
+  'src/components/settings/BusinessHoursForm.tsx',
+  'src/components/settings/BusinessHoursHolidays.tsx',
+  'src/components/settings/BusinessHoursApplyDialog.tsx',
+  // #8330: saved-filter create/edit/delete surface the API's error text.
+  'src/components/filters/SavedFilterList.tsx',
+  // Endpoint messaging W1 (#8741): the send POST goes through runAction from birth.
+  'src/lib/endpointMessages.ts',
+  'src/components/endpointMessages/SendMessageDialog.tsx',
   'src/components/devices/DeviceSettingsModal.tsx', // device tags/name/site PATCH via runAction (success toast)
   'src/components/billing/PaymentsSettingsTab.tsx',
   'src/components/billing/autopayClient.ts',
@@ -42,6 +84,29 @@ const TARGET_GLOBS = [
   'src/components/monitoring/conversion/ConversionPendingBanner.tsx',
   'src/components/admin/MonitorConversionAdmin.tsx',
   'src/components/ai/AiContinuationPrompt.tsx', // W05 #7603: POST /ai/sessions/:id/continue via runAction
+  // Wisp W04b (#9916): grant create/refresh/revoke/settings and thread attachments go through runAction.
+  'src/components/ai/WispGrantStepUpModal.tsx',
+  'src/components/ai/WispThreadHeader.tsx',
+  'src/components/ai/WispThreadAttachments.tsx',
+  // Wisp W05a (#9911): concerns list snooze/dismiss/resolve go through runAction.
+  'src/components/ai/WispConcernsPanel.tsx',
+  'src/lib/wispConcernsApi.ts',
+  // Wisp W06b (#9918): grant pause/resume go through runAction; the thread page (reads only today) is
+  // listed per the W06 plan so a mutation added there later cannot go silent.
+  'src/components/wisp/WispThreadPage.tsx',
+  'src/components/wisp/WispGrantPauseControl.tsx',
+  // Wisp W08b (#9921): links add/remove and the partner "Wisp enabled" switch go through runAction;
+  // the home page and needs-you section are listed so a mutation added later cannot go silent.
+  'src/lib/wispLinksApi.ts',
+  'src/lib/wispPartnerSettingsApi.ts',
+  'src/components/wisp/WispHomePage.tsx',
+  'src/components/wisp/WispLinksPanel.tsx',
+  'src/components/wisp/WispNeedsYou.tsx',
+  'src/components/wisp/WispEntityPicker.tsx',
+  'src/components/wisp/WispLinkButton.tsx',
+  'src/components/settings/WispPartnerSettingsCard.tsx',
+  'src/components/wisp/WispHomeContent.tsx',
+  'src/components/wisp/WispHomeThread.tsx',
   'src/components/admin/AiModels.tsx', // W01 #7599: /admin/ai-models (PATCH + refresh via runAction)
   'src/components/configurationPolicies/featureTabs/useFeatureLink.ts',
   // Old storage key check / operator confirmation: both mutations surface
@@ -78,6 +143,13 @@ const TARGET_GLOBS = [
   // gone when it is still being stamped.
   'src/components/settings/WorkTypesCard.tsx',
   'src/components/settings/PartnerSettingsPage.tsx',
+  'src/components/settings/partnerSettings/usePartnersMeUnit.ts',
+  'src/components/settings/partnerSettings/units/callerVerificationUnit.ts',
+  'src/components/settings/partnerSettings/units/loginBrandingUnit.ts',
+  'src/components/settings/partnerSettings/units/trustCenterUnit.ts',
+  'src/components/settings/partnerSettings/units/aiFeatureDefaultsUnit.ts',
+  'src/components/settings/partnerSettings/units/aiDataPolicyUnit.ts',
+  'src/components/settings/KnownGuestsSettings.tsx',
   'src/components/settings/aiModels/PartnerAiModelsTab.tsx',
   'src/components/settings/aiModels/ConnectionDrawer.tsx',
   'src/components/settings/aiModels/ResidencySwitch.tsx',
@@ -111,6 +183,9 @@ const TARGET_GLOBS = [
   // POST are advisory-then-destructive mutations against a partner's tenant
   // tree, so a silent failure here is exactly the class this guard exists for.
   'src/components/settings/MergeOrgModal.tsx',
+  // #9796: the bulk site move (POST /devices/bulk/site) — a multi-device tenant write that must
+  // never ride ChangeSiteModal.tsx's migration-backlog exemption.
+  'src/components/devices/bulkSiteMove.ts',
   // Org archive (org-lifecycle Wave 5), replacing the org delete flow: the
   // archive POST hides an org, uninstalls its agents, and stops its billing —
   // a silent failure here is exactly the class this guard exists for.
@@ -160,9 +235,13 @@ const TARGET_GLOBS = [
   'src/components/dnsSecurity/AddDnsIntegrationModal.tsx',
   'src/components/dnsSecurity/DnsSecurityPoliciesTab.tsx',
   'src/components/dnsSecurity/AddDnsPolicyModal.tsx',
+  // #6958 PR D: provisions Breeze-pinned DNS client packages (POST /software/builtin-packages/:key).
+  'src/components/software/BuiltinPackagesPanel.tsx',
   'src/components/devices/DeviceSoftwareInventory.tsx',
   'src/components/devices/DeviceLinkedProfilesTab.tsx',
   'src/components/devices/DeviceWarrantyCard.tsx',
+  // Physical placement W1-D1 (#8134): the placement PUT is its own file.
+  'src/components/devices/PhysicalPlacementCard.tsx',
   'src/components/devices/PossibleReplacementBanner.tsx',
   'src/components/pam/PamRespondModal.tsx',
   'src/components/pam/PamRevokeModal.tsx',
@@ -476,6 +555,10 @@ const TARGET_GLOBS = [
   'src/components/security/SecurityScanManager.tsx',
   'src/components/security/ThreatList.tsx',
   'src/components/security/ThreatDetail.tsx',
+  // #6263 W05 PR C: the IOC sweep client. Preview, create and the two cancels
+  // are POSTs that start or stop a fleet-wide scan; a swallowed failure would
+  // leave a tech believing a sweep ran (or stopped) when it did not.
+  'src/components/security/sweeps/sweepsApi.ts',
   // Alert workflows typed filter (#6367 W05c2 Task 9): the save handler now
   // wraps its create/update POST/PUT in runAction — a silent failure here is
   // a tech believing a workflow's severity/kind restriction is live when the
@@ -510,6 +593,15 @@ const TARGET_GLOBS = [
   // restarted from their fix — or reverted to full history — when it did not.
   'src/components/devices/ReliabilityBaselineDialog.tsx',
   'src/components/devices/ReliabilityBaselineSection.tsx',
+  // Sweep G4: peripheral policy save + config-policy partner-wide toggle toast their outcome.
+  'src/components/peripherals/PeripheralPolicyForm.tsx',
+  'src/components/configurationPolicies/OrganizationScopePanel.tsx',
+  // Operator Recipe Library W06 R1b (#6171): "allow these tools" widens what an
+  // AI agent may call on customer systems; a silent failure leaves the tech
+  // believing the recipe is set up when it is not.
+  'src/components/aiOperator/RecipeCard.tsx',
+  // The draft preview and the admission that starts a four-eyes offboarding.
+  'src/components/aiOperator/StartRecipeForm.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -911,7 +1003,37 @@ describe('no silent mutations in targeted set', () => {
     // Ticket-assignment Pushover adds settings/TicketPushoverSettings.tsx: 219 → 220.
     // Reliability baselines (#5876) add devices/ReliabilityBaseline{Dialog,Section}.tsx: 220 → 222.
     // DeviceSettingsModal.tsx (tag/name/site save moved to runAction) makes 223.
-    expect(absoluteFiles.length).toBe(223);
+    // #8385 adds backup/VaultDashboard.tsx and backup/VaultConfigDialog.tsx: 223 → 225.
+    // Caller verification W04 (#6354) adds lib/api/callerVerification.ts and
+    // callerVerification/{VerifyCallerModal,ContactVerificationDrawer,CallerVerificationPolicyForm}.tsx: 225 → 229.
+    // Endpoint messaging W1 (#8741) adds lib/endpointMessages.ts and endpointMessages/SendMessageDialog.tsx: 229 → 231.
+    // Trust Center W1 (#8768) adds TrustCenterTab, TrustStatusCard, TrustPublishDialog: 231 → 234.
+    // Trust Center sections (Task 16) add Controls/Content/Documents sections: 234 → 237.
+    // Trust Center W2 (#8770 W02a) pre-lists six W2 sections, TrustTemplateSettings and OrganizationForm: 237 → 245.
+    // #8330 adds filters/SavedFilterList.tsx: 245 → 246.
+    // Trust Center W03a (#8771) adds TrustEmbedSection: 246 → 247.
+    // Business hours (#8973) adds BusinessHoursCard/Form/Holidays/ApplyDialog: 247 → 251.
+    // Sweep 2026-10-23 adds PeripheralPolicyForm + OrganizationScopePanel: 251 → 253.
+    // Wisp W04b (#9916) adds WispToggle/WispGrantStepUpModal/WispThreadHeader/WispThreadAttachments (+4 = 257).
+    // Wisp W05a (#9911) adds WispConcernsPanel/wispConcernsApi (+2 = 259).
+    // Partner settings W2 (#9788) Task 18 adds partnerSettings/usePartnersMeUnit.ts: 259 → 260.
+    // Partner settings W2 (#9788) Task 20 adds partnerSettings/units/{callerVerificationUnit,loginBrandingUnit}.ts: 260 → 262.
+    // Partner settings W2 (#9788) Task 21 adds partnerSettings/units/trustCenterUnit.ts: 262 → 263.
+    // Partner settings W2 (#9788) Task 22 adds partnerSettings/units/{aiFeatureDefaultsUnit,aiDataPolicyUnit}.ts: 263 → 265.
+    // Partner settings W2 (#9788) Task 24 adds settings/KnownGuestsSettings.tsx: 265 → 266.
+    // Wisp W06b (#9918) adds WispThreadPage/WispGrantPauseControl: 266 → 268;
+    // bulk site move (#9796) adds devices/bulkSiteMove.ts (+1 = 269).
+    // #6958 PR D adds software/BuiltinPackagesPanel.tsx: 269 → 270.
+    // Operator Recipe Library R1b (#6171) adds aiOperator/RecipeCard.tsx and StartRecipeForm.tsx: 270 → 272.
+    // IOC sweeps W05 PR C (#6263) adds security/sweeps/sweepsApi.ts: 272 → 273.
+    // Wisp W08b (#9921) adds wispLinksApi, wispPartnerSettingsApi, WispHomePage, WispLinksPanel,
+    // WispNeedsYou, WispEntityPicker, WispLinkButton, WispPartnerSettingsCard: 273 → 281; then
+    // WispHomeContent and WispHomeThread (G3): 281 → 283.
+    // AI surface cohesion W05 (#10136) deletes WispToggle (the grant decides the panel's voice): 283 → 282.
+    // Tool Catalog W4 flows/api.ts: 282 → 283.
+    // Physical placement W1-D1 (#8134) adds devices/PhysicalPlacementCard.tsx: 283 → 284.
+    // Partner-wide groups W4 adds creation and partner group assignments: 284 → 286.
+    expect(absoluteFiles.length).toBe(286);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

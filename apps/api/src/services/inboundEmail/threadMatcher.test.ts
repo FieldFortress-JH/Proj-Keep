@@ -2,12 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ticketEmailInbound, users } from '../../db/schema';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
-const mocks = vi.hoisted(() => ({ rows: vi.fn(), lock: vi.fn(), where: vi.fn(), links: vi.fn(), inbound: vi.fn(), tech: vi.fn() }));
+const mocks = vi.hoisted(() => ({ rows: vi.fn(), lock: vi.fn(), where: vi.fn(), links: vi.fn(), inbound: vi.fn(), tech: vi.fn(), tombstones: vi.fn() }));
 vi.mock('../../db', () => ({
   db: {
     select: () => ({ from: (table: unknown) => ({ where: (predicate: unknown) => {
-      mocks.where(predicate);
-      const rows = table === ticketEmailInbound ? mocks.inbound : table === users ? mocks.tech : mocks.rows;
+      mocks.where(predicate, table);
+      // #8972: the tombstones-merged-into-the-match read has its own queue.
+      const isTombstoneRead = table !== ticketEmailInbound && table !== users
+        && new PgDialect().sqlToQuery(predicate as never).sql.includes('"merged_into_ticket_id" =');
+      const rows = table === ticketEmailInbound ? mocks.inbound : table === users ? mocks.tech
+        : isTombstoneRead ? mocks.tombstones : mocks.rows;
       const query = { then: (resolve: (value: unknown) => unknown) => rows().then(resolve), limit: rows, for: (mode: string) => { mocks.lock(mode); return query; } };
       return query;
     } }) })
@@ -15,7 +19,7 @@ vi.mock('../../db', () => ({
 }));
 vi.mock('../ticketEmailLinks', () => ({ findTicketIdsByMessageIds: mocks.links }));
 
-import { findClosedTicketInPartner, findTicketInPartner, type MatchedTicket, type SenderResolver } from './threadMatcher';
+import { findClosedTicketInPartner, findTicketInPartner, stripTicketTokens, type MatchedTicket, type SenderResolver } from './threadMatcher';
 
 const ORG = '11111111-1111-4111-8111-111111111111';
 const PARTNER = '22222222-2222-4222-8222-222222222222';
@@ -35,6 +39,7 @@ beforeEach(() => {
   mocks.links.mockResolvedValue([]);
   mocks.inbound.mockResolvedValue([]);
   mocks.tech.mockResolvedValue([]);
+  mocks.tombstones.mockResolvedValue([]);
 });
 
 describe.each([
@@ -55,7 +60,8 @@ describe.each([
   ])('accepts a prior inbound participant %j', async (prior) => {
     mocks.inbound.mockResolvedValue([prior]);
     expect(await match({ inReplyTo: '<anchor@example.com>', from: 'colleague@example.com' }, PARTNER, sender('other'))).toEqual(ticket);
-    const compiled = new PgDialect().sqlToQuery(mocks.where.mock.calls[1]![0]);
+    const inboundCall = mocks.where.mock.calls.find((c) => c[1] === ticketEmailInbound)!;
+    const compiled = new PgDialect().sqlToQuery(inboundCall[0]);
     expect(compiled.sql).toContain('"ticket_email_inbound"."ticket_id" =');
     expect(compiled.sql).toContain('"ticket_email_inbound"."partner_id" =');
     expect(compiled.params).toEqual(expect.arrayContaining([ticket.id, PARTNER, 'matched', 'created']));
@@ -81,6 +87,27 @@ describe.each([
     mocks.inbound.mockResolvedValue([{ fromAddress: 'other@example.com', raw: {} }]);
     expect(await match({ subject: 'Re: T-2026-0001', from: 'other@example.com' }, PARTNER, sender('other'))).toBeNull();
     expect(mocks.inbound).not.toHaveBeenCalled();
+  });
+
+  it('matches a bracketed customer-facing ticket_number in the subject, partner-scoped (#8965)', async () => {
+    const found = await match({ subject: 'Re: [KQ04YOHZ-N] Printer is down' }, PARTNER);
+    expect(found).toEqual(ticket);
+    const compiled = new PgDialect().sqlToQuery(mocks.where.mock.calls[0]![0]);
+    // #8972: the token is matched on the resolved-through-merges subquery (alias t).
+    expect(compiled.sql).toContain('t.ticket_number IN');
+    expect(compiled.sql).toContain('"tickets"."partner_id" =');
+    expect(compiled.params).toContain('KQ04YOHZ-N');
+  });
+
+  it('still matches the staff-style [T-YYYY-NNNN] subject token', async () => {
+    expect(await match({ subject: 'Re: [T-2026-0001] Printer' }, PARTNER)).toEqual(ticket);
+    const compiled = new PgDialect().sqlToQuery(mocks.where.mock.calls[0]![0]);
+    expect(compiled.params).toContain('T-2026-0001');
+  });
+
+  it('ignores an unbracketed uppercase word that merely looks like a ticket_number', async () => {
+    expect(await match({ subject: 'Re: ABCDEFGHIJ printer' }, PARTNER)).toBeNull();
+    expect(mocks.where).not.toHaveBeenCalled();
   });
 
   it('locks the matched ticket before checking requester identity', async () => {
@@ -112,6 +139,25 @@ describe.each([
     expect(mocks.links).toHaveBeenCalledWith(PARTNER, ['<linked@example.com>']);
   });
 
+  it('#8972: accepts a sender bound only to a tombstone merged into the match (same org)', async () => {
+    mocks.tombstones.mockResolvedValue([{ ...ticket, id: 'tomb', submittedBy: 'src-requester', requesterContactId: null, submitterEmail: 'src@example.com' }]);
+    expect(await match({ subject: 'Re: [T-2026-0001]', from: 'src@example.com' }, PARTNER, sender('src-requester'))).toEqual(ticket);
+  });
+
+  it('#8972: a tombstone\'s retained inbound history makes its senders thread participants', async () => {
+    mocks.tombstones.mockResolvedValue([{ ...ticket, id: 'tomb-1' }]);
+    mocks.inbound.mockResolvedValue([{ fromAddress: 'colleague@example.com', raw: {} }]);
+    expect(await match({ inReplyTo: '<anchor@example.com>', from: 'colleague@example.com' }, PARTNER, sender('other'))).toEqual(ticket);
+    const compiled = new PgDialect().sqlToQuery(mocks.where.mock.calls.find((c) => c[1] === ticketEmailInbound)![0]);
+    expect(compiled.params).toEqual(expect.arrayContaining([ticket.id, 'tomb-1']));
+  });
+
+  it('#8972: resolves the signal through merged_into_ticket_id before the status filter', async () => {
+    await match({ inReplyTo: '<anchor@example.com>' }, PARTNER);
+    const compiled = new PgDialect().sqlToQuery(mocks.where.mock.calls[0]![0]);
+    expect(compiled.sql).toContain('COALESCE(t.merged_into_ticket_id, t.id)');
+  });
+
   it('keeps authenticated technician matching partner-scoped without locks', async () => {
     expect(await match({ inReplyTo: '<anchor@example.com>' }, PARTNER)).toEqual(ticket);
     expect(mocks.lock).not.toHaveBeenCalled();
@@ -119,5 +165,13 @@ describe.each([
     expect(compiled.sql).toContain('"tickets"."partner_id" =');
     expect(compiled.sql).toContain('"tickets"."deleted_at" is null');
     expect(compiled.params).toContain(PARTNER);
+  });
+});
+
+describe('stripTicketTokens (#8965)', () => {
+  it('strips both the staff and customer ticket tokens', () => {
+    expect(stripTicketTokens('Re: [KQ04YOHZ-N] Printer')).toBe('Re: Printer');
+    expect(stripTicketTokens('Re: [T-2026-0001] Printer')).toBe('Re: Printer');
+    expect(stripTicketTokens('Printer [lowercase1] down')).toBe('Printer [lowercase1] down');
   });
 });

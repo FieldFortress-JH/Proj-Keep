@@ -84,6 +84,8 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'AGENT_AUTO_PROMOTE',
   'AGENT_BACKUP_SERVER_URL',
   'AGENT_MTLS_BINDING_MODE',
+  'AI_OPERATOR_RECIPE_IDENTITY_OFFBOARDING_ENABLED',
+  'AI_OPERATOR_RECIPE_IDENTITY_ONBOARDING_ENABLED',
   'AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED',
   'AI_OPERATOR_TASKS_ENABLED',
   'AI_WORKSPACE_BACKEND',
@@ -123,6 +125,8 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'BREEZE_BINARIES_VERSION',
   'BREEZE_SERVER',
   'BREEZE_VERSION',
+  'BREEZE_WISP_CONNECTOR_ENABLED',
+  'BREEZE_WISP_ENABLED',
   'BREEZE_WORKSPACE_ENABLED',
   'C2C_M365_CLIENT_ID',
   'CF_ACCESS_TEAM_DOMAIN',
@@ -178,6 +182,8 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'MCP_LLM_PROVIDER',
   'MCP_OAUTH_ENABLED',
   'METRICS_SCRAPE_IP_ALLOWLIST',
+  'OAUTH_CIMD_ALLOWED_HOSTS',
+  'OAUTH_CIMD_ENABLED',
   'OAUTH_CONSENT_URL_BASE',
   'OAUTH_DCR_ALLOW_ANONYMOUS',
   'OAUTH_DCR_ENABLED',
@@ -216,9 +222,12 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'TICKET_MAILBOX_M365_CLIENT_ID',
   'TOOL_SOURCES_ALLOW_PRIVATE_EGRESS',
   'TOOL_SOURCES_ENABLED',
+  'FLOWS_ENABLED',
   'TRUSTED_PROXY_CIDRS',
   'TRUST_CF_CONNECTING_IP',
   'TRUST_PROXY_HEADERS',
+  'TUNNEL_FRAME_ANCESTOR',
+  'TUNNEL_ORIGIN_TEMPLATE',
   'TURN_HOST',
   'TURN_PORT',
   'TURN_TLS_DIR',
@@ -240,5 +249,18 @@ describe('reviewed secret:false vars', () => {
   it('the set of secret:false vars matches the reviewed list exactly', () => {
     const actual = allVars.filter((v) => v.secret === false).map((v) => v.name).sort();
     expect(actual).toEqual([...REVIEWED_PUBLIC_VARS].sort());
+  });
+});
+
+describe('flows entry follows the FLOWS_ENABLED default (on since #5221 R1)', () => {
+  const flows = CONNECTION_REGISTRY.find((entry) => entry.id === 'flows')!;
+  it.each([
+    [{}, 'enabled'],
+    [{ FLOWS_ENABLED: '' }, 'enabled'],
+    [{ FLOWS_ENABLED: 'true' }, 'enabled'],
+    [{ FLOWS_ENABLED: 'false' }, 'disabled'],
+    [{ FLOWS_ENABLED: '0' }, 'disabled'],
+  ] as const)('%j is %s', (env, expected) => {
+    expect(flows.status(env as Record<string, string>).status).toBe(expected);
   });
 });

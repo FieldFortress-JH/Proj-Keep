@@ -22,15 +22,24 @@ const interactionFixture = (
     display_name: string;
     redirect_uri: string;
     redirect_origin: string;
+    client_id: string;
+    registration: 'metadata_document' | 'dynamic';
+    client_id_host: string | null;
+    redirect_host: string;
+    localhost_redirect: boolean;
   }> = {},
 ) => ({
   uid: 'uid-1',
   client: {
-    client_id: 'client_abc',
+    client_id: overrides.client_id ?? 'client_abc',
     display_name: overrides.display_name ?? 'Claude',
     verification: 'unverified' as const,
     redirect_uri: overrides.redirect_uri ?? 'https://claude.ai/api/mcp/auth_callback',
     redirect_origin: overrides.redirect_origin ?? 'https://claude.ai',
+    registration: overrides.registration ?? ('dynamic' as const),
+    client_id_host: overrides.client_id_host ?? null,
+    redirect_host: overrides.redirect_host ?? 'claude.ai',
+    localhost_redirect: overrides.localhost_redirect ?? false,
   },
   scopes: overrides.scopes ?? ['mcp:read', 'mcp:write'],
   resource: 'https://us.2breeze.app/mcp/server',
@@ -99,6 +108,63 @@ describe('ConsentForm', () => {
     render(<ConsentForm uid="uid-1" />);
     const origin = await screen.findByTestId('oauth-callback-origin');
     expect(origin.textContent).toBe('https://claude.ai');
+  });
+
+  // B-W03 (#6157): Client ID Metadata Document clients.
+  const cimdFixture = (extra: Parameters<typeof interactionFixture>[0] = {}) => interactionFixture({
+    client_id: 'https://client.example.com/oauth/metadata.json',
+    display_name: 'Example Agent',
+    registration: 'metadata_document',
+    client_id_host: 'client.example.com',
+    redirect_uri: 'https://app.example.org/callback',
+    redirect_origin: 'https://app.example.org',
+    redirect_host: 'app.example.org',
+    ...extra,
+  });
+
+  it('ConsentForm shows the metadata host line only for metadata_document', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(cimdFixture()));
+    const { unmount } = render(<ConsentForm uid="uid-1" />);
+    const line = await screen.findByTestId('oauth-metadata-host');
+    expect(line.textContent).toContain('client.example.com');
+    expect(screen.getByText(/Unverified integration/)).toBeTruthy();
+    unmount();
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(interactionFixture()));
+    render(<ConsentForm uid="uid-1" />);
+    await screen.findByText(/Claude wants to access your Breeze tenant/);
+    expect(screen.queryByTestId('oauth-metadata-host')).toBeNull();
+  });
+
+  it('ConsentForm shows the localhost warning only for metadata_document + localhost_redirect', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(cimdFixture({
+      redirect_uri: 'http://127.0.0.1:3000/cb', redirect_origin: 'http://127.0.0.1:3000', redirect_host: '127.0.0.1', localhost_redirect: true,
+    })));
+    const { unmount } = render(<ConsentForm uid="uid-1" />);
+    expect(await screen.findByTestId('oauth-localhost-warning')).toBeTruthy();
+    unmount();
+
+    // A DCR client with a loopback callback: no CIMD-specific warning.
+    fetchMock.mockResolvedValueOnce(jsonResponse(interactionFixture({
+      redirect_uri: 'http://127.0.0.1:3000/cb', redirect_origin: 'http://127.0.0.1:3000', redirect_host: '127.0.0.1', localhost_redirect: true,
+    })));
+    const second = render(<ConsentForm uid="uid-1" />);
+    await screen.findByText(/Claude wants to access your Breeze tenant/);
+    expect(screen.queryByTestId('oauth-localhost-warning')).toBeNull();
+    second.unmount();
+
+    // A CIMD client with a public https callback: no warning either.
+    fetchMock.mockResolvedValueOnce(jsonResponse(cimdFixture()));
+    render(<ConsentForm uid="uid-1" />);
+    await screen.findByTestId('oauth-metadata-host');
+    expect(screen.queryByTestId('oauth-localhost-warning')).toBeNull();
+  });
+
+  it('ConsentForm still renders the redirect host prominently', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(cimdFixture()));
+    render(<ConsentForm uid="uid-1" />);
+    const origin = await screen.findByTestId('oauth-callback-origin');
+    expect(origin.textContent).toBe('https://app.example.org');
   });
 
   it('renders a script-bearing display name as inert escaped text, never markup (MCP-OAUTH-08)', async () => {
@@ -228,13 +294,44 @@ describe('ConsentForm', () => {
         '/oauth/interaction/uid-1/consent',
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ partner_id: 'p1', approve: true }),
+          body: JSON.stringify({ partner_id: 'p1', approve: true, mcp_domains: null }),
         }),
       );
     });
     await waitFor(() => {
       expect(window.location.href).toBe('https://client.example/cb?code=abc');
     });
+  });
+
+  it('posts mcp_domains null by default', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(interactionFixture()));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ redirectTo: 'https://client.example/cb?code=abc' }));
+
+    render(<ConsentForm uid="uid-1" />);
+    expect((await screen.findByTestId('mcp-domains-all') as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByTestId('mcp-domains-reconnect-note')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = JSON.parse(fetchMock.mock.calls[1]![1]!.body as string);
+    expect(body).toEqual({ partner_id: 'p1', approve: true, mcp_domains: null });
+  });
+
+  it('posts the selected list', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(interactionFixture()));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ redirectTo: 'https://client.example/cb?code=abc' }));
+
+    render(<ConsentForm uid="uid-1" />);
+    fireEvent.click(await screen.findByTestId('mcp-domains-selected'));
+    // Zero boxes ticked: the picker is invalid, so Approve is disabled.
+    expect((screen.getByRole('button', { name: /Approve/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId('mcp-domain-tickets'));
+    fireEvent.click(screen.getByTestId('mcp-domain-devices'));
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = JSON.parse(fetchMock.mock.calls[1]![1]!.body as string);
+    expect(body).toEqual({ partner_id: 'p1', approve: true, mcp_domains: ['devices', 'tickets'] });
   });
 
   it('posts approve=false on Deny', async () => {
@@ -248,7 +345,7 @@ describe('ConsentForm', () => {
       expect(fetchMock).toHaveBeenLastCalledWith(
         '/oauth/interaction/uid-1/consent',
         expect.objectContaining({
-          body: JSON.stringify({ partner_id: 'p1', approve: false }),
+          body: JSON.stringify({ partner_id: 'p1', approve: false, mcp_domains: null }),
         }),
       );
     });

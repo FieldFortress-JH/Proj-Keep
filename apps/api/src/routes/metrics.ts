@@ -6,7 +6,7 @@
 
 import { Hono } from 'hono';
 import { routePath as honoRoutePath } from 'hono/route';
-import { avg, and, eq, gte, inArray, sql } from 'drizzle-orm';
+import { avg, and, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import { Counter, Gauge, Histogram } from 'prom-client';
 
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
@@ -55,12 +55,14 @@ import { setAbuseMetricsRecorder } from '../services/abuseMetrics';
 import { setProxyTrustMetricsRecorder } from '../services/clientIp';
 import { setSupportCodeMetricsRecorder } from '../services/supportCodeMissBudget';
 import {
+  registerM365ConsentFailureCausePrometheusCounter,
   registerM365CustomerGraphActionsPrometheusCounter,
   registerM365CustomerGraphReadPrometheusCounter,
 } from '../services/m365ControlPlane/metrics';
 import { registerM365GraphReadActionPrometheusCounter } from '../services/m365ControlPlane/readActionMetrics';
 import { registerM365GraphActionsPrometheusCounter } from '../services/m365ControlPlane/writeActionMetrics';
 import { registerM365SyncMetrics } from '../services/m365Sync/metrics';
+import { registerConnectionHealthMetrics } from '../services/connectionHealth/metrics';
 import { registerActionIntentPrometheusCounter } from '../services/actionIntents/metrics';
 import { registerAgentCertificateBindingPrometheusCounter } from '../services/agentCertificateBinding';
 import { registerRetentionPrometheusMetrics } from '../services/retentionMetrics';
@@ -68,6 +70,8 @@ import { setExtensionMetricsRecorder } from '../extensions/metrics';
 import { envFloat } from '../utils/envFloat';
 
 import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { admissionRouteLabelOf } from '../services/safeRequestLabel';
+import { resolveAnalyticsDateWindow, resolveAnalyticsOrgScope } from './analyticsQueryScope';
 export {
   recordBackupCommandTimeout,
   recordBackupDispatchFailure,
@@ -109,12 +113,14 @@ let METRICS_SCRAPE_IP_ALLOWLIST = parseMetricsScrapeIpAllowlist();
 const register = metricsRegistry;
 registerM365CustomerGraphReadPrometheusCounter(register);
 registerM365CustomerGraphActionsPrometheusCounter(register);
+registerM365ConsentFailureCausePrometheusCounter(register);
 registerM365GraphReadActionPrometheusCounter(register);
 registerM365GraphActionsPrometheusCounter(register);
 registerActionIntentPrometheusCounter(register);
 registerAgentCertificateBindingPrometheusCounter(register);
 registerRetentionPrometheusMetrics(register);
 registerM365SyncMetrics(register);
+registerConnectionHealthMetrics(register);
 
 /**
  * Route label for a request that never reached a registered handler — a 404, or
@@ -235,6 +241,21 @@ const agentHeartbeatTotal = new Counter({
   name: 'agent_heartbeat_total',
   help: 'Total agent heartbeats received',
   labelNames: ['status'] as const,
+  registers: [register]
+});
+
+// #8869 — agent Encrypted Client Hello telemetry. Counters only; the agent
+// reports `echActive` and `filterSignatureSeenAt` on its heartbeat.
+const agentHeartbeatEchTotal = new Counter({
+  name: 'breeze_agent_heartbeat_ech_total',
+  help: 'Heartbeats carrying echActive=true: the agent\'s most recent successful control-plane dial was ECH-accepted. Current agents omit the key when false, so active="false" is only ever set by non-agent clients',
+  labelNames: ['active'] as const,
+  registers: [register]
+});
+
+const agentFilterSignatureReportsTotal = new Counter({
+  name: 'breeze_agent_filter_signature_reports_total',
+  help: 'Heartbeats reporting a network filter signature (plaintext HTTP on the TLS port)',
   registers: [register]
 });
 
@@ -627,6 +648,9 @@ function initializeMetricDefaults(): void {
   alertQueueLengthGauge.set(0);
   agentHeartbeatTotal.labels('success').inc(0);
   agentHeartbeatTotal.labels('failed').inc(0);
+  agentHeartbeatEchTotal.labels('true').inc(0);
+  agentHeartbeatEchTotal.labels('false').inc(0);
+  agentFilterSignatureReportsTotal.inc(0);
   scriptsExecutedTotal.inc(0);
   backupDispatchFailuresTotal.labels('manual_backup', 'device_offline').inc(0);
   backupVerificationSkipsTotal.labels('integrity', 'device_offline').inc(0);
@@ -678,6 +702,8 @@ interface CounterValue {
 
 const httpRequestState = new Map<string, CounterValue>();
 const agentHeartbeatState = new Map<string, CounterValue>();
+const agentHeartbeatEchState = new Map<string, CounterValue>();
+let agentFilterSignatureReports = 0;
 const softwarePolicyEvaluationState = new Map<string, CounterValue>();
 const softwareRemediationDecisionState = new Map<string, CounterValue>();
 const sensitiveDataFindingState = new Map<string, CounterValue>();
@@ -761,13 +787,14 @@ export function resolveResponseStatus(c: any): number {
  * own registration; every global in index.ts is registered at `'*'`, which Hono
  * normalises to `/*`, so that is what `unmatched` keys on. NOTE: this means a
  * request short-circuited by a global middleware (rate limit, body limit) also
- * reports `unmatched`, and a path-scoped guard reports ITS pattern
+ * reports `unmatched` (except an agent request refused by W08 admission control,
+ * which reports its route template via `admissionRouteLabelOf`), and a path-scoped guard reports ITS pattern
  * (`/api/v1/agents/:id/*`) rather than the leaf route.
  */
 function resolveRoutePattern(c: any): string {
   const resolved = honoRoutePath(c);
   const pattern = typeof resolved === 'string' ? resolved.trim() : '';
-  if (pattern.length === 0 || pattern === '/*' || pattern === '*') return UNMATCHED_ROUTE_LABEL;
+  if (pattern.length === 0 || pattern === '/*' || pattern === '*') return admissionRouteLabelOf(c) ?? UNMATCHED_ROUTE_LABEL;
   return pattern;
 }
 
@@ -824,6 +851,19 @@ export function recordHttpRequest(
 export function recordAgentHeartbeat(status: 'success' | 'failed'): void {
   agentHeartbeatTotal.labels(status).inc();
   upsertCounterState(agentHeartbeatState, { status });
+}
+
+/** #8869 — one heartbeat that carried `echActive`. */
+export function recordAgentHeartbeatEch(active: boolean): void {
+  const label = active ? 'true' : 'false';
+  agentHeartbeatEchTotal.labels(label).inc();
+  upsertCounterState(agentHeartbeatEchState, { active: label });
+}
+
+/** #8869 — one heartbeat that carried a valid `filterSignatureSeenAt`. */
+export function recordAgentFilterSignatureReport(): void {
+  agentFilterSignatureReportsTotal.inc();
+  agentFilterSignatureReports += 1;
 }
 
 export function recordAgentIngestSubmission(kind: AgentIngestKind, outcome: AgentIngestOutcome): void {
@@ -1248,6 +1288,8 @@ export function resetMetricsForTesting(): void {
 
   httpRequestState.clear();
   agentHeartbeatState.clear();
+  agentHeartbeatEchState.clear();
+  agentFilterSignatureReports = 0;
   softwarePolicyEvaluationState.clear();
   softwareRemediationDecisionState.clear();
   sensitiveDataFindingState.clear();
@@ -1484,12 +1526,22 @@ function emptyDashboardMetrics() {
 
 metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', 'system'), requireMetricsRead, async (c) => {
   const auth = c.get('auth');
-  const orgCondition =
-    typeof auth?.orgCondition === 'function'
-      ? auth.orgCondition(devices.orgId)
-      : auth?.orgId
-        ? eq(devices.orgId, auth.orgId)
-        : undefined;
+  // The org switcher's selection arrives as `?orgId=`; it may only narrow the
+  // token's reach (#9648).
+  const orgScope = resolveAnalyticsOrgScope(auth, c.req.query('orgId'));
+  if (!orgScope.ok) {
+    return c.json({ error: orgScope.error }, orgScope.status);
+  }
+  const orgCondition = orgScope.orgCondition(devices.orgId);
+  // "Sessions in range" follows the selected range (preset or custom, #9650);
+  // the other figures here (uptime, active sessions) are point-in-time.
+  const sessionWindow = resolveAnalyticsDateWindow(
+    { range: c.req.query('range'), startDate: c.req.query('startDate'), endDate: c.req.query('endDate') },
+    (range) => (range === '24h' ? 1 : range === '7d' ? 7 : 30)
+  );
+  if (!sessionWindow.ok) {
+    return c.json({ error: sessionWindow.error }, sessionWindow.status);
+  }
 
   // `allowedSiteIds` is populated by requirePermission. `undefined` is
   // unrestricted; `[]` is restricted to no sites and must never widen into
@@ -1551,9 +1603,9 @@ metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', '
       .where(activeSessionCondition);
     const activeSessions = Number(sessionRow?.count ?? 0);
 
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const totalSessionCondition = and(
-      gte(remoteSessions.createdAt, thirtyDaysAgo),
+      gte(remoteSessions.createdAt, sessionWindow.since),
+      sessionWindow.until ? lt(remoteSessions.createdAt, sessionWindow.until) : undefined,
       orgCondition,
       siteCondition
     );
@@ -1600,28 +1652,29 @@ metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partn
   }
 
   const auth = c.get('auth');
-  const orgCondition =
-    typeof auth?.orgCondition === 'function'
-      ? auth.orgCondition(devices.orgId)
-      : auth?.orgId
-        ? eq(devices.orgId, auth.orgId)
-        : undefined;
-  const range = c.req.query('range') ?? '30d';
-  const days = range === '24h' ? 1 : range === '7d' ? 7 : 30;
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const orgScope = resolveAnalyticsOrgScope(auth, c.req.query('orgId'));
+  if (!orgScope.ok) {
+    return c.json({ error: orgScope.error }, orgScope.status);
+  }
+  const orgCondition = orgScope.orgCondition(devices.orgId);
+  // Custom range (`startDate`/`endDate`) wins over the `range` preset (#9649).
+  const dateWindow = resolveAnalyticsDateWindow(
+    { range: c.req.query('range'), startDate: c.req.query('startDate'), endDate: c.req.query('endDate') },
+    (range) => (range === '24h' ? 1 : range === '7d' ? 7 : 30)
+  );
+  if (!dateWindow.ok) {
+    return c.json({ error: dateWindow.error }, dateWindow.status);
+  }
+  const { since, until } = dateWindow;
 
   try {
-    const rollupOrgCondition =
-      typeof auth?.orgCondition === 'function'
-        ? auth.orgCondition(metricRollups.orgId)
-        : auth?.orgId
-          ? eq(metricRollups.orgId, auth.orgId)
-          : undefined;
+    const rollupOrgCondition = orgScope.orgCondition(metricRollups.orgId);
     const rollupCondition = and(
       eq(metricRollups.sourceTable, 'device_metrics'),
       eq(metricRollups.bucketSeconds, 86400),
       inArray(metricRollups.metricName, ['cpu_percent', 'ram_percent']),
       gte(metricRollups.bucketStart, since),
+      ...(until ? [lt(metricRollups.bucketStart, until)] : []),
       sql`${metricRollups.sampleCount} > 0`,
       sql`${metricRollups.avgValue} IS NOT NULL`,
       ...(rollupOrgCondition ? [rollupOrgCondition] : [])
@@ -1652,9 +1705,11 @@ metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partn
       return c.json(Array.from(byBucket.values()));
     }
 
-    const trendsCondition = orgCondition
-      ? and(gte(deviceMetrics.timestamp, since), orgCondition)
-      : gte(deviceMetrics.timestamp, since);
+    const trendsCondition = and(
+      gte(deviceMetrics.timestamp, since),
+      ...(until ? [lt(deviceMetrics.timestamp, until)] : []),
+      ...(orgCondition ? [orgCondition] : [])
+    );
     const rows = await db
       .select({
         bucket: sql<string>`date_trunc('day', ${deviceMetrics.timestamp})`.as('bucket'),
@@ -1747,6 +1802,8 @@ metricsRoutes.get('/json', authMiddleware, requireScope('system'), async (c) => 
       low_readiness_devices: backupLowReadinessDevices,
     },
     agent_heartbeats: Array.from(agentHeartbeatState.values()),
+    agent_heartbeat_ech: Array.from(agentHeartbeatEchState.values()),
+    agent_filter_signature_reports_total: agentFilterSignatureReports,
     process: {
       uptime_seconds: process.uptime(),
       node_version: process.version

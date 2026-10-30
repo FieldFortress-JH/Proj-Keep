@@ -4,6 +4,12 @@ import { and, eq, sql } from 'drizzle-orm';
 import { canonicalizeScriptParameters, hasVariableTokens } from '@breeze/shared';
 
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  restorePointPayloadField,
+} from './restorePointRequest';
+import type { RestorePointRequestBlock } from '@breeze/shared';
 import { devices, organizations, scriptExecutions, scripts, sites, users } from '../db/schema';
 import type { ScriptProposalRow } from '../db/schema/scriptProposals';
 import type { ScriptApprovalMethod } from '@breeze/shared';
@@ -15,7 +21,7 @@ import {
 } from './commandDispatch';
 import { cancelledCommandError } from './commandCancelMessage';
 import { CommandTypes, queueCommand } from './commandQueue';
-import { aiOriginColumns } from './aiOriginColumns';
+import { aiOriginAuditActor, aiOriginColumns } from './aiOriginColumns';
 import type { AiOriginRef } from '@breeze/shared';
 import { defaultOfflinePolicy, deliverByFor, type OfflinePolicy } from './commandOfflinePolicy';
 import {
@@ -704,6 +710,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
   let payload: Record<string, unknown>;
   let command: Awaited<ReturnType<typeof queueCommand>>;
   let stage: 'payload build' | 'queueCommand' = 'payload build';
+  let restorePoint: RestorePointRequestBlock | null = null;
   try {
     // Payload build lives inside this guarded region (not after it) so a seal
     // failure — #3409 PR4a made the 'script' entry real — also discards the
@@ -715,6 +722,22 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     // Live since PR4c-2: `secretEnv` is set for `tenantSecret` parameters and
     // sealed here into `secretEnvEnvelope`; without one this is a passthrough.
     const reservedCommandId = randomUUID();
+    // #4609 W05: the System Restore checkpoint decision, resolved inside this
+    // guarded region so a resolution failure also discards the pending
+    // execution row. Stamped BEFORE encryption; the block carries no secret
+    // material and the encryptor passes it through untouched. Null (no
+    // policy, toggle off, non-Windows) adds no key at all.
+    restorePoint = await buildRestorePointRequest({
+      deviceId: device.id,
+      orgId: device.orgId,
+      osType: device.osType,
+      trigger: 'script',
+      label: source.kind === 'saved' ? `run script ${source.script.name}`
+        : source.kind === 'proposal' ? 'run reviewed script'
+          : 'run command',
+      deviceCommandId: reservedCommandId,
+      scriptExecutionId: executionId,
+    });
     payload = encryptSensitivePayloadFields('script', {
       scriptId: payloadScriptId,
       ...(executionId ? { executionId } : {}),
@@ -747,6 +770,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
       // agent already treats as fail-closed.
       ...(acknowledgedSecurityPatterns.length > 0 ? { acknowledgedSecurityPatterns } : {}),
       ...(input.targetSessionId != null ? { targetSessionId: input.targetSessionId } : {}),
+      ...restorePointPayloadField(restorePoint),
     }, { commandId: reservedCommandId, deviceId: device.id });
     stage = 'queueCommand';
     command = await queueCommand(device.id, 'script', payload, safeCreatedBy ?? undefined, {
@@ -774,10 +798,12 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     });
   } catch (err) {
     await discardPendingExecution(`${stage} threw`);
+    await discardRestorePointRequest(restorePoint);
     throw err;
   }
   if (!command) {
     await discardPendingExecution('queueCommand returned no row');
+    await discardRestorePointRequest(restorePoint);
     return { ok: false, code: 'insert_failed', error: 'Failed to create command' };
   }
 
@@ -870,8 +896,10 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
         });
         let sent: boolean;
         try {
+          // #8318 §6.4: to the agent_id read IN the claim, not `device.agentId`
+          // read before it (a reattach or re-enroll may have committed since).
           sent = deliverable
-            ? sendCommandToAgent(device.agentId, toAgentCommandFrame(deliverable))
+            ? sendCommandToAgent(claimed.agentId, toAgentCommandFrame(deliverable))
             : false;
         } catch (sendErr) {
           // The claim already flipped the row to 'sent'. Hand it back to
@@ -982,22 +1010,27 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     // source.proposal.authorKind while actorId came from the invoker, so an
     // AI-AUTHORED script hand-run by a human wrote actor_type='ai_agent'
     // against a HUMAN user id.) Authorship is a separate fact and now lives in
-    // `details.authorKind`.
-    const principalIsAgent = input.aiOrigin?.kind === 'ai_agent';
-    const auditActorType = principalIsAgent ? ('ai_agent' as const) : ('user' as const);
-    const auditActorId = principalIsAgent
-      ? (input.principalActorId ?? SYSTEM_ACTOR_ID)
-      : (safeCreatedBy ?? safeTriggeredBy ?? SYSTEM_ACTOR_ID);
+    // `details.authorKind`. Tool catalog W04 (#5219), Decision 16: the shared
+    // mapping makes a flow origin system automation carrying its run.
+    const humanActorId = safeCreatedBy ?? safeTriggeredBy;
+    const actor = input.aiOrigin
+      ? aiOriginAuditActor(input.aiOrigin, { agentActorId: input.principalActorId, humanActorId })
+      : {
+        actorType: 'user' as const,
+        actorId: humanActorId ?? SYSTEM_ACTOR_ID,
+        initiatedBy: 'ai' as const,
+        originDetails: aiOriginColumns(undefined),
+      };
     void createAuditLogAsync({
       trigger: input.trigger,
       orgId: device.orgId,
-      actorType: auditActorType,
-      actorId: auditActorId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
       action: 'ai.script.executed',
       resourceType: 'device',
       resourceId: device.id,
       resourceName: device.hostname,
-      initiatedBy: 'ai',
+      initiatedBy: actor.initiatedBy,
       result: 'dispatched',
       details: {
         executionId,
@@ -1011,7 +1044,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
         // arm indexes); `deviceId` is set as well so the feed's details arm can
         // also find it.
         deviceId: device.id,
-        ...aiOriginColumns(input.aiOrigin),
+        ...actor.originDetails,
         approvalMethod: input.provenance?.approvalMethod ?? null,
         reviewRiskTier: input.provenance?.reviewRiskTier ?? null,
         reviewSummary: input.provenance?.reviewSummary ?? null,

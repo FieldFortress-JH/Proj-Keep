@@ -51,11 +51,52 @@ if [ -z "$pinned" ]; then
 fi
 echo "pinned Go toolchain (agent/go.mod): $pinned"
 
+# --- required declarations -------------------------------------------------
+# The loops below only compare values they FIND. A workflow that loses its
+# declaration yields zero values, nothing is compared, and the guard would
+# still report "all pins agree" — fail-open (#8283). So the files that MUST
+# carry a pin are listed explicitly and a file yielding zero values fails.
+# Add a workflow here when it starts building/scanning Go.
+GO_VERSION_ENV_FILES=(
+  .github/workflows/ci.yml
+  .github/workflows/security.yml
+  .github/workflows/release.yml
+  .github/workflows/dev-build-agent.yml
+  .github/workflows/yara-pack.yml
+)
+GO_VERSION_LITERAL_FILES=(
+  .github/workflows/codeql.yml
+)
+
+env_values()     { sed -nE "s/^[[:space:]]*GO_VERSION:[[:space:]]*['\"]?([^'\"[:space:]]+)['\"]?.*/\1/p" "$1"; }
+literal_values() { sed -nE "s/^[[:space:]]*go-version:[[:space:]]*['\"]?([^'\"[:space:]]+)['\"]?.*/\1/p" "$1"; }
+
+for file in "${GO_VERSION_ENV_FILES[@]}"; do
+  [ -f "$file" ] || { note "$file is missing — it must declare GO_VERSION=$pinned"; continue; }
+  [ -n "$(env_values "$file")" ] \
+    || note "$file declares no GO_VERSION — its toolchain is no longer held to agent/go.mod"
+done
+for file in "${GO_VERSION_LITERAL_FILES[@]}"; do
+  [ -f "$file" ] || { note "$file is missing — it must pin go-version: $pinned"; continue; }
+  [ -n "$(literal_values "$file" | grep -vF '{{' || true)" ] \
+    || note "$file declares no literal go-version — its toolchain is no longer held to agent/go.mod"
+done
+
+# A templated go-version must read the pinned env var exactly; a typo such as
+# `${{ env.GOVERSION }}` expands to empty and would otherwise be skipped below.
+for file in .github/workflows/*.yml; do
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    note "$file go-version templates something other than \${{ env.GO_VERSION }}: $line"
+  done < <(grep -E '^[[:space:]]*go-version:[[:space:]]*.*\{\{' "$file" \
+    | grep -vE '\{\{[[:space:]]*env\.GO_VERSION[[:space:]]*\}\}' || true)
+done
+
 # --- every GO_VERSION env in workflows -------------------------------------
 for file in .github/workflows/*.yml; do
   while IFS= read -r v; do
     [ "$v" = "$pinned" ] || note "$file GO_VERSION=$v != $pinned (agent/go.mod)"
-  done < <(sed -nE "s/^[[:space:]]*GO_VERSION:[[:space:]]*['\"]?([^'\"[:space:]]+)['\"]?.*/\1/p" "$file")
+  done < <(env_values "$file")
 done
 
 # --- literal go-version: pins that bypass GO_VERSION entirely ---------------
@@ -64,7 +105,46 @@ for file in .github/workflows/*.yml; do
   while IFS= read -r v; do
     [[ "$v" == *'{{'* ]] && continue
     [ "$v" = "$pinned" ] || note "$file hard-codes go-version: $v != $pinned"
-  done < <(sed -nE "s/^[[:space:]]*go-version:[[:space:]]*['\"]?([^'\"[:space:]]+)['\"]?.*/\1/p" "$file")
+  done < <(literal_values "$file")
+done
+
+# --- other Go modules (#6263 W03b: the built-in YARA pack filter) ----------
+# Each extra go.mod is its own toolchain pin for anyone running `go test` /
+# `go build` in that directory (release.yml builds the pack with it).
+EXTRA_GO_MODS=(
+  scripts/security/yara-pack/go.mod
+)
+for file in "${EXTRA_GO_MODS[@]}"; do
+  [ -f "$file" ] || { note "$file is missing — it must declare go $pinned"; continue; }
+  v="$(sed -nE 's/^go ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "$file")"
+  if [ -z "$v" ]; then
+    note "$file has no fully-qualified 'go X.Y.Z' directive (want go $pinned)"
+  elif [ "$v" != "$pinned" ]; then
+    note "$file go $v != $pinned (agent/go.mod)"
+  fi
+done
+
+# --- golang build stages in Dockerfiles (#6263 W03a: breeze-yarac) ----------
+# The API images build the agent's YARA compiler from agent/ sources; that
+# stage must use the same toolchain as the agent and be digest-pinned.
+GO_DOCKERFILES=(
+  apps/api/Dockerfile
+  docker/Dockerfile.api
+  docker/Dockerfile.api.dev
+)
+for file in "${GO_DOCKERFILES[@]}"; do
+  [ -f "$file" ] || { note "$file is missing — it must build breeze-yarac with golang:$pinned"; continue; }
+  froms="$(grep -E '^FROM[[:space:]].*golang:' "$file" || true)"
+  [ -n "$froms" ] || note "$file has no golang build stage — expected golang:$pinned-alpine@sha256:… for breeze-yarac"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    v="$(sed -nE 's/.*golang:([0-9]+\.[0-9]+\.[0-9]+)-alpine@sha256:[0-9a-f]{64}.*/\1/p' <<<"$line")"
+    if [ -z "$v" ]; then
+      note "$file golang stage is not a digest-pinned golang:X.Y.Z-alpine@sha256 image: $line"
+    elif [ "$v" != "$pinned" ]; then
+      note "$file golang:$v != $pinned (agent/go.mod)"
+    fi
+  done <<<"$froms"
 done
 
 # --- public docs telling self-hosters which toolchain to install ------------

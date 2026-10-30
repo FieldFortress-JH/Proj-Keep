@@ -203,6 +203,7 @@
       "scanQueued": "Scansione di rilevamento accodata per \"{{name}}\"",
       "profileCreated": "Profilo di rilevamento \"{{name}}\" creato",
       "profileUpdated": "Profilo di rilevamento \"{{name}}\" aggiornato",
+      "profileDeleted": "Profilo di rilevamento \"{{name}}\" eliminato",
       "profileMoved": "Profilo spostato in {{site}}.",
       "assetsMoved_one": "{{count}} dispositivo di rete spostato",
       "assetsMoved_other": "{{count}} dispositivi di rete spostati",
@@ -269,11 +270,15 @@
       "time": "Ora",
       "timeout": "Timeout (ms)",
       "timezone": "Fuso orario",
-      "username": "Nome utente"
+      "username": "Nome utente",
+      "scanAgent": "Agente di scansione"
     },
     "options": {
       "everyHours": "Ogni {{count}} ore",
-      "selectSite": "Seleziona un sito..."
+      "selectSite": "Seleziona un sito...",
+      "automaticAgent": "Automatico (preferisci un agente su queste subnet)",
+      "agentOffline": "{{name}} (non in linea)",
+      "pinnedAgentUnlisted": "Agente fissato (non in questa sede)"
     },
     "placeholders": {
       "profileName": "Scansione sede centrale",
@@ -313,7 +318,13 @@
       "moveAssets_one": "Sposta anche il {{count}} dispositivo di rete rilevato da questo profilo nel nuovo sito",
       "moveAssets_other": "Sposta anche i {{count}} dispositivi di rete rilevati da questo profilo nel nuovo sito",
       "moveAssetsUnknown": "Sposta anche i dispositivi di rete rilevati da questo profilo nel nuovo sito"
-    }
+    },
+    "scanAgentHelp": {
+      "automatic": "Viene preferito un agente online di questa sede con un indirizzo in una delle subnet.",
+      "pinned": "Le scansioni vengono eseguite solo da questo agente. Se è offline, la scansione non riesce invece di usare un altro agente.",
+      "loadError": "Impossibile caricare gli agenti di questa sede. La selezione automatica è ancora disponibile."
+    },
+    "subnetTopologyNote": "Le sottoreti indicate qui identificano anche le reti di questa sede nella mappa della topologia."
   },
   "discoveryProfileList": {
     "actions": {
@@ -332,6 +343,8 @@
       "subnets": "Subnet"
     },
     "configuredCount": "{{count}} profili configurati",
+    "configuredCount_one": "{{count}} profilo configurato",
+    "configuredCount_other": "{{count}} profili configurati",
     "empty": "Nessun profilo di rilevamento. Crea il primo profilo per iniziare la scansione.",
     "lastRun": "Ultima esecuzione {{time}}",
     "loading": "Caricamento dei profili di rilevamento...",
@@ -427,7 +440,10 @@
       "interval": "L'intervallo di scansione deve essere compreso tra 1 e 168 ore.",
       "selectSite": "Seleziona un sito prima di salvare."
     },
-    "configuredCount": "{{count}} baseline configurate"
+    "configuredCount": "{{count}} baseline configurate",
+    "configuredCount_one": "{{count}} baseline configurata",
+    "configuredCount_other": "{{count}} baseline configurate",
+    "subnetTopologyNote": "Le sottoreti indicate qui identificano anche le reti di questa sede nella mappa della topologia."
   },
   "networkChangeDetailModal": {
     "acknowledgeTitle": "Conferma evento",

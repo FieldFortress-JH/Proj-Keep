@@ -3,9 +3,6 @@ import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { automationActionSchema, scriptParametersSchema, alertTriggerKey, buildTriggerKey, interpolateAlertTemplate, type RemediationTrigger, type DeploymentTargetConfig } from '@breeze/shared';
 import { db, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import {
-  alertRules,
-  alerts,
-  alertTemplates,
   automationActionResults,
   automations,
   automationResourceBindings,
@@ -15,6 +12,7 @@ import {
   configPolicyEffectiveFeatureLinks,
   configurationPolicies,
   deviceGroupMemberships,
+  deviceGroups as deviceGroupsTable,
   devices,
   notificationChannels,
   organizations,
@@ -23,12 +21,15 @@ import {
 } from '../db/schema';
 import type { NotificationChannelWithConfig } from './notificationChannelConfig';
 import { resolveDeploymentTargets } from './deploymentEngine';
+import { resolveDeploymentTargetsWithWarnings } from './deploymentTargetResolver';
+import { partitionGroupsByExecutionFieldProvenance } from './executionTargetGating';
 import { canAccessSite, type UserPermissions } from './permissions';
 import { dispatchScriptToDevice, type DispatchScriptResult } from './scriptDispatch';
 import { deliveryTtlMs, type OfflinePolicy } from './commandOfflinePolicy';
 import { loadTenantVariableScope, type TenantVariableScope } from './tenantVariableResolution';
 import { scriptNeedsVariableScope } from './sourcedParameters';
 import { publishEvent } from './eventBus';
+import { createAutomationStyleAlert } from './alertCreation';
 import { captureException } from './sentry';
 import {
   createAndEnqueueAgentRun,
@@ -56,6 +57,7 @@ import {
   claimAutomationActionDispatch,
   claimAutomationActionDispatches,
   readAutomationActionState,
+  claimAutomationFailureNotification,
   recordAutomationActionDispatch,
   reconcileAutomationRun,
   seedAutomationActionResults,
@@ -1054,7 +1056,101 @@ async function resolveLegacyConditionTargets(orgIds: string[], conditionsInput: 
     .map((device) => device.id);
 }
 
-export async function resolveAutomationTargetDeviceIds(automation: AutomationRow): Promise<string[]> {
+/**
+ * #8598 — what a run needs to know about its target set beyond the device ids.
+ *
+ * - `warnings`: the run proceeds; each is written to the run log (a refused
+ *   group, a valid group that currently has no members).
+ * - `problems`: the configured target is broken (a group that was deleted or
+ *   is not in the owner org, every target group refused, a group target on a
+ *   partner-wide automation). The run is recorded `failed` with these as its
+ *   reasons and dispatches nothing — never a quiet zero-device "completed".
+ */
+export interface AutomationTargetDiagnostics {
+  warnings: string[];
+  problems: string[];
+}
+
+export interface AutomationTargetResolution extends AutomationTargetDiagnostics {
+  deviceIds: string[];
+}
+
+export const PARTNER_WIDE_GROUP_TARGET_PROBLEM =
+  'Device group targets are not supported on partner-wide automations (a group belongs to a single organization); change the target to all devices or a filter';
+
+/**
+ * Org-owned `groups` target: every group must still exist in the owner org.
+ * Membership is the MATERIALIZED `device_group_memberships`, read through the
+ * shared per-org resolver (which keeps `eq(devices.orgId, orgId)` and refuses +
+ * audits groups keyed on execution-refused agent-reported fields).
+ */
+async function resolveAutomationGroupTargets(
+  orgId: string,
+  groupIds: string[],
+): Promise<AutomationTargetResolution> {
+  const requested = [...new Set(groupIds)];
+  const rows = requested.length > 0
+    ? await db
+      .select({ id: deviceGroupsTable.id, orgId: deviceGroupsTable.orgId, filterFieldsUsed: deviceGroupsTable.filterFieldsUsed })
+      .from(deviceGroupsTable)
+      .where(inArray(deviceGroupsTable.id, requested))
+    : [];
+  const inOwnerOrg = rows.filter((row) => row.orgId === orgId);
+  const inOwnerOrgIds = new Set(inOwnerOrg.map((row) => row.id));
+  const unusable = requested.filter((id) => !inOwnerOrgIds.has(id));
+
+  const problems: string[] = [];
+  if (unusable.length > 0) {
+    problems.push(
+      `Target device group(s) ${unusable.join(', ')} no longer exist or are not in this automation's organization`,
+    );
+  }
+
+  const { deviceIds, warnings } = inOwnerOrg.length > 0
+    ? await resolveDeploymentTargetsWithWarnings({
+      orgId,
+      targetConfig: { type: 'groups', groupIds: inOwnerOrg.map((row) => row.id) },
+    })
+    : { deviceIds: [], warnings: [] };
+
+  const { allowedGroupIds } = partitionGroupsByExecutionFieldProvenance(inOwnerOrg);
+  if (inOwnerOrg.length > 0 && allowedGroupIds.length === 0) {
+    problems.push('Every target device group was refused as an execution target; nothing was run');
+  }
+  const resultWarnings = [...warnings];
+  if (problems.length === 0 && deviceIds.length === 0) {
+    resultWarnings.push('The target device group(s) currently have no members; nothing to run');
+  }
+
+  return { deviceIds, warnings: resultWarnings, problems };
+}
+
+/**
+ * The automation's configured target set, with diagnostics. Only a `groups`
+ * target produces diagnostics today; every other shape resolves exactly as
+ * before (`resolveAutomationTargetDeviceIds` is a thin wrapper over this).
+ */
+export async function resolveAutomationTargetsDetailed(
+  automation: Pick<AutomationRow, 'orgId' | 'partnerId' | 'conditions' | 'trigger'>,
+): Promise<AutomationTargetResolution> {
+  if (isDeploymentTargetConfig(automation.conditions) && automation.conditions.type === 'groups') {
+    if (!automation.orgId) {
+      return { deviceIds: [], warnings: [], problems: [PARTNER_WIDE_GROUP_TARGET_PROBLEM] };
+    }
+    return resolveAutomationGroupTargets(automation.orgId, automation.conditions.groupIds ?? []);
+  }
+  return { deviceIds: await resolveConfiguredTargetDeviceIds(automation), warnings: [], problems: [] };
+}
+
+export async function resolveAutomationTargetDeviceIds(
+  automation: Pick<AutomationRow, 'orgId' | 'partnerId' | 'conditions' | 'trigger'>,
+): Promise<string[]> {
+  return (await resolveAutomationTargetsDetailed(automation)).deviceIds;
+}
+
+async function resolveConfiguredTargetDeviceIds(
+  automation: Pick<AutomationRow, 'orgId' | 'partnerId' | 'conditions' | 'trigger'>,
+): Promise<string[]> {
   // Dual-ownership fan-out (#2133): a partner-wide automation (orgId NULL)
   // resolves targets across EVERY org under the owning partner.
   const ownerOrgIds = await automationOwnerOrgIds(automation);
@@ -1150,6 +1246,13 @@ export interface AutomationSiteScopeCheck {
    * resolution, so two calls are not guaranteed to agree.
    */
   targetDeviceIds: string[];
+  /**
+   * #8598 — diagnostics from the same resolution as `targetDeviceIds` (only set
+   * when a resolution happened). A caller that binds `targetDeviceIds` into a
+   * run passes these along as `createAutomationRunRecord`'s
+   * `targetDiagnostics`, so a broken group target still fails that run visibly.
+   */
+  targetDiagnostics?: AutomationTargetDiagnostics;
 }
 
 /**
@@ -1172,14 +1275,17 @@ export async function checkAutomationTargetsWithinSiteScope(
     return { ok: true, outOfScopeDeviceIds: [], unbounded: false, restricted: false, targetDeviceIds: [] };
   }
 
-  const unbounded = isUnboundedOrgWideTarget(automation);
+  const unbounded = isUnboundedOrgWideTarget(automation)
+    || await groupTargetEscapesSiteAllowlist(automation, perms as UserPermissions);
   if (unbounded) {
     return { ok: false, outOfScopeDeviceIds: [], unbounded: true, restricted: true, targetDeviceIds: [] };
   }
 
-  const targetDeviceIds = await resolveAutomationTargetDeviceIds(automation);
+  const resolution = await resolveAutomationTargetsDetailed(automation);
+  const targetDiagnostics = { warnings: resolution.warnings, problems: resolution.problems };
+  const targetDeviceIds = resolution.deviceIds;
   if (targetDeviceIds.length === 0) {
-    return { ok: true, outOfScopeDeviceIds: [], unbounded: false, restricted: true, targetDeviceIds: [] };
+    return { ok: true, outOfScopeDeviceIds: [], unbounded: false, restricted: true, targetDeviceIds: [], targetDiagnostics };
   }
 
   const ownerOrgIds = await automationOwnerOrgIds(automation);
@@ -1194,7 +1300,42 @@ export async function checkAutomationTargetsWithinSiteScope(
     .filter((device) => !(typeof device.siteId === 'string' && canAccessSite(perms as UserPermissions, device.siteId)))
     .map((device) => device.id);
 
-  return { ok: outOfScopeDeviceIds.length === 0, outOfScopeDeviceIds, unbounded: false, restricted: true, targetDeviceIds };
+  return {
+    ok: outOfScopeDeviceIds.length === 0,
+    outOfScopeDeviceIds,
+    unbounded: false,
+    restricted: true,
+    targetDeviceIds,
+    targetDiagnostics,
+  };
+}
+
+/**
+ * #8598 — `isUnboundedOrgWideTarget` treats `groups` as a concrete set, which
+ * is only true for a group that cannot grow beyond the caller's sites. A
+ * dynamic group gains members as devices start matching, and a static group
+ * with no site (or another site) can be given members anywhere in the org —
+ * then a scheduled run resolves devices outside the creator's allowlist with
+ * no caller context. For a site-restricted caller a `groups` target is bounded
+ * only when EVERY group is static and sits at an allowed site. (A group that
+ * no longer exists contributes no devices and is the run's own problem.)
+ *
+ * Kept here, not in `isUnboundedOrgWideTarget`, because it needs a DB read and
+ * that function stays pure and synchronous.
+ */
+async function groupTargetEscapesSiteAllowlist(
+  automation: Pick<AutomationRow, 'conditions'>,
+  perms: UserPermissions,
+): Promise<boolean> {
+  if (!isDeploymentTargetConfig(automation.conditions) || automation.conditions.type !== 'groups') return false;
+  const groupIds = [...new Set(automation.conditions.groupIds ?? [])];
+  if (groupIds.length === 0) return false;
+  const rows = await db
+    .select({ id: deviceGroupsTable.id, type: deviceGroupsTable.type, siteId: deviceGroupsTable.siteId })
+    .from(deviceGroupsTable)
+    .where(inArray(deviceGroupsTable.id, groupIds));
+  return rows.some((group) => group.type !== 'static'
+    || !(typeof group.siteId === 'string' && canAccessSite(perms, group.siteId)));
 }
 
 function getExistingLogs(logs: unknown): AutomationLogEntry[] {
@@ -1229,76 +1370,6 @@ function logEntry(
 function parseNotificationChannelConfig(config: unknown): Record<string, unknown> {
   if (!isPlainRecord(config)) return {};
   return config;
-}
-
-async function ensureAutomationAlertRule(orgId: string): Promise<string> {
-  const templateName = 'Automation Action Template';
-  const ruleName = 'Automation Action Alerts';
-
-  const [existingTemplate] = await db
-    .select({ id: alertTemplates.id })
-    .from(alertTemplates)
-    .where(and(eq(alertTemplates.orgId, orgId), eq(alertTemplates.name, templateName)))
-    .limit(1);
-
-  const templateId = existingTemplate?.id ?? (await db
-    .insert(alertTemplates)
-    .values({
-      orgId,
-      name: templateName,
-      description: 'Template for alerts generated by automation actions',
-      conditions: {},
-      severity: 'medium',
-      titleTemplate: '{{title}}',
-      messageTemplate: '{{message}}',
-      autoResolve: false,
-      cooldownMinutes: 1,
-      isBuiltIn: false,
-    })
-    .returning({ id: alertTemplates.id })
-  )[0]?.id;
-
-  if (!templateId) {
-    throw new Error('Failed to create automation alert template');
-  }
-
-  const [existingRule] = await db
-    .select({ id: alertRules.id })
-    .from(alertRules)
-    .where(
-      and(
-        eq(alertRules.orgId, orgId),
-        eq(alertRules.name, ruleName),
-        eq(alertRules.targetType, 'org'),
-        eq(alertRules.targetId, orgId),
-      ),
-    )
-    .limit(1);
-
-  if (existingRule?.id) {
-    return existingRule.id;
-  }
-
-  const [rule] = await db
-    .insert(alertRules)
-    .values({
-      orgId,
-      templateId,
-      name: ruleName,
-      targetType: 'org',
-      targetId: orgId,
-      overrideSettings: {
-        templateOwned: true,
-      },
-      isActive: true,
-    })
-    .returning({ id: alertRules.id });
-
-  if (!rule?.id) {
-    throw new Error('Failed to create automation alert rule');
-  }
-
-  return rule.id;
 }
 
 type ActionExecutionContext = {
@@ -1576,6 +1647,17 @@ const AI_TRIAGE_SKIP_IS_FAILURE: Readonly<Record<AgentRunSkipReason, boolean>> =
   // AI Suggested Fixes W3: memory already proves a fix; the proven suggestion
   // is attached instead of a shadow run.
   proven_fix_available: false,
+  // Wisp W02: a delegation grant that is no longer usable (or no longer
+  // reaches the org) is a policy outcome, not an integrity failure.
+  // Unreachable today — automations never pass a grant.
+  grant_inactive: false,
+  grant_org_out_of_ceiling: false,
+  // Wisp W05b: assessment volume guards and the grant precondition — caps and
+  // policy outcomes, not integrity failures. Unreachable — automations never
+  // admit an assessment.
+  max_concurrent_assessment_runs: false,
+  assessment_rate: false,
+  assessment_requires_grant: false,
 });
 
 // Exported for direct unit coverage of the script_executions correlation
@@ -2027,8 +2109,6 @@ async function executeCreateAlertAction(
   // Alert rows (and their backing rule/template) take the DEVICE's org —
   // playbook rule 5: a partner-wide automation (orgId NULL) never owns child
   // rows; each alert lands in the org whose device raised it (#2133).
-  const ruleId = await ensureAutomationAlertRule(context.device.orgId);
-
   const deviceLabel = context.device.displayName || context.device.hostname;
   const templateContext = {
     device: deviceLabel,
@@ -2041,34 +2121,18 @@ async function executeCreateAlertAction(
   );
   const message = interpolateAlertTemplate(action.alertMessage, templateContext);
 
-  // Every create_alert action shares ONE synthetic per-org rule, so several can
-  // be open on one device at once. Each alert is its own subject: the open-alert
-  // identity index (one open alert per rule, device, subject — W03 #6854) must
-  // never merge distinct automation alerts. The 110300 migration keys existing
-  // rows with the same `automation-alert:<id>` form.
-  const alertId = randomUUID();
-  const [createdAlert] = await db
-    .insert(alerts)
-    .values({
-      id: alertId,
-      subjectKey: `automation-alert:${alertId}`,
-      ruleId,
-      deviceId: context.device.id,
-      orgId: context.device.orgId,
-      status: 'active',
-      severity: action.alertSeverity,
-      title,
-      message,
-      context: {
-        automationId: context.automation.id,
-        automationRunId: context.runId,
-        deviceId: context.device.id,
-      },
-      triggeredAt: new Date(),
-    })
-    .returning({ id: alerts.id });
+  // Tool Catalog W06 (#5221): the row + event writer is shared with the flow
+  // `create_alert` built-in (services/alertCreation.ts), moved verbatim.
+  const createdAlert = await createAutomationStyleAlert({
+    orgId: context.device.orgId,
+    deviceId: context.device.id,
+    severity: action.alertSeverity,
+    title,
+    message,
+    provenance: { kind: 'automation', automationId: context.automation.id, runId: context.runId },
+  });
 
-  if (!createdAlert?.id) {
+  if (!createdAlert) {
     return {
       outcome: { status: 'failed', message: 'Failed to create alert' },
       log: logEntry('Failed to create alert from create_alert action', 'error', {
@@ -2079,29 +2143,13 @@ async function executeCreateAlertAction(
     };
   }
 
-  await publishEvent(
-    'alert.triggered',
-    context.device.orgId,
-    {
-      alertId: createdAlert.id,
-      ruleId,
-      deviceId: context.device.id,
-      severity: action.alertSeverity,
-      title,
-      message,
-      automationId: context.automation.id,
-      runId: context.runId,
-    },
-    'automation-executor',
-  );
-
   return {
     outcome: { status: 'succeeded' },
     log: logEntry('create_alert action created alert successfully', 'info', {
       actionType: action.type,
       actionIndex,
       deviceId: context.device.id,
-      alertId: createdAlert.id,
+      alertId: createdAlert.alertId,
     }),
   };
 }
@@ -3246,26 +3294,52 @@ async function executeAutomationActionsInOrder(args: {
     device: OrderedAutomationDevice,
     actionIndex: number,
     message: string,
-    options: { replayed?: boolean } = {},
+    options: { notify?: boolean } = {},
   ): Promise<void> => {
     failedDeviceIds.add(device.id);
-    // #3189 — a failure an earlier attempt of this run already recorded had its
-    // on-failure notification sent by that attempt. Re-sending it on every
-    // replay would page the MSP twice for one failure, so a replayed failure
-    // is at-most-once: if the first attempt died before sending, it is lost.
-    if (args.onFailure === 'notify' && !options.replayed) {
+    if (args.onFailure === 'notify' && options.notify !== false) {
       try {
-        logs.push(...await sendOnFailureNotifications(
-          args.automation,
-          args.channelsById,
-          args.notificationTargets,
-          {
+        // #7188 — whether to send is decided by a CAS on the failed action's
+        // failure_notified_at, not by whether this attempt is a replay. A
+        // first attempt and a stalled-job replay both go through the claim:
+        // the one that wins sends, every other attempt sends nothing. A
+        // replay therefore still sends an alert the first attempt recorded
+        // the failure for but died before claiming.
+        const claimed = await claimAutomationFailureNotification({
+          runId: args.runId,
+          deviceId: device.id,
+          actionIndex,
+        });
+        if (claimed === 'claimed') {
+          logs.push(...await sendOnFailureNotifications(
+            args.automation,
+            args.channelsById,
+            args.notificationTargets,
+            {
+              runId: args.runId,
+              deviceId: device.id,
+              deviceOrgId: device.orgId,
+              message,
+            },
+          ));
+        } else if (claimed === 'already_claimed') {
+          logs.push(logEntry('On-failure notification already claimed by an earlier attempt of this run', 'info', {
+            actionIndex,
+            deviceId: device.id,
+          }));
+        } else {
+          // Unreachable by construction: every dispatched action is seeded
+          // first. Without a row nothing can deduplicate the send, so refuse.
+          captureException(new Error('automation on-failure notification has no action result row to claim'), undefined, {
             runId: args.runId,
             deviceId: device.id,
-            deviceOrgId: device.orgId,
-            message,
-          },
-        ));
+            actionIndex: String(actionIndex),
+          });
+          logs.push(logEntry('On-failure notification not sent: no action result row to claim', 'error', {
+            actionIndex,
+            deviceId: device.id,
+          }));
+        }
       } catch (err) {
         // A best-effort failure notification must not strand later action rows
         // in pending or abort dispatch for unrelated devices.
@@ -3326,7 +3400,15 @@ async function executeAutomationActionsInOrder(args: {
     logs.push(replayedActionLog(state, actionIndex, device.id));
     const replayed = classifyReplayedAction(state);
     if (replayed.kind === 'terminal_failed') {
-      await handleFailure(device, actionIndex, replayed.message, { replayed: true });
+      // #7188 — a replay notifies only for a failure the first attempt would
+      // have notified for: one its own dispatch path recorded. An agent-reported
+      // failure, a timeout, a cancellation or an authority loss never paged on
+      // a first attempt, so it must not start paging because a worker stalled.
+      await handleFailure(device, actionIndex, replayed.message, {
+        notify: state.status === 'failed'
+          && state.terminalSource === 'dispatch'
+          && state.message !== AUTOMATION_TARGET_AUTHORITY_LOST,
+      });
       return;
     }
     if (replayed.kind === 'in_flight') {
@@ -3636,6 +3718,22 @@ export async function createAutomationRunRecord(options: {
    * webhook runs, which are never deduplicated.
    */
   occurrenceKey?: string;
+  /**
+   * #8598 — diagnostics from the resolution that produced `boundDeviceIds`
+   * (the site-scope check's `targetDiagnostics`). Ignored without
+   * `boundDeviceIds`, where this function resolves — and diagnoses — itself.
+   * Omit for event-bound runs: their target is the triggering device, not
+   * the configured target set.
+   */
+  targetDiagnostics?: AutomationTargetDiagnostics;
+  /**
+   * #5221 B2 — runs inside the run's transaction, after the insert and the
+   * `run_count` bump, for a NEWLY minted run only (a reused run's admission
+   * already ran it). A throw rolls the run back with whatever the hook wrote
+   * (the occurrence claim) and is rethrown to the caller. Omitted by every
+   * caller whose automation has no conversion, so their path is unchanged.
+   */
+  onCreated?: (tx: Parameters<Parameters<typeof db.transaction>[0]>[0], run: AutomationRunRow) => Promise<void>;
 }): Promise<{ run: AutomationRunRow; targetDeviceIds: string[]; reused: boolean }> {
   const normalized = normalizeAutomationInput({
     trigger: options.automation.trigger,
@@ -3644,8 +3742,22 @@ export async function createAutomationRunRecord(options: {
     onFailure: options.automation.onFailure,
     notificationTargets: options.automation.notificationTargets,
   });
-  const targetDeviceIds = options.boundDeviceIds
-    ?? await resolveAutomationTargetDeviceIds(options.automation);
+  let targetDeviceIds: string[];
+  let diagnostics: AutomationTargetDiagnostics;
+  if (options.boundDeviceIds) {
+    targetDeviceIds = options.boundDeviceIds;
+    diagnostics = options.targetDiagnostics ?? { warnings: [], problems: [] };
+  } else {
+    const resolution = await resolveAutomationTargetsDetailed(options.automation);
+    targetDeviceIds = resolution.deviceIds;
+    diagnostics = { warnings: resolution.warnings, problems: resolution.problems };
+  }
+  // A broken target fails the run at creation, visibly and before anything is
+  // queued: the run row is born `failed` with the reasons in its log, targets
+  // nothing, and the executor's terminal-run short-circuit makes any enqueue a
+  // no-op. Never a quiet zero-device "completed".
+  const failedAtCreation = diagnostics.problems.length > 0;
+  if (failedAtCreation) targetDeviceIds = [];
 
   const { run, reused } = await db.transaction(async (tx) => {
     await resolveStandaloneAutomationReferencesForAdmission(tx, options.automation, normalized);
@@ -3655,7 +3767,8 @@ export async function createAutomationRunRecord(options: {
       .values({
         automationId: options.automation.id,
         triggeredBy: options.triggeredBy,
-        status: 'running',
+        status: failedAtCreation ? 'failed' : 'running',
+        ...(failedAtCreation ? { completedAt: new Date() } : {}),
         devicesTargeted: targetDeviceIds.length,
         devicesSucceeded: 0,
         devicesFailed: 0,
@@ -3667,6 +3780,12 @@ export async function createAutomationRunRecord(options: {
               ...options.details,
             },
           }),
+          ...diagnostics.warnings.map((warning) => logEntry(warning, 'warning', {
+            details: { phase: 'target_resolution' },
+          })),
+          ...diagnostics.problems.map((problem) => logEntry(problem, 'error', {
+            details: { phase: 'target_resolution' },
+          })),
         ],
       });
     const [created] = options.occurrenceKey
@@ -3705,11 +3824,19 @@ export async function createAutomationRunRecord(options: {
         updatedAt: new Date(),
       })
       .where(eq(automations.id, options.automation.id));
+    if (options.onCreated) await options.onCreated(tx, created);
     return { run: created, reused: false };
   });
 
   // A reused run already published its `automation.started` when it was minted.
   if (options.deferStartedEvent || reused) return { run, targetDeviceIds, reused };
+  // A run born `failed` never started: nothing to announce.
+  if (failedAtCreation) {
+    console.warn(
+      `[AutomationRuntime] automation ${options.automation.id} run ${run.id} failed at creation: ${diagnostics.problems.join('; ')}`,
+    );
+    return { run, targetDeviceIds, reused };
+  }
 
   // Lifecycle events carry an org. An org-owned automation publishes to its
   // own org (unchanged); a partner-wide automation (orgId NULL, #2133) has no
@@ -4014,9 +4141,35 @@ async function executeAutomationRunInner(
   const resolvedReferences = await withAutomationRuntimeDb(() => db.transaction((tx) =>
     resolveStandaloneAutomationReferencesForAdmission(tx, automation, normalized)));
 
-  const resolvedTargetIds = targetDeviceIdsFromQueue && targetDeviceIdsFromQueue.length > 0
-    ? targetDeviceIdsFromQueue
-    : await withAutomationRuntimeDb(() => resolveAutomationTargetDeviceIds(automation));
+  let resolvedTargetIds: string[];
+  if (targetDeviceIdsFromQueue && targetDeviceIdsFromQueue.length > 0) {
+    resolvedTargetIds = targetDeviceIdsFromQueue;
+  } else {
+    // #8598 — re-resolving here (an empty frozen set, or a resume) must not
+    // turn a target that broke since run creation into a quiet zero-device
+    // completion: fail the run with the reasons instead.
+    const resolution = await withAutomationRuntimeDb(() => resolveAutomationTargetsDetailed(automation));
+    // A resume (an earlier attempt already seeded devices) is not failed here:
+    // it continues from its ledger below, so a half-dispatched run is never
+    // torn down by a target that broke mid-flight.
+    const isResume = resolution.problems.length > 0
+      && (await withAutomationRuntimeDb(() => ledgerDeviceIdsForRun(run.id))).length > 0;
+    if (resolution.problems.length > 0 && !isResume) {
+      await withAutomationRuntimeDb(async () => {
+        const logs = [
+          ...getExistingLogs(run.logs),
+          ...resolution.problems.map((problem) => logEntry(problem, 'error', {
+            details: { phase: 'target_resolution' },
+          })),
+        ];
+        await db.update(automationRuns).set({ logs })
+          .where(and(eq(automationRuns.id, run.id), eq(automationRuns.status, 'running')));
+        await markAutomationRunFailedAfterError(run.id, new Error(resolution.problems.join('; ')));
+      });
+      return { status: 'failed', devicesSucceeded: 0, devicesFailed: 0 };
+    }
+    resolvedTargetIds = resolution.deviceIds;
+  }
   // #3189 — on a resume, keep every device an earlier attempt already seeded.
   // Empty on a first attempt, so this is a no-op there.
   const resumedDeviceIds = new Set(await withAutomationRuntimeDb(() => ledgerDeviceIdsForRun(run.id)));

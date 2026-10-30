@@ -9,9 +9,12 @@ import { showToast } from '../shared/Toast';
 vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
-// Stand-in for the filter panel: one button applies a known filter set.
+// Stand-in for the filter panel: one button applies a known filter set, and it
+// echoes the filters it was opened with (#9941).
 vi.mock('./AuditFilters', () => ({
-  default: ({ onApply }: { onApply: (f: unknown) => void }) => (
+  default: ({ onApply, initialFilters }: { onApply: (f: unknown) => void; initialFilters?: unknown }) => (
+    <>
+    <pre data-testid="mock-initial-filters">{JSON.stringify(initialFilters ?? null)}</pre>
     <button
       type="button"
       onClick={() =>
@@ -27,6 +30,7 @@ vi.mock('./AuditFilters', () => ({
     >
       apply-test-filters
     </button>
+    </>
   ),
 }));
 
@@ -107,12 +111,34 @@ describe('AuditLogViewer', () => {
     );
   });
 
+  it('reopens the filter panel seeded with the applied filters (#9941)', async () => {
+    render(<AuditLogViewer />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const filtersToggle = () => screen.getByRole('button', { name: /filters/i });
+
+    fireEvent.click(filtersToggle());
+    expect(JSON.parse(screen.getByTestId('mock-initial-filters').textContent!)).toBeNull();
+
+    fireEvent.click(screen.getByText('apply-test-filters'));
+    // Apply closes (unmounts) the panel; reopening must hand it what was applied.
+    await waitFor(() => expect(screen.queryByTestId('mock-initial-filters')).toBeNull());
+    fireEvent.click(filtersToggle());
+    expect(JSON.parse(screen.getByTestId('mock-initial-filters').textContent!)).toEqual({
+      datePreset: '7d',
+      userId: '11111111-1111-4111-8111-111111111111',
+      userEmail: 'dana@example.com',
+      actions: ['login'],
+      resources: ['device'],
+      search: 'abc',
+    });
+  });
+
   it('sends the viewer filters the export API accepts (userId) on the export request', async () => {
     render(<AuditLogViewer />);
     await screen.findByText(/audit log/i);
     fireEvent.click(screen.getByRole('button', { name: /filters/i }));
     fireEvent.click(await screen.findByText('apply-test-filters'));
-    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes('user='))).toBe(true));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes('userId='))).toBe(true));
 
     fireEvent.click(screen.getByRole('button', { name: /export/i }));
 
@@ -121,6 +147,93 @@ describe('AuditLogViewer', () => {
       expect(call).toBeTruthy();
       const qs = new URLSearchParams(String(call![0]).split('?')[1] ?? '');
       expect(qs.get('userId')).toBe('11111111-1111-4111-8111-111111111111');
+      // #9671: a picked user is matched by id; the email text match would AND
+      // away that user's rows that carry no actor email (agent.command.*).
+      expect(qs.has('user')).toBe(false);
+    });
+  });
+
+  it('forwards the same date/user/action/resource/search filters to the export as the list request (#8366)', async () => {
+    render(<AuditLogViewer />);
+    await screen.findByText(/audit log/i);
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    fireEvent.click(await screen.findByText('apply-test-filters'));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/audit-logs/search'))).toBe(true));
+    const listCall = [...fetchMock.mock.calls].reverse().find(([u]) => String(u).includes('/audit-logs/search'))!;
+    const listQs = new URLSearchParams(String(listCall[0]).split('?')[1] ?? '');
+
+    fireEvent.click(screen.getByRole('button', { name: /export/i }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([u]) => String(u).includes('/audit-logs/export'));
+      expect(call).toBeTruthy();
+      const qs = new URLSearchParams(String(call![0]).split('?')[1] ?? '');
+      for (const key of ['userId', 'action', 'resource', 'q']) {
+        expect(listQs.get(key), `list sends ${key}`).toBeTruthy();
+        expect(qs.get(key), `export sends ${key}`).toBe(listQs.get(key));
+      }
+      // The relative "last 7d" window is recomputed at click time, so compare
+      // within a few seconds rather than byte-for-byte.
+      expect(listQs.get('from')).toBeTruthy();
+      expect(qs.get('from')).toBeTruthy();
+      expect(Math.abs(Date.parse(qs.get('from')!) - Date.parse(listQs.get('from')!))).toBeLessThan(10_000);
+      expect(qs.get('to')).toBeTruthy();
+      // Pagination / count hints are list-only.
+      expect(qs.has('page')).toBe(false);
+      expect(qs.has('limit')).toBe(false);
+      expect(qs.has('skipCount')).toBe(false);
+    });
+  });
+
+  describe('row presentation (#9672)', () => {
+    const row = (action: string, extra: Record<string, unknown> = {}) => ({
+      id: `log-${action}`,
+      timestamp: '2026-10-01T12:00:00.000Z',
+      user: { name: 'Dana Admin', email: 'dana@example.com', role: 'user' },
+      action,
+      resource: 'Disk cleanup',
+      resourceType: 'script',
+      details: JSON.stringify({ a: 1, b: 2, c: 3 }),
+      ipAddress: '10.0.0.1',
+      userAgent: 'test',
+      sessionId: '',
+      changes: { before: {}, after: {} },
+      ...extra,
+    });
+
+    it('colours badges by the first segment of the dotted code', async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse({ entries: [row('user.login'), row('script.execute')], pagination: { total: 2, totalPages: 1 } }),
+      );
+      render(<AuditLogViewer />);
+      await screen.findAllByTestId('audit-action-badge');
+      const [login, script] = screen.getAllByTestId('audit-action-badge');
+      expect(login.className).not.toBe(script.className);
+      expect(script.className).not.toContain('slate');
+    });
+
+    it('does not claim "N fields updated" when there is no before-state', async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse({
+          entries: [row('script.execute', { changes: { before: {}, after: { a: 1, b: 2, c: 3 } } })],
+          pagination: { total: 1, totalPages: 1 },
+        }),
+      );
+      render(<AuditLogViewer />);
+      fireEvent.click((await screen.findAllByTestId('audit-row-toggle'))[0]);
+      expect(screen.queryByText(/fields? updated/i)).toBeNull();
+    });
+
+    it('counts changed fields when a before-state exists', async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse({
+          entries: [row('device.update', { changes: { before: { a: 0 }, after: { a: 1, b: 2 } } })],
+          pagination: { total: 1, totalPages: 1 },
+        }),
+      );
+      render(<AuditLogViewer />);
+      fireEvent.click((await screen.findAllByTestId('audit-row-toggle'))[0]);
+      expect(screen.getByText(/2 fields updated/i)).toBeTruthy();
     });
   });
 });

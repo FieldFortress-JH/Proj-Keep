@@ -276,6 +276,10 @@ describe('oauthInteractionRoutes', () => {
         verification: 'unverified',
         redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
         redirect_origin: 'https://claude.ai',
+        registration: 'dynamic',
+        client_id_host: null,
+        redirect_host: 'claude.ai',
+        localhost_redirect: false,
       },
       scopes: ['openid', 'offline_access'],
       resource: 'https://api.example/mcp/server',
@@ -338,7 +342,57 @@ describe('oauthInteractionRoutes', () => {
       verification: 'unverified',
       redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
       redirect_origin: 'https://claude.ai',
+      registration: 'dynamic',
+      client_id_host: null,
+      redirect_host: 'claude.ai',
+      localhost_redirect: false,
     });
+  });
+
+  // B-W03 (#6157, D-B20): a CIMD host proves who hosts the metadata, not
+  // who the application is — the name stays unverified.
+  it('consent payload marks a URL client_id as metadata_document with its host and keeps verification unverified', async () => {
+    mocks.interactionDetails.mockResolvedValue(details({
+      params: {
+        client_id: 'https://client.example.com/oauth/metadata.json',
+        resource: 'https://api.example/mcp/server',
+        scope: 'openid offline_access mcp:read',
+        redirect_uri: 'https://app.example.org/callback',
+      },
+    }));
+    queueSelect([{ partnerId: PARTNER_ID, partnerName: 'Acme MSP' }]);
+    queueSelect([{ metadata: { client_name: 'Example Agent' } }], 'limit');
+    const res = await request(loadApp(), '/api/v1/oauth/interaction/uid-1');
+    const body = await res.json() as { client: Record<string, unknown> };
+    expect(res.status).toBe(200);
+    expect(body.client).toMatchObject({
+      client_id: 'https://client.example.com/oauth/metadata.json',
+      display_name: 'Example Agent',
+      verification: 'unverified',
+      registration: 'metadata_document',
+      client_id_host: 'client.example.com',
+      redirect_host: 'app.example.org',
+      localhost_redirect: false,
+    });
+  });
+
+  it.each([
+    ['http://127.0.0.1:3000/cb', '127.0.0.1'],
+    ['http://localhost:8080/cb', 'localhost'],
+    ['http://[::1]:9000/cb', '[::1]'],
+  ])('consent payload flags a loopback redirect (%s)', async (redirectUri, host) => {
+    mocks.interactionDetails.mockResolvedValue(details({
+      params: {
+        client_id: 'https://client.example.com/oauth/metadata.json',
+        resource: 'https://api.example/mcp/server',
+        scope: 'openid mcp:read',
+        redirect_uri: redirectUri,
+      },
+    }));
+    queueSelect([{ partnerId: PARTNER_ID, partnerName: 'Acme MSP' }]);
+    queueSelect([{ metadata: { client_name: 'Example Agent' } }], 'limit');
+    const body = await (await request(loadApp(), '/api/v1/oauth/interaction/uid-1')).json() as { client: Record<string, unknown> };
+    expect(body.client).toMatchObject({ redirect_host: host, localhost_redirect: true, registration: 'metadata_document' });
   });
 
   it('MCP-OAUTH-08: marks the client unverified and exposes the exact callback origin', async () => {
@@ -385,6 +439,26 @@ describe('oauthInteractionRoutes', () => {
     expect(res.status).toBe(200);
     expect(body.client.redirect_uri).toBe('');
     expect(body.client.redirect_origin).toBe('');
+  });
+
+  it.each([
+    'https://127.0.0.1.evil.example.net/cb',
+    'https://localhost.evil.example.net/cb',
+    'http://[::ffff:127.0.0.1]:3000/cb',
+    'not a url',
+  ])('consent payload does not flag a loopback look-alike (%s)', async (redirectUri) => {
+    mocks.interactionDetails.mockResolvedValue(details({
+      params: {
+        client_id: 'https://client.example.com/oauth/metadata.json',
+        resource: 'https://api.example/mcp/server',
+        scope: 'openid mcp:read',
+        redirect_uri: redirectUri,
+      },
+    }));
+    queueSelect([{ partnerId: PARTNER_ID, partnerName: 'Acme MSP' }]);
+    queueSelect([{ metadata: { client_name: 'Example Agent' } }], 'limit');
+    const body = await (await request(loadApp(), '/api/v1/oauth/interaction/uid-1')).json() as { client: Record<string, unknown> };
+    expect(body.client.localhost_redirect).toBe(false);
   });
 
   it('returns access_denied redirect when consent is denied', async () => {
@@ -565,6 +639,71 @@ describe('oauthInteractionRoutes', () => {
     // provider.interactionResult (cookie-UID-vs-URL-UID race in multi-prompt flows).
     expect(d.result).toEqual({ login: { accountId: 'u1' }, consent: { grantId: 'grant-1' } });
     expect(d.save).toHaveBeenCalled();
+  });
+
+  describe('mcp_domains on consent (#6156)', () => {
+    function arrange(opts: { firstConsented?: boolean } = {}) {
+      const d = details({
+        prompt: { details: { scopes: { new: ['openid', 'offline_access', 'mcp:read', 'mcp:write'] } } },
+      });
+      mocks.interactionDetails.mockResolvedValue(d);
+      queueSelect([{ partnerId: PARTNER_ID, userId: 'u1' }], 'limit');
+      queueSelect([{ partnerId: PARTNER_ID, orgId: 'org-1' }], 'limit');
+      queueSelect([{ status: 'active' }], 'limit');
+      const upd = queueUpdate(); // setGrantBreezeMeta on oauth_grants
+      queueInsertGrantReturning({ firstConsented: opts.firstConsented ?? true });
+      return { d, upd };
+    }
+    const post = (body: Record<string, unknown>) =>
+      request(loadApp(), '/api/v1/oauth/interaction/uid-1/consent', {
+        method: 'POST',
+        body: JSON.stringify({ partner_id: PARTNER_ID, approve: true, ...body }),
+      });
+
+    it('consent without mcp_domains persists null', async () => {
+      const { upd } = arrange();
+      const res = await post({});
+      expect(res.status).toBe(200);
+      expect(upd.set).toHaveBeenCalledWith(expect.objectContaining({ mcpDomains: null }));
+    });
+
+    it('consent with ["tickets"] persists it via setGrantBreezeMeta', async () => {
+      const { upd } = arrange();
+      const res = await post({ mcp_domains: ['tickets'] });
+      expect(res.status).toBe(200);
+      expect(upd.set).toHaveBeenCalledWith(expect.objectContaining({
+        partnerId: PARTNER_ID,
+        mcpDomains: ['tickets'],
+      }));
+    });
+
+    it('consent with ["core"] or [] is a 400 and saves no grant meta', async () => {
+      for (const bad of [['core'], [], 'tickets', ['nope']]) {
+        mocks.Grant.instances.length = 0;
+        mocks.update.mockReset();
+        mocks.select.mockReset();
+        mocks.insert.mockReset();
+        const { d } = arrange();
+        const res = await post({ mcp_domains: bad });
+        expect(res.status).toBe(400);
+        expect(mocks.update).not.toHaveBeenCalled();
+        // Validation runs before grant.save(): either no Grant was built, or none saved.
+        expect(mocks.Grant.instances.every((g) => g.save.mock.calls.length === 0)).toBe(true);
+        expect(d.save).not.toHaveBeenCalled();
+      }
+    });
+
+    it('partner_grant audit details carry grantId and mcpDomains', async () => {
+      arrange();
+      const res = await post({ mcp_domains: ['tickets', 'devices'] });
+      expect(res.status).toBe(200);
+      expect(auditMocks.writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          details: expect.objectContaining({ grantId: 'grant-1', mcpDomains: ['devices', 'tickets'] }),
+        }),
+      );
+    });
   });
 
   it('does not grant unrequested MCP resource scopes during consent fallback', async () => {

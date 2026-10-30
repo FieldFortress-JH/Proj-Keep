@@ -40,8 +40,14 @@ describe('resolveQuoteBranding', () => {
     expect(b.footer).toBe('quote terms');
   });
 
-  it('footer precedence: partner invoiceFooter beats portal footer when terms null', async () => {
+  it('footer precedence (#7510): the org footer overrides the partner invoiceFooter when terms null', async () => {
     queue(basePartner, baseBrand);
+    const b = await resolveQuoteBranding(source({ terms: null }));
+    expect(b.footer).toBe('portal footer');
+  });
+
+  it('footer precedence: partner invoiceFooter used when terms + org footer absent', async () => {
+    queue(basePartner, { ...baseBrand, footerText: null });
     const b = await resolveQuoteBranding(source({ terms: null }));
     expect(b.footer).toBe('partner footer');
   });
@@ -65,10 +71,15 @@ describe('resolveQuoteBranding', () => {
   });
 
   it('inheritedFooter reports the partner footer + source even when quote.terms overrides (#6648)', async () => {
-    queue(basePartner, baseBrand);
+    queue(basePartner, { ...baseBrand, footerText: null });
     const b = await resolveQuoteBranding(source({ terms: 'quote terms' }));
     expect(b.footer).toBe('quote terms');
     expect(b.inheritedFooter).toEqual({ text: 'partner footer', source: 'partner' });
+  });
+
+  it('inheritedFooter reports the org footer over the partner default (#7510)', async () => {
+    queue(basePartner, baseBrand);
+    expect((await resolveQuoteBranding(source({ terms: 'quote terms' }))).inheritedFooter).toEqual({ text: 'portal footer', source: 'brand' });
   });
 
   it('inheritedFooter falls to the portal footer, then null (#6648)', async () => {
@@ -239,10 +250,14 @@ describe('resolveQuoteBranding: partner Branding settings feed the document (Q-2
     expect(b.primaryColor).toBe('#1c8a9e');
   });
 
-  it('leaves invoice branding on the portal row only (quotes-only change)', async () => {
+  it("invoices use the partner's logo and colours too, and an org value still wins (#9676)", async () => {
     queue(brandedPartner, null);
     const b = await resolveInvoiceBranding({ ...source(), documentTheme: null, documentPageSize: null } as never);
-    expect(b.logoUrl).toBeNull();
-    expect(b.primaryColor).toBeNull();
+    expect(b.logoUrl).toBe(PNG);
+    expect(b.primaryColor).toBe('#00bfa6');
+    queue(brandedPartner, baseBrand);
+    const o = await resolveInvoiceBranding({ ...source(), documentTheme: null, documentPageSize: null } as never);
+    expect(o.logoUrl).toBe('logo.png');
+    expect(o.primaryColor).toBe('#1c8a9e');
   });
 });

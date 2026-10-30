@@ -16,6 +16,12 @@ describe('isProtectedPath', () => {
     expect(isProtectedPath('/ticketsomething')).toBe(false);
   });
 
+  it('protects /agreements but leaves the singular public /agreement/<token> signing page open', () => {
+    expect(isProtectedPath('/agreements')).toBe(true);
+    expect(isProtectedPath('/agreements/abc')).toBe(true);
+    expect(isProtectedPath('/agreement/abc')).toBe(false);
+  });
+
   it('leaves the public token documents and auth pages unprotected', () => {
     for (const path of ['/login', '/forgot-password', '/reset-password', '/accept-invite', '/quote/abc', '/invoice/abc', '/invoice/return']) {
       expect(isProtectedPath(path), path).toBe(false);
@@ -53,4 +59,9 @@ it('payment methods requires login and active account, public tokens do not', ()
   expect(isProtectedPath('/payment-methods')).toBe(true);
   expect(requiresAccountStatusGuard('/payment-methods')).toBe(true);
   expect(isProtectedPath('/autopay/opaque-token/stop')).toBe(false);
+});
+
+it('approvals requires login and active account (#8200)', () => {
+  expect(isProtectedPath('/approvals')).toBe(true);
+  expect(requiresAccountStatusGuard('/approvals')).toBe(true);
 });

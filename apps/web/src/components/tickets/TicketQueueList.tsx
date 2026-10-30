@@ -3,6 +3,7 @@ import '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import SlaChip from './SlaChip';
+import TicketTypeChip from './TicketTypeChip';
 import { statusConfig, priorityConfig, type TicketPriority, type TicketStatus, type TicketSummary } from './ticketConfig';
 import { type TicketConfig } from '../../lib/ticketConfigApi';
 import { formatDateTime } from '@/lib/dateTimeFormat';
@@ -104,14 +105,26 @@ function TicketQueueList({ tickets, selectedId, onSelect, loading, config = null
               )}
             />
           )}
-          <button
-            type="button"
+          {/* role="option" + tabIndex + onKeyDown give the row a button's focus
+              and Enter/Space activation. Keep it free of nested links: the whole
+              row is the select target, and an anchor inside it (the org name used
+              to be one) captures clicks in the middle of the row and navigates
+              away instead of opening the ticket (#9564). The workbench header
+              carries the org record link. */}
+          <div
             role="option"
+            tabIndex={0}
             aria-selected={ticket.id === selectedId}
             onClick={() => onSelect(ticket)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onSelect(ticket);
+              }
+            }}
             data-testid={`ticket-row-${ticket.id}`}
             className={cn(
-              'w-full px-3 py-2.5 text-left hover:bg-muted/50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary',
+              'block w-full cursor-pointer px-3 py-2.5 text-left hover:bg-muted/50 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary',
               onToggleSelect && 'pl-8', // reserve the checkbox gutter
               ticket.id === selectedId && 'bg-primary/5 border-l-0' // selection tint; brand color reserved for selection
             )}
@@ -138,13 +151,34 @@ function TicketQueueList({ tickets, selectedId, onSelect, loading, config = null
                 )}
                 {translatedStatusLabel(config, ticket.status, ticket.statusName, t)}
               </span>
-              {!hideOrg && <span className="truncate">{ticket.orgName ?? ''}</span>}
+              <TicketTypeChip type={ticket.ticketType} testId={`ticket-type-chip-${ticket.id}`} />
+              {ticket.mergedIntoTicketId && (
+                // #8972: a merged tombstone, listed only under "Show merged".
+                <span className="inline-flex items-center rounded-md border border-primary/30 bg-primary/10 px-1.5 py-0.5 font-medium text-primary" data-testid={`ticket-row-merged-${ticket.id}`}>
+                  {t('ticketQueueList.merged')}
+                </span>
+              )}
+              {ticket.checklist && ticket.checklist.total > 0 && (
+                <span
+                  className={cn(
+                    'inline-flex items-center rounded-md border px-1.5 py-0.5 font-medium tabular-nums',
+                    ticket.checklist.done === ticket.checklist.total && 'text-success'
+                  )}
+                  title={t('ticketQueueList.checklistTitle', { done: ticket.checklist.done, total: ticket.checklist.total })}
+                  data-testid={`ticket-checklist-chip-${ticket.id}`}
+                >
+                  {t('ticketQueueList.checklistProgress', { done: ticket.checklist.done, total: ticket.checklist.total })}
+                </span>
+              )}
+              {!hideOrg && ticket.orgName && (
+                <span className="min-w-0 truncate" data-testid={`ticket-org-${ticket.id}`}>{ticket.orgName}</span>
+              )}
               <span className="ml-auto shrink-0 flex items-center gap-2">
                 <SlaChip ticket={ticket} />
                 <span title={formatDateTime(ticket.updatedAt)}>{timeAgo(ticket.updatedAt, t)}</span>
               </span>
             </div>
-          </button>
+          </div>
         </li>
       ))}
     </ul>

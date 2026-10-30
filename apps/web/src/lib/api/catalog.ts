@@ -19,6 +19,7 @@ import { formatPercent } from '../i18n/format';
 
 export type CatalogItemType = 'hardware' | 'software' | 'service';
 export type CatalogBillingType = 'one_time' | 'recurring';
+export type CatalogBillingFrequency = 'monthly' | 'annual';
 
 /** A row from `GET /catalog` / `GET /catalog/:id`.`item`. */
 export interface CatalogItem {
@@ -29,6 +30,9 @@ export interface CatalogItem {
   sku: string | null;
   description: string | null;
   billingType: CatalogBillingType;
+  /** Set only for a recurring item; null for one-time. */
+  billingFrequency: CatalogBillingFrequency | null;
+  commitmentTermMonths: number | null;
   costBasis: string | null;
   /** ISO 4217 code `costBasis` is denominated in (NOT NULL server-side). */
   costCurrency: string;
@@ -132,7 +136,8 @@ export interface CatalogItemDetail {
 
 /** Shape of `GET /catalog/:id/economics` — `{ data: { ... } }`. Money totals are
  *  null unless the price book is complete in `currencyCode` AND every component
- *  cost is in that currency — never a partial sum. */
+ *  cost is known (non-null) and in that currency — never a partial sum, and a
+ *  missing cost is never counted as 0 (#9223). */
 export interface BundleEconomics {
   currencyCode: string;
   headlinePrice: string | null;
@@ -147,6 +152,8 @@ export interface BundleEconomics {
   allocationTotal: string | null;
   allocationMatchesHeadline: boolean;
   missingPriceComponentIds: string[];
+  /** components whose cost is unknown (NULL); non-empty ⇒ margin unknown (#9223). */
+  missingCostComponentIds: string[];
 }
 
 /** One component as sent to `PUT /catalog/:id/components`. */
@@ -333,12 +340,6 @@ export function removeOrgPriceOverride(id: string, orgId: string): Promise<Respo
 }
 
 // ---- presentation helpers -------------------------------------------------
-
-export const CATALOG_TYPE_LABELS: Record<CatalogItemType, string> = {
-  hardware: 'Hardware',
-  software: 'Software',
-  service: 'Service',
-};
 
 export const CATALOG_TYPE_ORDER: CatalogItemType[] = ['hardware', 'software', 'service'];
 

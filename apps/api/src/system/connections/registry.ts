@@ -6,7 +6,7 @@ import {
   transportSecurityStatus,
   workspaceExtensionStatus,
 } from './customStatus';
-import { defineEntry } from './statusHelpers';
+import { defineEntry, isFlagOn } from './statusHelpers';
 import type { ConnectionEntry } from './types';
 
 /**
@@ -57,6 +57,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     vars: [
       { name: 'PUBLIC_APP_URL', secret: false, required: true },
       { name: 'PUBLIC_API_URL', secret: false, required: true },
+      { name: 'TUNNEL_ORIGIN_TEMPLATE', secret: false },
+      { name: 'TUNNEL_FRAME_ANCESTOR', secret: false },
       { name: 'DASHBOARD_URL', secret: false },
       { name: 'PUBLIC_URL', secret: false },
       { name: 'PUBLIC_PORTAL_URL', secret: false },
@@ -237,6 +239,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       { name: 'BREEZE_AI_SCRIPT_AUTHORING_ENABLED', secret: false },
       { name: 'AI_OPERATOR_TASKS_ENABLED', secret: false },
       { name: 'AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', secret: false },
+      { name: 'AI_OPERATOR_RECIPE_IDENTITY_OFFBOARDING_ENABLED', secret: false },
+      { name: 'AI_OPERATOR_RECIPE_IDENTITY_ONBOARDING_ENABLED', secret: false },
     ],
     status: {
       kind: 'flags',
@@ -265,11 +269,26 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     },
   }),
   defineEntry({
+    id: 'wisp',
+    group: 'ai',
+    label: 'Wisp (hosted)',
+    vars: [
+      { name: 'BREEZE_WISP_ENABLED', secret: false },
+    ],
+    status: {
+      kind: 'flags',
+      flags: ['BREEZE_WISP_ENABLED'],
+      requiredWhenOn: [],
+    },
+  }),
+  defineEntry({
     id: 'workspace-extension',
     group: 'ai',
-    label: 'Workspace extension (pgvector)',
+    label: 'Wisp knowledge connector (pgvector)',
     vars: [
       { name: 'BREEZE_WORKSPACE_ENABLED', secret: false },
+      // Wisp W08 alias; either one enables the connector (builtinRegistry.ts enableEnvAliases).
+      { name: 'BREEZE_WISP_CONNECTOR_ENABLED', secret: false },
     ],
     status: { kind: 'custom', fn: workspaceExtensionStatus },
   }),
@@ -285,6 +304,22 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       kind: 'flags',
       flags: ['TOOL_SOURCES_ENABLED'],
       requiredWhenOn: [],
+    },
+  }),
+  defineEntry({
+    id: 'flows',
+    group: 'ai',
+    label: 'Flows (AI-drafted automation flows)',
+    vars: [{ name: 'FLOWS_ENABLED', secret: false }],
+    // Default ON since #5221 R1 (mirrors flowsEnabled()): unset or empty is
+    // enabled; only an explicit false-y value turns Flows off.
+    status: {
+      kind: 'custom',
+      fn: (env) => {
+        const raw = env.FLOWS_ENABLED;
+        if (typeof raw !== 'string' || raw.trim() === '') return { status: 'enabled' };
+        return isFlagOn(env, 'FLOWS_ENABLED') ? { status: 'enabled' } : { status: 'disabled' };
+      },
     },
   }),
   // ── billing ─────────────────────────────────────────────────────────────
@@ -772,6 +807,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       { name: 'OAUTH_DCR_ENABLED', secret: false },
       { name: 'OAUTH_DCR_ALLOW_ANONYMOUS', secret: false },
       { name: 'OAUTH_DCR_REQUIRE_IAT', secret: false },
+      { name: 'OAUTH_CIMD_ENABLED', secret: false },
+      { name: 'OAUTH_CIMD_ALLOWED_HOSTS', secret: false },
     ],
     status: {
       kind: 'flags',

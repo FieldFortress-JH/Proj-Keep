@@ -46,6 +46,19 @@ type Session struct {
 	clipboardSync *clipboard.ClipboardSync
 	cursorDC      *webrtc.DataChannel
 	controlDC     *webrtc.DataChannel
+
+	// viewerChannels maps each viewer data-channel label to the channel now
+	// serving it. A replaced channel's messages are ignored and its late close
+	// does not reset the stream its successor carries. Guarded by mu.
+	viewerChannels map[string]any
+	// inputRAttached is set once the viewer opens a reliable input-r: it
+	// speaks W2b, so it is sent input_epoch announcements. Viewers that never
+	// open it are never sent a control message they predate.
+	inputRAttached atomic.Bool
+	// geometryMu serialises input geometry transitions (monitor switch,
+	// desktop switch): epoch bump, capturer swap, offset commit, announcement.
+	// Lock order: geometryMu, then mu. The input worker never takes it.
+	geometryMu    sync.Mutex
 	audioTrack    *webrtc.TrackLocalStaticSample
 	audioCapturer AudioCapturer
 	audioEnabled  atomic.Bool
@@ -131,6 +144,10 @@ type Session struct {
 
 	// onClipboardSummary is SessionManager.OnClipboardSummary at creation.
 	onClipboardSummary func(sessionID string, summary ipc.ClipboardSummary)
+
+	// trickle carries local ICE candidates gathered after the answer to the
+	// viewer (#9182). nil for sessions not built by StartSession.
+	trickle *iceTrickle
 
 	// displayIndex is the monitor index this session was started on.
 	displayIndex int
@@ -226,6 +243,13 @@ type SessionManager struct {
 	// Quick Support uses it to tell the end user "Technician connected."
 	// Invoked on its own goroutine, like OnSessionStopped.
 	OnSessionStarted func(sessionID string)
+
+	// OnLocalICECandidate receives each local ICE candidate gathered after a
+	// session's answer was taken, and the end-of-gathering marker, once the
+	// transport owner calls BeginICETrickle (#9182). startGeneration is the
+	// value given to BeginICETrickle. Called serially per session from pion's
+	// candidate callback, so it must not block for long.
+	OnLocalICECandidate func(sessionID, startGeneration string, c LocalICECandidate)
 
 	// lastDesktopState caches the most recently broadcast desktop state so
 	// late-connecting viewers can receive an initial state when their control
@@ -596,6 +620,9 @@ func (s *Session) doCleanup() {
 		// Before anything else is torn down: nothing this session pressed may
 		// stay pressed on the customer's machine.
 		s.closeInput()
+		if s.trickle != nil {
+			s.trickle.stop()
+		}
 		if s.audioCapturer != nil {
 			s.audioCapturer.Stop()
 		}

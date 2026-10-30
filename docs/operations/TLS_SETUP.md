@@ -39,6 +39,48 @@ sudo apt install -y caddy
 Create `/etc/caddy/Caddyfile`:
 
 ```caddyfile
+{
+    # Redact credential headers and query parameters in ALL Caddy logs,
+    # including the error logs, which record the full request header map and
+    # URI. Keep this identical to the `log default` block in
+    # docker/Caddyfile.prod (enforced by apps/api/src/config/caddyLogRedaction.test.ts).
+    log default {
+        format filter {
+            wrap json
+            request>headers>X-Api-Key replace REDACTED
+            request>headers>X-Agent-Enrollment-Secret replace REDACTED
+            request>headers>X-Agent-Reenrollment-Token replace REDACTED
+            request>headers>X-Breeze-Bootstrap-Token replace REDACTED
+            request>headers>X-Breeze-Native-Auth-Binding replace REDACTED
+            request>headers>X-Breeze-Storage-Session replace REDACTED
+            request>headers>X-Recovery-Token replace REDACTED
+            request>headers>X-Automation-Secret replace REDACTED
+            request>headers>X-Webhook-Secret replace REDACTED
+            request>headers>X-Breeze-Signature replace REDACTED
+            request>headers>X-Signature replace REDACTED
+            request>headers>X-Huntress-Signature replace REDACTED
+            request>headers>X-Xero-Signature replace REDACTED
+            request>headers>Stripe-Signature replace REDACTED
+            request>headers>Svix-Signature replace REDACTED
+            request>headers>Webhook-Signature replace REDACTED
+            request>headers>Intuit-Signature replace REDACTED
+            request>headers>Mcp-Session-Id replace REDACTED
+            request>headers>Cf-Access-Jwt-Assertion replace REDACTED
+            resp_headers>X-Breeze-Native-Auth-Binding replace REDACTED
+            request>uri query {
+                replace ticket REDACTED
+                replace __bzt REDACTED
+                replace t REDACTED
+                replace token REDACTED
+                replace access_token REDACTED
+                replace code REDACTED
+                replace state REDACTED
+                replace secret REDACTED
+            }
+        }
+    }
+}
+
 breeze.example.com {
     # Caddy automatically:
     # - Obtains Let's Encrypt certificates
@@ -216,6 +258,8 @@ form-action 'self'
 ```
 
 The `script-src` allows `unsafe-inline` for inline scripts used by API documentation pages (Swagger UI). The `connect-src` includes `ws:` and `wss:` for WebSocket connections used by the agent communication layer and remote terminal/desktop features.
+
+**Framing exception.** Two token-gated public PDF responses are shown in an inline `<iframe>` by the customer portal: `GET /api/v1/agreements/public/<token>/file` (agreement signing page) and `GET /api/v1/quotes/public/<token>/contract-file/<blockId>` (quote contract block). They send `X-Frame-Options: SAMEORIGIN` and `frame-ancestors 'self'` instead of `DENY` / `'none'`, so only a page on the same origin can embed them. The portal requests them by a relative `/api/v1/...` path, so serve `/portal/*` and `/api/*` from the same origin (the default reverse-proxy layout). Every other response keeps `DENY`.
 
 ## Verifying the Setup
 

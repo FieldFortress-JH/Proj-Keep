@@ -1,4 +1,4 @@
-import type { AiStreamEvent, AiApprovalMode, AiApprovalScope, ActionPlanStep, AiScriptRunContext, AiRunResultArtifactRef, AiTopologyProgressPhase, TopologyAiExplanation, AiTurnModel } from '@breeze/shared';
+import type { AiStreamEvent, AiApprovalMode, AiApprovalScope, ActionPlanStep, AiScriptRunContext, AiRunResultArtifactRef, AiTopologyProgressPhase, TopologyAiExplanation, AiTurnModel, AiAttachState, AiPendingCardEvent, AiApprovalOutcome } from '@breeze/shared';
 // Subpath, not the barrel: this module loads on the topology island, whose CSP
 // forbids the barrel's JIT-compiled schemas (see topologyImports.test.ts).
 import { topologyAiExplanationSchema } from '@breeze/shared/validators/topologyAi';
@@ -89,6 +89,25 @@ export interface PendingApproval {
    * to expand a JSON blob.
    */
   scriptRunContext?: AiScriptRunContext | null;
+  /**
+   * #9431: set once the server says this card's wait ended — decided here or
+   * anywhere else (another window, Approvals, mobile), timed out, or settled.
+   * The card stays visible with its buttons disabled and says how it ended,
+   * until the turn's next event removes it.
+   */
+  resolution?: AiApprovalOutcome;
+}
+
+/**
+ * #9431: the approve route's answer to a click on a card that was already
+ * decided (409 `approval_already_decided`) — the outcome to show on the card,
+ * or null for any other response.
+ */
+export function alreadyDecidedOutcome(status: number, body: unknown): AiApprovalOutcome | null {
+  if (status !== 409 || !body || typeof body !== 'object') return null;
+  const { code, outcome } = body as { code?: unknown; outcome?: unknown };
+  if (code !== 'approval_already_decided') return null;
+  return outcome === 'approved' || outcome === 'not_approved' || outcome === 'ended' ? outcome : null;
 }
 
 export interface PendingPlan {
@@ -156,6 +175,49 @@ export interface StreamableState {
   thinking?: boolean;
   /** W05: what actually ran the last turn. */
   turnModel?: AiTurnModel | null;
+  /**
+   * #9427: this surface attached to a running turn whose replay was too large
+   * to send (`attach_state.partial`). The reply so far is not on screen; the
+   * full reply appears when the turn finishes. Cleared by `done`.
+   */
+  joinedMidResponse?: boolean;
+}
+
+/**
+ * Roles a turn writes as its own output. After the turn's user row, these are
+ * exactly what an `attach_state` replay re-creates; any other persisted row
+ * (e.g. a script-proposal system note) is kept.
+ */
+const TURN_OUTPUT_ROLES: ReadonlySet<string> = new Set(['assistant', 'tool_use', 'tool_result']);
+
+/**
+ * #9427: a running, fully replayed snapshot names this turn's user row, but the
+ * hydrated messages do not contain it (they were read before the row was
+ * written). The caller re-hydrates once and re-attaches; if the row is still
+ * absent the second time it applies the snapshot anyway, which then drops
+ * nothing (see the `attach_state` case).
+ */
+export function attachAnchorMissing(state: AiAttachState, messages: AiMessage[]): boolean {
+  if (state.turn !== 'running' || state.partial || state.turnUserMessageId === null) return false;
+  const anchor = state.turnUserMessageId;
+  return !messages.some((m) => m.id === anchor);
+}
+
+function pendingApprovalFromCard(card: Extract<AiPendingCardEvent, { type: 'approval_required' }>): PendingApproval {
+  return {
+    executionId: card.executionId,
+    toolName: card.toolName,
+    input: card.input,
+    description: card.description,
+    deviceContext: card.deviceContext,
+    intentBacked: card.intentBacked,
+    selfApprovalRequestId: card.selfApprovalRequestId,
+    approvalScope: card.approvalScope,
+    intentExpiresAt: card.intentExpiresAt,
+    approvalWindowMs: card.approvalWindowMs,
+    approvalExpiresAt: card.approvalExpiresAt,
+    scriptRunContext: card.scriptRunContext ?? null,
+  };
 }
 
 type StreamSetter = (fn: (s: StreamableState) => Partial<StreamableState>) => void;
@@ -265,30 +327,29 @@ export function processStreamEvent(
     }
 
     case 'approval_required':
-      set(() => ({
-        pendingApproval: {
-          executionId: event.executionId,
-          toolName: event.toolName,
-          input: event.input,
-          description: event.description,
-          deviceContext: event.deviceContext,
-          intentBacked: event.intentBacked,
-          selfApprovalRequestId: event.selfApprovalRequestId,
-          approvalScope: event.approvalScope,
-          intentExpiresAt: event.intentExpiresAt,
-          approvalWindowMs: event.approvalWindowMs,
-          approvalExpiresAt: event.approvalExpiresAt,
-          scriptRunContext: event.scriptRunContext ?? null,
-        }
-      }));
+      set(() => ({ pendingApproval: pendingApprovalFromCard(event) }));
+      return currentAssistantId;
+
+    // #9431: the card's wait ended, wherever it was decided. Matched by
+    // executionId, so another card (or none) is never touched.
+    case 'approval_resolved':
+      set((s) => (s.pendingApproval?.executionId === event.executionId
+        ? { pendingApproval: { ...s.pendingApproval, resolution: event.outcome } }
+        : {}));
       return currentAssistantId;
 
     case 'title_updated':
-      set((s) => ({
-        sessions: s.sessions.map((sess) =>
-          sess.id === s.sessionId ? { ...sess, title: event.title } : sess
-        )
-      }));
+      // Only the side panel keeps a sessions list. A workspace tab's state has
+      // none (its title lives on the tab), and the first turn of a conversation
+      // replays title_updated first: mapping an absent list threw and dropped
+      // the whole attach (#9840 lab, row A2).
+      set((s) => (Array.isArray(s.sessions)
+        ? {
+            sessions: s.sessions.map((sess) =>
+              sess.id === s.sessionId ? { ...sess, title: event.title } : sess
+            ),
+          }
+        : {}));
       return currentAssistantId;
 
     case 'message_end': {
@@ -436,8 +497,19 @@ export function processStreamEvent(
     }
 
     case 'done':
-      set(() => ({ isStreaming: false, thinking: false }));
+      // #9431: a card whose wait already ended has nothing left to show once
+      // the turn is over (a denied / settled call may send no tool_result).
+      set((s) => ({
+        isStreaming: false, thinking: false, joinedMidResponse: false,
+        ...(s.pendingApproval?.resolution ? { pendingApproval: null } : {}),
+      }));
       return null;
+
+    // #9427: the first frame of an attach. Applies the snapshot of the
+    // session's current turn; live events (seq > lastSeq) follow on the
+    // returned assistant id.
+    case 'attach_state':
+      return applyAttachState(event, set, get);
 
     // Topology M4 (#6000): progress phases are status only; the explanation
     // is the ONLY answer a topology turn ever sends, already validated.
@@ -520,6 +592,76 @@ export function processStreamEvent(
   }
 
   return null;
+}
+
+/**
+ * #9427: apply an `attach_state` snapshot (see `AiAttachState`).
+ *
+ * 1. Running, full replay: everything up to and including the turn's user row
+ *    (`turnUserMessageId`) is kept; after it only the turn's own output rows
+ *    are dropped (the replay re-creates them) and any other persisted row is
+ *    kept. The anchor is matched exactly — never guessed. A null or absent
+ *    anchor drops nothing (no turn output is persisted yet, or the caller has
+ *    already re-hydrated once; see `attachAnchorMissing`).
+ * 2. Running, partial: hydrated rows are kept and one streaming assistant
+ *    placeholder is appended so live `content_delta`s have a target.
+ * 3. Pending cards are REPLACED, never merged with what the surface had.
+ * 4. The active plan is the server's value at `lastSeq`, installed after the
+ *    replay fold (which already moved it through the replayed step events).
+ *    An idle or unavailable turn has no executing plan to show.
+ */
+function applyAttachState(
+  snapshot: AiAttachState,
+  set: StreamSetter,
+  get: StreamGetter,
+): string | null {
+  const running = snapshot.turn === 'running';
+  let currentAssistantId: string | null = null;
+
+  if (running && !snapshot.partial) {
+    const anchor = snapshot.turnUserMessageId;
+    set((s) => {
+      const anchorIndex = anchor === null ? -1 : s.messages.findIndex((m) => m.id === anchor);
+      if (anchorIndex < 0) return {};
+      return {
+        messages: s.messages.filter((m, i) => i <= anchorIndex || !TURN_OUTPUT_ROLES.has(m.role)),
+      };
+    });
+    for (const event of snapshot.replay) {
+      // A nested attach_state can never be in a replay; ignore one defensively
+      // rather than recursing.
+      if (event.type === 'attach_state') continue;
+      currentAssistantId = processStreamEvent(event, set, get, currentAssistantId);
+    }
+  } else if (running) {
+    const placeholder: AiMessage = {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
+      createdAt: new Date(),
+    };
+    set((s) => ({ messages: [...s.messages, placeholder] }));
+    currentAssistantId = placeholder.id;
+  }
+
+  let pendingApproval: PendingApproval | null = null;
+  let pendingPlan: PendingPlan | null = null;
+  for (const card of snapshot.pendingCards) {
+    if (card.type === 'approval_required') pendingApproval = pendingApprovalFromCard(card);
+    else if (card.type === 'plan_approval_required') pendingPlan = { planId: card.planId, steps: card.steps };
+  }
+
+  set(() => ({
+    pendingApproval,
+    pendingPlan,
+    activePlan: running ? snapshot.activePlan : null,
+    isStreaming: running,
+    joinedMidResponse: running && snapshot.partial,
+    ...(snapshot.turnModel ? { turnModel: snapshot.turnModel } : {}),
+  }));
+
+  return currentAssistantId;
 }
 
 /** Map raw API message objects to typed AiMessage array */

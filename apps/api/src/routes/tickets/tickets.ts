@@ -1,13 +1,15 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { tickets, ticketComments, ticketAlertLinks, devices, organizations, users, alerts, ticketStatuses } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
 import { alertInSiteScope, deviceInSiteScope, ticketSiteScopeCondition } from './siteScope';
 import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
-import { escapeLike } from '../../utils/sql';
+import { ticketSearchCondition } from '../../services/ticketSearch';
+import { checklistCountsForTickets } from '../../services/ticketChecklistService';
+import { withBusinessMinutesRemaining } from '../../services/businessCalendars/remaining';
 import {
   createTicketSchema, updateTicketSchema, changeTicketStatusSchema,
   assignTicketSchema, addTicketCommentSchema, listTicketsQuerySchema,
@@ -22,6 +24,7 @@ import {
   softDeleteTicket, restoreTicket,
   TicketServiceError
 } from '../../services/ticketService';
+import { ticketMergedResponse } from '../../services/ticketMerge/errors';
 import {
   evaluateTicketTriage,
   getTicketTriageSuggestion,
@@ -70,22 +73,21 @@ const CLOSED_STATUSES = ['resolved', 'closed'] as const;
 const PRIORITY_ORDER = sql`CASE ${tickets.priority}
   WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END`;
 
-// SQL twins of services/ticketSla.ts rules — change them together.
-// Active elapsed = now - created_at - paused; at-risk at 80% of the tighter target (D7).
-const SLA_BREACHED = sql`${tickets.slaBreachedAt} IS NOT NULL`;
-const SLA_AT_RISK = sql`(
-  ${tickets.slaBreachedAt} IS NULL
+// #8973 W3 (spec §4.3 reader 2): at-risk compares now() with the STORED 80%
+// point of each unfrozen arm (services/ticketSlaDeadlines.ts writes it).
+// SLA_BREACHED is unchanged. A stamped breach on either arm leaves at-risk.
+// #8972: merged tombstones never count as breached / at-risk (spec §3.6).
+const SLA_BREACHED = sql`(${tickets.slaBreachedAt} IS NOT NULL AND ${tickets.mergedIntoTicketId} IS NULL)`;
+export const SLA_AT_RISK = sql`(
+  ${tickets.mergedIntoTicketId} IS NULL
+  AND ${tickets.slaBreachedAt} IS NULL
   AND ${tickets.status} IN ('new', 'open')
   AND ${tickets.slaPausedAt} IS NULL
   AND (
-    (${tickets.firstResponseAt} IS NULL AND ${tickets.responseSlaMinutes} IS NOT NULL
-      AND now() >= ${tickets.createdAt}
-        + COALESCE(${tickets.slaPausedMinutes}, 0) * interval '1 minute'
-        + ${tickets.responseSlaMinutes} * interval '1 minute' * 0.8)
-    OR (${tickets.resolutionSlaMinutes} IS NOT NULL
-      AND now() >= ${tickets.createdAt}
-        + COALESCE(${tickets.slaPausedMinutes}, 0) * interval '1 minute'
-        + ${tickets.resolutionSlaMinutes} * interval '1 minute' * 0.8)
+    (${tickets.firstResponseAt} IS NULL AND ${tickets.responseWarnAt} IS NOT NULL
+      AND now() >= ${tickets.responseWarnAt})
+    OR (${tickets.resolutionWarnAt} IS NOT NULL
+      AND now() >= ${tickets.resolutionWarnAt})
   )
 )`;
 
@@ -96,6 +98,9 @@ export function actorFrom(c: { get: (k: 'auth') => AuthContext }): Extract<Ticke
 }
 
 export function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  // #8972 W1: a write reached a merged tombstone → 409 with the survivor id.
+  const merged = ticketMergedResponse(c, err);
+  if (merged) return merged;
   if (err instanceof TicketServiceError) {
     // `code` is optional on the error; include it when present so callers can
     // branch on a stable token instead of the message (W08 #3902 relies on
@@ -222,6 +227,7 @@ ticketsRoutes.get(
     const siteCondition = ticketSiteScopeCondition(auth);
     if (siteCondition) conditions.push(siteCondition);
     conditions.push(isNull(tickets.deletedAt)); // soft-deleted tickets never count toward queue tabs
+    conditions.push(isNull(tickets.mergedIntoTicketId)); // #8972: merged tombstones never count
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
     const rows = await db
@@ -342,6 +348,8 @@ ticketsRoutes.get(
     } else {
       conditions.push(isNull(tickets.deletedAt));
     }
+    // #8972: merged tombstones are hidden (list, search, closed filter) unless asked for.
+    if (!q.showMerged) conditions.push(isNull(tickets.mergedIntoTicketId));
     if (q.status) conditions.push(eq(tickets.status, q.status));
     else if (q.statusGroup === 'open') conditions.push(inArray(tickets.status, [...OPEN_STATUSES]));
     else if (q.statusGroup === 'closed') conditions.push(inArray(tickets.status, [...CLOSED_STATUSES]));
@@ -349,18 +357,19 @@ ticketsRoutes.get(
     else if (q.assignee === 'unassigned') conditions.push(isNull(tickets.assignedTo));
     else if (q.assignee) conditions.push(eq(tickets.assignedTo, q.assignee));
     if (q.categoryId) conditions.push(eq(tickets.categoryId, q.categoryId));
+    if (q.ticketType) conditions.push(inArray(tickets.ticketType, q.ticketType));
     if (q.priority) conditions.push(eq(tickets.priority, q.priority));
     if (q.slaState === 'breached') conditions.push(SLA_BREACHED);
     else if (q.slaState === 'at_risk') conditions.push(SLA_AT_RISK);
     else if (q.slaState === 'breaching') conditions.push(sql`(${SLA_BREACHED} OR ${SLA_AT_RISK})`);
     else if (q.slaState === 'ok') conditions.push(sql`(NOT ${SLA_BREACHED} AND NOT ${SLA_AT_RISK})`);
     if (q.search) {
-      // Escape ILIKE special chars (\, %, _) so they match literally, not as
-      // wildcards/escapes. Use the shared helper — the prior inline regex
-      // dropped backslash, so a trailing '\' could escape the closing '%'.
-      const term = `%${escapeLike(q.search)}%`;
-      const searchCond = or(ilike(tickets.subject, term), ilike(tickets.internalNumber, term));
-      if (searchCond) conditions.push(searchCond);
+      // Subject / Breeze number substrings (ILIKE-escaped by the helper), or
+      // the whole source number of an imported ticket (#8313).
+      const visibleOrgIds = auth.scope === 'organization'
+        ? [auth.orgId as string]
+        : auth.scope === 'partner' ? (auth.accessibleOrgIds ?? []) : null;
+      conditions.push(ticketSearchCondition(q.search, visibleOrgIds));
     }
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -370,7 +379,7 @@ ticketsRoutes.get(
       : q.sort === 'due' ? [asc(tickets.dueDate), asc(tickets.id)]
       : [desc(SLA_BREACHED), desc(SLA_AT_RISK), PRIORITY_ORDER, asc(tickets.createdAt), asc(tickets.id)]; // triage: breaches surface first
 
-    const data = await db
+    const rows = await db
       .select({
         id: tickets.id,
         internalNumber: tickets.internalNumber,
@@ -378,6 +387,7 @@ ticketsRoutes.get(
         status: tickets.status,
         priority: tickets.priority,
         source: tickets.source,
+        ticketType: tickets.ticketType,
         orgId: tickets.orgId,
         orgName: organizations.name,
         deviceId: tickets.deviceId,
@@ -393,9 +403,21 @@ ticketsRoutes.get(
         slaPausedAt: tickets.slaPausedAt,
         slaPausedMinutes: tickets.slaPausedMinutes,
         slaBreachReason: tickets.slaBreachReason,
+        // #8973 W3 stored deadlines (spec §4.3 readers 5–6).
+        responseDueAt: tickets.responseDueAt,
+        resolutionDueAt: tickets.resolutionDueAt,
+        responseWarnAt: tickets.responseWarnAt,
+        resolutionWarnAt: tickets.resolutionWarnAt,
+        // #8973 W4: the business-calendar snapshot (null = 24×7).
+        slaCalendarRevisionId: tickets.slaCalendarRevisionId,
         createdAt: tickets.createdAt,
         updatedAt: tickets.updatedAt,
         deletedAt: tickets.deletedAt,
+        // #8313: the window that imported the ticket; null when live.
+        migrationWindowId: tickets.migrationWindowId,
+        // #8972: the merged marker for the "Merged" chip (rows appear only under showMerged=true).
+        mergedIntoTicketId: tickets.mergedIntoTicketId,
+        mergedAt: tickets.mergedAt,
         statusName: ticketStatuses.name,
         statusColor: ticketStatuses.color
       })
@@ -408,6 +430,9 @@ ticketsRoutes.get(
       .orderBy(...orderBy)
       .limit(q.limit)
       .offset(offset);
+    // #8973 W4: business minutes remaining, server-side, only for rows on a
+    // calendar (one batch load per page); with none the client counts wall-clock.
+    const data = await withBusinessMinutesRemaining(db, rows);
 
     const countRows = await db
       .select({ count: sql<number>`count(*)` })
@@ -415,7 +440,15 @@ ticketsRoutes.get(
       .where(whereCondition);
     const total = Number(countRows[0]?.count ?? 0);
 
-    return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    // #9180 — checklist progress for the queue: one grouped count for the page,
+    // never a per-row fetch. Checklists are internal MSP procedure (spec #5783
+    // §2): an organization-scoped caller gets no `checklist` key at all.
+    if (auth.scope === 'organization' || data.length === 0) {
+      return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    }
+    const counts = await checklistCountsForTickets(data.map((t) => t.id));
+    const withChecklist = data.map((t) => ({ ...t, checklist: counts.get(t.id) ?? null }));
+    return c.json({ data: withChecklist, pagination: { page: q.page, limit: q.limit, total } });
   }
 );
 
@@ -530,6 +563,10 @@ ticketsRoutes.get(
 
     const comments = commentRows.map((row) => ({
       ...row,
+      // #8313: who wrote an imported comment in its source (display only).
+      originalAuthor: row.originalAuthorKind
+        ? { name: row.authorName ?? null, email: row.originalAuthorEmail ?? null, kind: row.originalAuthorKind }
+        : null,
       deleted: row.deletedAt != null,
       // Never ship the prior text of a deleted comment to the client.
       content: row.deletedAt != null ? '' : row.content,
@@ -550,7 +587,9 @@ ticketsRoutes.get(
       .leftJoin(alerts, eq(ticketAlertLinks.alertId, alerts.id))
       .where(eq(ticketAlertLinks.ticketId, id));
 
-    return c.json({ data: { ...ticket, orgName, deviceHostname, assigneeName, statusName, statusColor, comments, alertLinks } });
+    // #8973 W4: non-null only when the ticket carries a calendar revision.
+    const [withRemaining] = await withBusinessMinutesRemaining(db, [ticket]);
+    return c.json({ data: { ...ticket, slaBusinessMinutesRemaining: withRemaining!.slaBusinessMinutesRemaining, orgName, deviceHostname, assigneeName, statusName, statusColor, comments, alertLinks } });
   }
 );
 
@@ -702,6 +741,13 @@ ticketsRoutes.patch(
       return c.json({ error: 'Assignee is not updatable via PATCH — use POST /tickets/:id/assign' }, 400);
     }
     if (Object.keys(body).length === 0) return c.json({ error: 'No fields to update' }, 400);
+
+    // #4617: the budget is the customer's spend ceiling under the approval
+    // gate — a partner-staff decision. Organization scope cannot read the
+    // time entries it is measured against (time_entries has no org-axis RLS).
+    if (auth.scope === 'organization' && (body.budgetMinutes !== undefined || body.budgetAmount !== undefined)) {
+      return c.json({ error: 'The ticket budget can only be set by partner staff', code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
 
     if (auth.scope === 'organization' && !auth.orgId) {
       return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);

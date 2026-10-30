@@ -26,33 +26,41 @@ type tccLoopPolicy struct {
 	requestScreenRecording bool
 	// promptAccessibility lets the loop raise the Accessibility prompt once.
 	promptAccessibility bool
-	// captureProbe lets the loop run the capture probe behind
-	// TCCStatus.RemoteDesktop. It never calls ScreenCaptureKit
-	// (desktop.ProbeCaptureAccess); see desktop.CaptureProbeOptions.
-	captureProbe bool
+	// reportRemoteDesktop lets the loop fill TCCStatus.RemoteDesktop from the
+	// non-capturing access check (desktop.CheckCaptureAccess, #8390). No
+	// permission check captures the screen any more.
+	reportRemoteDesktop bool
+	// remindPermissions lets the loop show its own Full Disk Access
+	// guidance (the first-run dialog, then reminder toasts). False only when
+	// the agent said it shows the permission notice itself (#10190 W04).
+	remindPermissions bool
 }
 
-// tccLoopPolicyFor gates the loop's prompts and capture probe on the binary
-// kind. RunTCCCheckLoop starts in every userhelper.Client.Run, including
+// tccLoopPolicyFor gates the loop's prompts on the binary kind.
+// RunTCCCheckLoop starts in every userhelper.Client.Run, including
 // `breeze-agent user-helper` (the legacy com.breeze.agent-user LaunchAgent).
 // Only the desktop helper captures the screen or injects input, and the
 // broker drops a TCC status from any session without the desktop scope, so
-// for every other kind a prompt or a capture would ask the user for
-// something nothing uses — and each capture is one more chance to put macOS's
-// screen-recording consent in front of them.
-func tccLoopPolicyFor(binaryKind string) tccLoopPolicy {
+// for every other kind a prompt would ask the user for something nothing
+// uses.
+//
+// agentHandlesNotice is this connection's AuthResponse.AgentHandlesTCCNotice
+// (see ShowsOwnTCCReminder): when set, the agent shows the permission notice
+// from this helper's tcc_status and the helper must not show its own too.
+func tccLoopPolicyFor(binaryKind string, agentHandlesNotice bool) tccLoopPolicy {
+	p := tccLoopPolicy{remindPermissions: !agentHandlesNotice}
 	if binaryKind == ipc.HelperBinaryDesktopHelper {
-		return tccLoopPolicy{requestScreenRecording: true, promptAccessibility: true, captureProbe: true}
+		p.requestScreenRecording, p.promptAccessibility, p.reportRemoteDesktop = true, true, true
 	}
-	return tccLoopPolicy{}
+	return p
 }
 
-// allowCaptureProbe reports whether this check may run the capture probe:
-// only when the policy allows it and, if canProbe is set, no live session owns
-// the capturer. canProbe is not consulted when the policy forbids the probe.
-func (p tccLoopPolicy) allowCaptureProbe(canProbe func() bool) bool {
-	if !p.captureProbe {
-		return false
-	}
-	return canProbe == nil || canProbe()
+// ShowsOwnTCCReminder reports whether a helper shows its own macOS
+// permission reminder on a connection whose authentication returned resp
+// (#10190 W04 skew rule). An older agent omits the flag, so a new helper
+// keeps reminding; an older helper never reads it and always reminds, and
+// the agent never sets it for a helper whose live advertisement lacks
+// notice.info@1.
+func ShowsOwnTCCReminder(resp ipc.AuthResponse) bool {
+	return !resp.AgentHandlesTCCNotice
 }

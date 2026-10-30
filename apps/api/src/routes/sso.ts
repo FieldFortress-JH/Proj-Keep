@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { eq, and, gt, ne, isNull, inArray, exists, notExists, sql } from 'drizzle-orm';
@@ -35,10 +35,12 @@ import {
   assertFreshIdpAuthentication,
   PROVIDER_PRESETS,
   type OIDCConfig,
-  type EmailVerifiedClaim
+  type EmailVerifiedClaim,
+  type IdTokenVerifyFailureKind
 } from '../services/sso';
 import { urlOriginChanged } from '../services/credentialOriginBinding';
 import { mintStepUpGrant } from '../services/mfaStepUpGrant';
+import { SSO_OIDC_PRESET_IDS } from '@breeze/shared';
 import {
   bindIssuedUserSession,
   createSession,
@@ -243,12 +245,26 @@ function nullableOptional<T extends z.ZodTypeAny>(schema: T) {
   );
 }
 
+// #9601: the web form sent 'azure' for Azure AD while PROVIDER_PRESETS is keyed
+// 'azure-ad', and the create route silently ignored any key it did not know.
+// Accept the legacy 'azure' value (a web bundle cached from before the fix can
+// still send it; the preset is never persisted, so nothing stored carries it)
+// and reject every other unknown preset with a 400. '' is "Custom
+// configuration" in the web dropdown and means no preset.
+const LEGACY_PRESET_ALIASES: Record<string, (typeof SSO_OIDC_PRESET_IDS)[number]> = {
+  azure: 'azure-ad'
+};
+const presetSchema = z.preprocess(
+  (v) => (typeof v === 'string' && Object.hasOwn(LEGACY_PRESET_ALIASES, v) ? LEGACY_PRESET_ALIASES[v] : v),
+  z.union([z.enum(SSO_OIDC_PRESET_IDS), z.literal('')]).optional()
+);
+
 const createProviderSchema = z.object({
   ownerScope: z.enum(['organization', 'partner']).default('organization'),
   orgId: z.string().guid().optional(),
   name: z.string().min(1).max(255),
   type: z.enum(['oidc', 'saml']),
-  preset: z.string().optional(),
+  preset: presetSchema,
   issuer: nullableOptional(z.string().url()),
   clientId: z.string().optional(),
   clientSecret: z.string().optional(),
@@ -618,6 +634,19 @@ async function revalidateSsoDefaultRole(params: {
 
 type SsoCallbackMode = 'login' | 'link' | 'reauth';
 
+/**
+ * #8862: clock leeway (seconds) on the RE-AUTH id_token only. Microsoft Entra
+ * answers `max_age=0` with a token whose `exp` is already past on arrival.
+ * 300s matches Microsoft's own token validator default. Login and link
+ * verification take none.
+ */
+const REAUTH_ID_TOKEN_CLOCK_TOLERANCE_SECONDS = 300;
+
+/** Values of IdTokenVerificationError.failureKind allowed onto the audit row. */
+const ID_TOKEN_FAILURE_KINDS: ReadonlySet<string> = new Set<IdTokenVerifyFailureKind>([
+  'config', 'jwks', 'signature', 'timing', 'claims', 'nonce',
+]);
+
 type LinkRejectReason =
   | 'link_binding_missing'
   | 'link_user_gone'
@@ -810,6 +839,23 @@ const PROVIDER_CREATE_ORG_REQUIRED: Omit<OrgResolutionError, 'status'> = {
     "Select an organization (pass orgId), or set ownerScope to 'partner' to create a partner-wide provider",
   code: 'sso_provider_org_required',
 };
+
+/**
+ * The web client never sends a body orgId; fetchWithAuth appends the header
+ * switcher's `?orgId=`. A body orgId wins; otherwise fall back to a
+ * guid-valid query orgId, which the caller must be able to reach.
+ */
+function bodyOrSelectedQueryOrgId(
+  c: Context,
+  auth: Pick<AuthContext, 'canAccessOrg'>,
+  bodyOrgId?: string
+): { orgId: string | undefined } | { denied: true } {
+  if (bodyOrgId) return { orgId: bodyOrgId };
+  const query = z.string().guid().safeParse(c.req.query('orgId'));
+  if (!query.success) return { orgId: undefined };
+  if (!auth.canAccessOrg(query.data)) return { denied: true };
+  return { orgId: query.data };
+}
 
 function resolveOrgIdForProviderRoute(
   auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>,
@@ -1004,7 +1050,9 @@ ssoRoutes.post(
     }
     ownerColumns = { orgId: null, partnerId: auth.partnerId };
   } else {
-    const orgResult = resolveOrgIdForProviderRoute(auth, body.orgId, PROVIDER_CREATE_ORG_REQUIRED);
+    const requestedOrg = bodyOrSelectedQueryOrgId(c, auth, body.orgId);
+    if ('denied' in requestedOrg) return c.json({ error: 'Access to this organization denied' }, 403);
+    const orgResult = resolveOrgIdForProviderRoute(auth, requestedOrg.orgId, PROVIDER_CREATE_ORG_REQUIRED);
     if ('error' in orgResult) {
       return c.json({ error: orgResult.error, code: orgResult.code }, orgResult.status);
     }
@@ -1027,13 +1075,13 @@ ssoRoutes.post(
   // Apply preset if specified
   let config: Partial<typeof ssoProviders.$inferInsert> = {};
   if (body.preset) {
+    // Always defined: body.preset is validated against SSO_OIDC_PRESET_IDS and
+    // PROVIDER_PRESETS is keyed by the same type.
     const preset = PROVIDER_PRESETS[body.preset];
-    if (preset) {
-      config = {
-        scopes: preset.scopes,
-        attributeMapping: preset.attributeMapping as any
-      };
-    }
+    config = {
+      scopes: preset.scopes,
+      attributeMapping: preset.attributeMapping as any
+    };
   }
 
   // If issuer provided, discover endpoints. NOTE: this outbound call runs with
@@ -1778,7 +1826,9 @@ ssoRoutes.post(
       axis = { scope: 'partner', partnerId: auth.partnerId };
     } else {
       // Create-flow preflight: same axis derivation, so the same refusal as POST /providers.
-      const orgResult = resolveOrgIdForProviderRoute(auth, body.orgId, PROVIDER_CREATE_ORG_REQUIRED);
+        const requestedOrg = bodyOrSelectedQueryOrgId(c, auth, body.orgId);
+      if ('denied' in requestedOrg) return c.json({ error: 'Access to this organization denied' }, 403);
+      const orgResult = resolveOrgIdForProviderRoute(auth, requestedOrg.orgId, PROVIDER_CREATE_ORG_REQUIRED);
       if ('error' in orgResult) {
         return c.json({ error: orgResult.error, code: orgResult.code }, orgResult.status);
       }
@@ -2220,6 +2270,7 @@ ssoRoutes.post(
 
     writeRouteAudit(c, {
       orgId: provider.orgId,
+      partnerId: provider.partnerId,
       action: 'sso.identity.link_started',
       resourceType: 'sso_provider',
       resourceId: provider.id,
@@ -2358,6 +2409,7 @@ ssoRoutes.post('/reauth/start', authMiddleware, async (c) => {
 
   writeRouteAudit(c, {
     orgId: provider.orgId,
+    partnerId: provider.partnerId,
     action: 'sso.reauth.started',
     resourceType: 'sso_provider',
     resourceId: provider.id,
@@ -2720,6 +2772,7 @@ ssoRoutes.get('/callback', async (c) => {
   if (!generation.ok) {
     writeRouteAudit(c, {
       orgId: provider.orgId,
+      partnerId: provider.partnerId,
       action: 'sso.callback.rejected',
       resourceType: 'sso_provider',
       resourceId: provider.id,
@@ -2814,7 +2867,69 @@ ssoRoutes.get('/callback', async (c) => {
       clearStateCookie();
       return c.redirect('/login?error=sso_provider_unverified');
     }
-    const idClaims = await verifyIdTokenSignature(tokens.id_token, config, session.nonce);
+    // #8862: re-auth sends `max_age=0`, and Microsoft Entra answers that with
+    // an id_token whose `exp` is already in the past on arrival (iat backdated
+    // ~5 min, exp a few seconds after auth_time). Re-auth verification alone
+    // takes a bounded clock tolerance; freshness is still enforced below by
+    // assertFreshIdpAuthentication (auth_time, ±120s) and the single-use
+    // nonce. Login and link verification stay strict.
+    let idClaims: Awaited<ReturnType<typeof verifyIdTokenSignature>>;
+    try {
+      idClaims = await verifyIdTokenSignature(
+        tokens.id_token,
+        config,
+        session.nonce,
+        callbackMode === 'reauth'
+          ? { clockToleranceSeconds: REAUTH_ID_TOKEN_CLOCK_TOLERANCE_SECONDS, mode: callbackMode }
+          : { mode: callbackMode },
+      );
+    } catch (verifyError) {
+      // Login keeps its existing path: the shared catch below logs, reports to
+      // Sentry, and sends the browser to /login.
+      if (callbackMode === 'login') throw verifyError;
+
+      // Re-auth and link belong to an ALREADY-SIGNED-IN user on
+      // /settings/profile. Sending them to /login abandons the enrollment or
+      // link they were in the middle of, so keep them on the profile page with
+      // a typed reason (same discrimination as the email_unverified branch).
+      // The verifier has already logged the claim diagnostics; the URL gets
+      // only the coarse code, never the error text.
+      // `failureKind` (set by verifyIdTokenSignature) separates an IdP clock
+      // quirk from a misconfigured provider, an unreachable JWKS, a bad
+      // signature, and a nonce mismatch (a replay/injection signal) in the
+      // durable audit trail. Whitelisted so nothing else reaches the row.
+      const thrownKind = (verifyError as { failureKind?: unknown } | null)?.failureKind;
+      const failureKind = typeof thrownKind === 'string' && ID_TOKEN_FAILURE_KINDS.has(thrownKind)
+        ? thrownKind
+        : 'unknown';
+      console.error(
+        `SSO callback ${callbackMode} id_token verification failed (${failureKind}, provider ${provider.id}):`,
+        verifyError,
+      );
+      captureException(verifyError, c);
+      writeRouteAudit(c, {
+        orgId: provider.orgId,
+        partnerId: provider.partnerId,
+        action: callbackMode === 'reauth' ? 'sso.reauth.rejected' : 'sso.identity.link_rejected',
+        resourceType: 'sso_provider',
+        resourceId: provider.id,
+        resourceName: provider.name,
+        result: 'denied',
+        details: {
+          mode: callbackMode,
+          reason: 'idp_verify_failed',
+          failureKind,
+          partnerId: provider.partnerId,
+          userId: callbackMode === 'reauth' ? session.reauthUserId : session.linkUserId,
+        },
+      });
+      clearStateCookie();
+      return c.redirect(
+        callbackMode === 'reauth'
+          ? '/settings/profile?ssoReauthError=idp_verify_failed'
+          : '/settings/profile?ssoLinkError=idp_verify_failed',
+      );
+    }
 
     // Get user info (display attributes). Bind it to the signed token: per OIDC
     // Core §5.3.2 the userinfo `sub` MUST equal the id_token `sub`; otherwise
@@ -2878,6 +2993,7 @@ ssoRoutes.get('/callback', async (c) => {
     if (emailVerifiedClaim === 'false') {
       writeRouteAudit(c, {
         orgId: provider.orgId,
+        partnerId: provider.partnerId,
         action: 'sso.callback.rejected',
         resourceType: 'sso_provider',
         resourceId: provider.id,
@@ -2952,6 +3068,7 @@ ssoRoutes.get('/callback', async (c) => {
       if (!freshness.ok) {
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.reauth.rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3048,6 +3165,7 @@ ssoRoutes.get('/callback', async (c) => {
       if (!outcome.ok) {
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.reauth.rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3080,6 +3198,7 @@ ssoRoutes.get('/callback', async (c) => {
         console.error(`[sso] reauth grant mint failed for user ${reauthUserId} (provider ${provider.id})`);
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.reauth.rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3092,6 +3211,7 @@ ssoRoutes.get('/callback', async (c) => {
 
       writeRouteAudit(c, {
         orgId: provider.orgId,
+        partnerId: provider.partnerId,
         action: 'sso.reauth.completed',
         resourceType: 'sso_provider',
         resourceId: provider.id,
@@ -3176,6 +3296,7 @@ ssoRoutes.get('/callback', async (c) => {
       if ('error' in outcome) {
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.identity.link_rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3196,6 +3317,7 @@ ssoRoutes.get('/callback', async (c) => {
       }
       writeRouteAudit(c, {
         orgId: provider.orgId,
+        partnerId: provider.partnerId,
         action: 'sso.identity.linked',
         resourceType: 'sso_provider',
         resourceId: provider.id,
@@ -3264,6 +3386,7 @@ ssoRoutes.get('/callback', async (c) => {
         if (!domainProven) {
           writeRouteAudit(c, {
             orgId: provider.orgId,
+            partnerId: provider.partnerId,
             action: 'sso.callback.rejected',
             resourceType: 'sso_provider',
             resourceId: provider.id,
@@ -3293,6 +3416,7 @@ ssoRoutes.get('/callback', async (c) => {
         // (SR2-11 / SR2-12) — a console line is not an audit trail.
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.callback.rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3408,6 +3532,7 @@ ssoRoutes.get('/callback', async (c) => {
             });
             writeRouteAudit(c, {
               orgId: provider.orgId,
+              partnerId: provider.partnerId,
               action: 'sso.link.ceremony_started',
               resourceType: 'sso_provider',
               resourceId: provider.id,
@@ -3479,6 +3604,7 @@ ssoRoutes.get('/callback', async (c) => {
       if (!jitRole.ok) {
         writeRouteAudit(c, {
           orgId: provider.orgId,
+          partnerId: provider.partnerId,
           action: 'sso.callback.rejected',
           resourceType: 'sso_provider',
           resourceId: provider.id,
@@ -3714,6 +3840,7 @@ ssoRoutes.get('/callback', async (c) => {
     if (!liveProviderAuthority.ok) {
       writeRouteAudit(c, {
         orgId: provider.orgId,
+        partnerId: provider.partnerId,
         action: 'sso.callback.rejected',
         resourceType: 'sso_provider',
         resourceId: provider.id,
@@ -3870,6 +3997,7 @@ ssoRoutes.get('/callback', async (c) => {
     if (provider.partnerId) {
       auditLogin(c, {
         orgId: null,
+        partnerId: provider.partnerId,
         userId: finalized.user.id,
         email: finalized.user.email,
         name: finalized.user.name,
@@ -4056,6 +4184,7 @@ ssoRoutes.post('/link/confirm', zValidator('json', ssoLinkConfirmSchema), async 
     clearLinkCookie();
     writeRouteAudit(c, {
       orgId: record.providerOrgId,
+      partnerId: record.providerPartnerId,
       action: 'sso.link.ceremony_rejected',
       resourceType: 'sso_provider',
       resourceId: record.providerId,

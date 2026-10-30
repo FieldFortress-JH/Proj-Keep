@@ -13,6 +13,7 @@ import {
   partners,
   supportSessions,
 } from '../../db/schema';
+import { CLEARED_AGENT_CREDENTIALS, collectAgentCredentialHashes } from '../../services/agentCredentialHashes';
 import { getActiveOrgTenant } from '../../services/tenantStatus';
 import { writeAuditEvent } from '../../services/auditEvents';
 import { hashEnrollmentKeyCandidates, hashEnrollmentSecret } from '../../services/enrollmentKeySecurity';
@@ -21,6 +22,7 @@ import { getRedis } from '../../services/redis';
 import { rateLimiter } from '../../services/rate-limit';
 import { invalidateOrgDeviceCount } from '../../services/agentOrgRateLimit';
 import { enrollSchema } from './schemas';
+import { normalizeRebindProtocolVersion } from '../../services/deviceReattach/protocol';
 import { generateAgentId, generateApiKey, issueMtlsCertForDevice } from './helpers';
 import { buildEnrollmentResponseBody } from './enrollmentResponse';
 import { recordAgentEnrollment } from '../../services/anomalyMetrics';
@@ -34,6 +36,7 @@ import {
   type ManifestKeyDelegation,
 } from '../../services/manifestSigning';
 import { captureException } from '../../services/sentry';
+import { publishEvent } from '../../services/eventBus';
 import {
   disconnectAgentCredentialGeneration,
   publishAgentCredentialRevocation,
@@ -52,6 +55,7 @@ import {
   PartnerDeviceCapacityError,
 } from '../../services/partnerDeviceCapacity';
 import { markTopologyIdentityDirty } from '../../services/topology/identityDirty';
+import { applyOrgDefaultDeviceGroup } from '../../services/enrollmentDefaultGroup';
 
 export const enrollmentRoutes = new Hono();
 
@@ -140,6 +144,7 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
         replacedAgentId?: string;
         replacedCredentialHashes?: string[];
         collision?: DeviceIdentityCollisionAlertInput;
+        enrolledEvent: { orgId: string; siteId: string; payload: Record<string, unknown> };
         responseBody: Record<string, unknown>;
       }
   > => {
@@ -467,6 +472,15 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
         previousTokenHash: devices.previousTokenHash,
         previousTokenExpiresAt: devices.previousTokenExpiresAt,
         pendingTokenHash: devices.pendingTokenHash,
+        // #8318 §6.4: re-enroll revokes EVERY hash of the row it rewrites —
+        // watchdog and helper, current, previous and pending — not the agent
+        // hashes alone.
+        watchdogTokenHash: devices.watchdogTokenHash,
+        previousWatchdogTokenHash: devices.previousWatchdogTokenHash,
+        pendingWatchdogTokenHash: devices.pendingWatchdogTokenHash,
+        helperTokenHash: devices.helperTokenHash,
+        previousHelperTokenHash: devices.previousHelperTokenHash,
+        pendingHelperTokenHash: devices.pendingHelperTokenHash,
         agentTokenSuspendedAt: devices.agentTokenSuspendedAt,
       })
       .from(devices)
@@ -814,6 +828,7 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
       // collision-free in practice (8 hex chars = ~4B namespace) and
       // mirrors the SQL workaround documented in the #896 incident notes.
       if (decomBypassFreshRow && existingDevice) {
+        // own-device-row-allowlisted: enroll-decom-bypass-rename
         await tx
           .update(devices)
           .set({
@@ -825,9 +840,22 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
 
       let dev;
       if (!insertFreshRow && existingDevice) {
+        // #8318 §6.4 (F3): the token was matched against `existingDevice`
+        // without a lock, and this path is not on the agent auth context, so
+        // the identity predicate is carried here: the row must still bear the
+        // agent_id it was matched by. If a reattach confirm (or another
+        // re-enroll) changed it in between, this matches 0 rows and the
+        // enrollment is REFUSED below — never answered with a fresh row.
+        // own-device-row-allowlisted: reenroll-matched-row-agent-id
         [dev] = await tx
           .update(devices)
           .set({
+            // A full credential reset: every credential column starts from
+            // "none" (the one shared set, so a future credential column cannot
+            // survive), then the new install's current set is written. Issue
+            // #2621: that includes any staged rotation, which would otherwise
+            // keep authenticating and be promoted over the fresh credentials.
+            ...CLEARED_AGENT_CREDENTIALS,
             agentId: agentId,
             enrollmentIp,
             agentTokenHash: tokenHash,
@@ -840,35 +868,58 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             tokenIssuedAt,
             watchdogTokenIssuedAt: tokenIssuedAt,
             helperTokenIssuedAt: tokenIssuedAt,
-            previousTokenHash: null,
-            previousTokenExpiresAt: null,
-            previousWatchdogTokenHash: null,
-            previousWatchdogTokenExpiresAt: null,
-            previousHelperTokenHash: null,
-            previousHelperTokenExpiresAt: null,
-            // Issue #2621 — re-enrollment is a full credential reset, so it must
-            // also drop any staged rotation. Leaving it would let a staged set
-            // minted before the re-enrollment keep authenticating, and be
-            // promoted over the freshly issued credentials.
-            pendingTokenHash: null,
-            pendingWatchdogTokenHash: null,
-            pendingHelperTokenHash: null,
-            pendingTokenExpiresAt: null,
             deviceRole: data.deviceRole || 'unknown',
             deviceRoleSource: 'auto',
             isVirtual: data.isVirtual ?? false,
             virtualizationPlatform: data.virtualizationPlatform ?? null,
+            // #8318 §6.2: re-enroll is a new install, so its declared rebind
+            // capability is rewritten (not blindly reset to 0).
+            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             // A new install: what the previous one reported about its backup
             // helper no longer holds. Backups and restores for this device
             // wait for the new install's first heartbeat, as for a new device.
             backupReadProtocolVersion: null,
             backupIntegrityProtocolVersion: null,
             backupWriteProtocolVersion: null,
+            // #8318 §6.4 / §5.7 (review of wave 1b-1): the claims the previous
+            // install stamped belong to it, as at a reattach confirm's
+            // boundary (deviceInstallBoundary/handlers/deviceRow.ts). Left
+            // set, the once-per-install edition-migration claim kept
+            // auto-migration off for the new install with nothing logged,
+            // and the old install's uninstall intent stayed armed for the
+            // reaper until the new install's first beat — no longer covered
+            // by the migration-window exemption once that claim is gone.
+            editionMigrationDispatchedAt: null,
+            uninstallIntentAt: null,
             status: 'pending',
             updatedAt: new Date(),
           })
-          .where(eq(devices.id, existingDevice.id))
+          .where(and(eq(devices.id, existingDevice.id), eq(devices.agentId, existingDevice.agentId)))
           .returning();
+        if (!dev) {
+          const message = 'The device row changed during re-enrollment; retry the enrollment';
+          // Same shape as the sibling refusals in this transaction: audit +
+          // metric, and the JSON body encoded in `message`, which the
+          // handler's catch below renders (rolling the transaction back).
+          writeAuditEvent(c, {
+            orgId: key.orgId,
+            actorType: 'system',
+            action: 'agent.enroll',
+            resourceType: 'device',
+            resourceId: existingDevice.id,
+            resourceName: data.hostname,
+            details: {
+              reason: 'reenrollment_conflict',
+              enrollmentKeyId: key.id,
+            },
+            result: 'denied',
+            errorMessage: message,
+          });
+          recordAgentEnrollment('error', enrollmentPartnerId);
+          throw new HTTPException(409, {
+            message: JSON.stringify({ error: message, code: 'reenrollment_conflict' }),
+          });
+        }
       } else {
         [dev] = await tx
           .insert(devices)
@@ -892,6 +943,8 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             deviceRoleSource: 'auto',
             isVirtual: data.isVirtual ?? false,
             virtualizationPlatform: data.virtualizationPlatform ?? null,
+            // #8318 §6.2: a new install is what a reattach makes the source.
+            rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
             status: 'pending',
             isEphemeral: isSupportEnrollment,
             // #2764: forensic + UI linkage back to the row this enrollment may
@@ -905,6 +958,13 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
 
       if (!dev) {
         throw new Error('Failed to create device');
+      }
+
+      // #9617: org "default device group" — fresh rows only (an in-place
+      // re-enrollment keeps whatever groups the device already has). Never
+      // throws; runs in a savepoint so it cannot abort this transaction.
+      if (insertFreshRow && !isSupportEnrollment) {
+        await applyOrgDefaultDeviceGroup(tx, { orgId: dev.orgId, deviceId: dev.id, siteId: dev.siteId });
       }
 
       // Quick Support: bind the session to the device it just enrolled. Inside
@@ -1158,15 +1218,27 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
 
     return {
       deviceId: device.id,
+      // #9511 — published by the handler AFTER this context resolves.
+      enrolledEvent: {
+        orgId: key.orgId,
+        siteId: device.siteId,
+        payload: {
+          deviceId: device.id,
+          hostname: data.hostname,
+          agentVersion: data.agentVersion,
+          // In-place re-enrollment only: a decom-bypass / hostname-collision
+          // enrollment inserts a brand-new row, so it is a new device here.
+          reenrollment: !insertFreshRow,
+        },
+      },
       // Preserve the pre-update connection key. In-place re-enrollment mints
       // a new agentId, while the stale socket is still indexed by the old one.
       replacedAgentId: !insertFreshRow ? existingDevice?.agentId : undefined,
+      // #8318 §6.4: every hash of the replaced row — agent, watchdog and
+      // helper; current, previous and pending — so a stale watchdog or helper
+      // session is revoked with the agent socket.
       replacedCredentialHashes: !insertFreshRow && existingDevice
-        ? [
-            existingDevice.agentTokenHash,
-            existingDevice.previousTokenHash,
-            existingDevice.pendingTokenHash,
-          ].filter((hash): hash is string => typeof hash === 'string')
+        ? collectAgentCredentialHashes(existingDevice)
         : undefined,
       // #2764: raised AFTER this context closes (see below). Only when the
       // colliding row is currently ONLINE — that is the lookalike signal;
@@ -1235,6 +1307,20 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
   // committed and the pooled connection has been released. Same fire-and-
   // forget error handling as before — an enqueue failure must never fail
   // enrollment.
+  // #9511 — `device.enrolled` for webhook / automation / event-stream
+  // subscribers. Published only here, after the enrollment context resolved
+  // and the device row committed (a later failure inside the context can no
+  // longer leave a phantom event). Covers first enrollment AND re-enrollment
+  // (payload `reenrollment`); the internal `device.created` group-reevaluation
+  // is not an EventType and reaches no subscribers. Never awaited, never fatal.
+  const { enrolledEvent } = enrollmentOutcome;
+  void Promise.resolve()
+    .then(() => publishEvent('device.enrolled', enrolledEvent.orgId, enrolledEvent.payload, 'agent-enrollment', { siteId: enrolledEvent.siteId }))
+    .catch((err) => {
+      console.error('[Enrollment] Failed to publish device.enrolled:', err instanceof Error ? err.message : err);
+      captureException(err);
+    });
+
   queueWarrantySyncForDevice(enrollmentOutcome.deviceId).catch((err) => {
     console.error('[Enrollment] Failed to queue warranty sync:', err instanceof Error ? err.message : err);
   });

@@ -21,9 +21,6 @@ import {
   formatDate,
   formatMoney,
   lineTaxAmount,
-  lineTitle,
-  lineBlurb,
-  lineWorkedVsBilledNote,
   pctFromFraction,
   sellerLines,
   computeInvoiceProfit,
@@ -35,7 +32,10 @@ import AccountingSyncCard from './AccountingSyncCard';
 import { MarginPanel, MarginToggle, useShowMargin } from './billingUi';
 import { computeChargeNow } from '@breeze/shared';
 import InvoiceLineDevices from './InvoiceLineDevices';
+import { DocumentLineDescription } from '@breeze/document-ui';
+import { lineDescriptionProps } from '@breeze/shared/documents';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { localDateInputValue } from '@/lib/localDate';
 import {
   ACCOUNTING_PROVIDER_NAMES,
   isAccountingProviderId,
@@ -167,7 +167,7 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   const [payAmount, setPayAmount] = useState('');
   const [payMethod, setPayMethod] = useState<PaymentMethod>('bank_transfer');
   const [payRef, setPayRef] = useState('');
-  const [payDate, setPayDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [payDate, setPayDate] = useState(() => localDateInputValue());
 
   // Payment confirm dialog
   const [payConfirmOpen, setPayConfirmOpen] = useState(false);
@@ -273,6 +273,11 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     amountPaid: invoice.amountPaid,
     balance: invoice.balance,
   }, invoice.currencyCode);
+  // Lead the sidebar with the deposit while one is still owed (#8786). A draft
+  // isn't payable yet and a void invoice owes nothing, so neither has a deposit
+  // "due now"; a zero charge (balance already cleared) has nothing to lead with.
+  const leadWithDeposit =
+    chargeNow.isDeposit && invoice.status !== 'void' && invoice.status !== 'draft' && Number(chargeNow.amount) > 0;
 
   // The due date is editable once the invoice is live (issued/partially paid/overdue);
   // the /due-date route is gated on invoices:write.
@@ -507,7 +512,9 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             rowClassName={(l) => (l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : '')}
             descriptionCellClassName={(l) => (l.parentLineId ? 'pl-8' : '')}
             renderDescription={(l) => {
-              const workedVsBilledNote = lineWorkedVsBilledNote(l, t);
+              const desc = lineDescriptionProps(l, {
+                workedVsBilled: (worked, billed) => t('tickets:ticketTimeBilling.billedVsWorked', { worked, billed }),
+              });
               return (
                 <>
                   {/* sweep F9: Preview/PDF/portal already show the frozen
@@ -524,16 +531,17 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                       </span>
                     </div>
                   )}
-                  <span className={l.parentLineId ? '' : 'font-medium text-foreground'}>
-                    {l.parentLineId ? <span aria-hidden="true">↳ </span> : ''}{lineTitle(l)}
-                  </span>
-                  {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
-                  {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
-                  {workedVsBilledNote && (
-                    <div className="text-xs text-muted-foreground" data-testid={`invoice-detail-line-worked-vs-billed-${l.id}`}>
-                      {workedVsBilledNote}
-                    </div>
-                  )}
+                  {/* The shared description cell (#9414 W5). The host owns the child arrow
+                      and the hidden marker (title prefix/suffix); the wrapper
+                      gives the title its weight and the muted rows go back to normal. */}
+                  <div className={l.parentLineId ? '' : 'font-medium text-foreground [&>*]:font-normal'}>
+                    <DocumentLineDescription
+                      {...desc}
+                      titlePrefix={l.parentLineId ? '↳ ' : undefined}
+                      titleSuffix={internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : undefined}
+                      rowKey={l.id}
+                    />
+                  </div>
                   <InvoiceLineDevices invoiceId={invoice.id} line={l} />
                 </>
               );
@@ -648,9 +656,25 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                 <span className="text-2xl font-semibold uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-void-state">
                   {invoiceStatusLabel}
                 </span>
+              ) : leadWithDeposit ? (
+                // Unpaid deposit: lead with what the customer's Pay button charges
+                // (#8786) so an operator recording an offline deposit payment sees
+                // it first; the full balance stays visible as the secondary line.
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-end justify-between gap-2">
+                    <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-headline-label">{t('invoiceDetail.summary.depositDueNow')}</span>
+                    <span className="break-words text-2xl font-semibold tabular-nums" data-testid="invoice-detail-deposit-due-now">
+                      {formatMoney(chargeNow.amount, currency)}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 justify-between gap-2 text-sm text-muted-foreground">
+                    <span className="shrink-0">{t('invoiceDetail.summary.balanceDue')}</span>
+                    <span className="break-words tabular-nums" data-testid="invoice-detail-balance">{formatMoney(invoice.balance, currency)}</span>
+                  </div>
+                </div>
               ) : (
                 <>
-                  <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('invoiceDetail.summary.balanceDue')}</span>
+                  <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-headline-label">{t('invoiceDetail.summary.balanceDue')}</span>
                   <span
                     className={`break-words text-2xl font-semibold tabular-nums ${Number(invoice.balance) > 0 ? '' : 'text-muted-foreground'}`}
                     data-testid="invoice-detail-balance"
@@ -868,6 +892,26 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
 
             {canRecordPayment && can('invoices', 'send') && (
               <div className="mt-3 space-y-2 border-t pt-3" data-testid="invoice-payment-form">
+                {/* One-click amount fills (#8786). The deposit figure is computeChargeNow's,
+                    so it matches what the customer's Pay button would charge. */}
+                <div className="flex flex-wrap gap-2" role="group" aria-label={t('invoiceDetail.payments.fillLabel')}>
+                  {leadWithDeposit && (
+                    <button
+                      type="button" onClick={() => setPayAmount(chargeNow.amount)}
+                      data-testid="invoice-payment-fill-deposit"
+                      className="rounded-full border px-3 py-1 text-xs font-medium hover:bg-muted"
+                    >
+                      {t('invoiceDetail.payments.fillDeposit', { amount: formatMoney(chargeNow.amount, currency) })}
+                    </button>
+                  )}
+                  <button
+                    type="button" onClick={() => setPayAmount(invoice.balance)}
+                    data-testid="invoice-payment-fill-balance"
+                    className="rounded-full border px-3 py-1 text-xs font-medium hover:bg-muted"
+                  >
+                    {t('invoiceDetail.payments.fillBalance', { amount: formatMoney(invoice.balance, currency) })}
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <input
                     type="number" min="0" step="0.01" placeholder={t('invoiceDetail.payments.amount')} value={payAmount}

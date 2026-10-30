@@ -391,8 +391,8 @@ export default function Header() {
           <Menu className="h-5 w-5 text-muted-foreground" />
         </button>
 
-        {/* Organization Switcher */}
-        <div data-tour="org-switcher">
+        {/* Organization Switcher — min-w-0 lets the org name truncate, not drop, on a phone (#9028) */}
+        <div data-tour="org-switcher" className="min-w-0">
           <OrgSwitcher />
         </div>
 
@@ -525,6 +525,7 @@ export default function Header() {
             aria-label={t('layout.header.accountMenu')}
             aria-expanded={showUserMenu}
             aria-haspopup="true"
+            data-testid="account-menu-button"
           >
             {mounted && resolvedAvatarUrl ? (
               <img
@@ -688,6 +689,7 @@ export default function Header() {
                   type="button"
                   onClick={handleSignOut}
                   disabled={isLoggingOut}
+                  data-testid="account-menu-sign-out"
                   className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive transition hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <LogOut className="h-4 w-4" />

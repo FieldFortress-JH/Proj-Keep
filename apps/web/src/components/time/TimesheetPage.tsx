@@ -18,6 +18,10 @@ import { useHashState } from '@/lib/useHashState';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { replaceUrl } from '../../lib/replaceUrl';
+import { AwaitingApprovalChip, WriteOffHeldButton, isAwaitingApproval } from './HeldEntryControls';
+import { laborHours, billedLaborMinutes } from '@breeze/shared';
+import { laborBreakdown } from './laborBreakdown';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,7 +45,7 @@ interface TsEntry extends BillingOutcomeStamp {
   currencyCode: string | null;
   /** `billed` locks startedAt/endedAt/isBillable/hourlyRate server-side (409 ENTRY_BILLED
    *  if any of them is PRESENT in a PATCH) — only the description may change. */
-  billingStatus?: 'not_billed' | 'billed' | 'no_charge' | 'contract';
+  billingStatus?: 'not_billed' | 'billed' | 'no_charge' | 'contract' | 'awaiting_approval';
   /** W06 (#3900) server-stamped provenance. Absent on an API predating the
    *  column — render nothing rather than guessing 'manual'. */
   source?: string | null;
@@ -56,15 +60,15 @@ interface TsEntry extends BillingOutcomeStamp {
 
 /** #4628 §3.5 — one line naming the worked time whenever a minimum or the
  *  card's rounding moved the billed quantity. Returns null when they agree.
- *  Duplicated locally from TicketTimeBilling: a two-line helper, per the
- *  repo's file guidance. */
+ *  The rounding itself is the shared labour rule (#9561, `laborHours`); only
+ *  the locale key differs from TicketTimeBilling's copy. */
 function billedVsWorked(
   t: (key: string, options?: Record<string, unknown>) => string,
   durationMinutes: number | null,
   billableMinutes: number | null | undefined
 ): string | null {
-  const worked = ((durationMinutes ?? 0) / 60).toFixed(2);
-  const billed = (((billableMinutes ?? durationMinutes) ?? 0) / 60).toFixed(2);
+  const worked = laborHours(durationMinutes ?? 0);
+  const billed = laborHours(billedLaborMinutes({ billableMinutes, durationMinutes }));
   if (worked === billed) return null;
   return t('longTail.time.TimesheetPage.billedVsWorked', { worked, billed });
 }
@@ -151,7 +155,7 @@ function parseHash(hash: string): { week: string; tech: string | null } {
 function writeHash(week: string, tech: string | null): void {
   const parts: string[] = [`week=${week}`];
   if (tech) parts.push(`tech=${tech}`);
-  history.replaceState(null, '', `#${parts.join('&')}`);
+  replaceUrl(`#${parts.join('&')}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +616,9 @@ export default function TimesheetPage() {
                             placeholder={t('common:labels.description')}
                             className="min-w-0 flex-1 rounded-md border bg-background px-2 py-1 text-sm"
                           />
+                          <p className="mt-1 w-full text-xs text-muted-foreground" data-testid="time-entry-note-invoice-cue">
+                            {t('longTail.time.TimesheetPage.noteInvoiceCue')}
+                          </p>
                           <div className="w-full sm:w-40">
                             <WorkTypeSelect
                               value={editForm.workTypeId}
@@ -706,6 +713,7 @@ export default function TimesheetPage() {
                                   {t('longTail.time.TimesheetPage.approved')}
                                 </span>
                               )}
+                              {isAwaitingApproval(entry) && <AwaitingApprovalChip entryId={entry.id} />}
                               {!entry.isBillable && (
                                 <span className="text-xs text-muted-foreground">{t('longTail.time.TimesheetPage.nonBillable')}</span>
                               )}
@@ -718,6 +726,11 @@ export default function TimesheetPage() {
                               {entry.endedAt && billedVsWorked(t, entry.durationMinutes, entry.billableMinutes) && (
                                 <span className="block text-xs" data-testid={`timesheet-billed-vs-worked-${entry.id}`}>
                                   {billedVsWorked(t, entry.durationMinutes, entry.billableMinutes)}
+                                </span>
+                              )}
+                              {laborBreakdown(t, entry) && (
+                                <span className="block text-xs" data-testid={`timesheet-labor-${entry.id}`}>
+                                  {laborBreakdown(t, entry)}
                                 </span>
                               )}
                             </span>
@@ -740,6 +753,9 @@ export default function TimesheetPage() {
                             >
                               {t('common:actions.edit')}
                             </button>
+                            {isAwaitingApproval(entry) && (
+                              <WriteOffHeldButton entryId={entry.id} onDone={() => void loadSheet(week, tech)} />
+                            )}
                             {canWriteTime && entry.billingStatus !== 'billed' && (
                               <button
                                 type="button"
@@ -788,6 +804,13 @@ export default function TimesheetPage() {
               </span>
             )}
           </div>
+          {/* #9561: each chip is a sum of per-entry figures billed at 2-decimal
+              hours × rate (by design) — say so where the money is. */}
+          {(sheet.totals.billableAmounts?.length ?? 0) > 0 && (
+            <span className="text-xs font-normal text-muted-foreground" data-testid="timesheet-labor-rule">
+              {t('tickets:ticketTimeBilling.laborRule')}
+            </span>
+          )}
           {/* Reporting-only companion to the chips above; hides itself whenever
               a leg is missing or stale (multi-currency spec §8). */}
           <ApproximateMoneyLine

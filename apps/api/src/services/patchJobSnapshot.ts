@@ -14,21 +14,12 @@ import type {
 } from './configPolicyPatching';
 
 /**
- * The subset of a loaded policy-local patch config the snapshot reads.
- *
- * The auto-approve fields and `apps` are optional here (unlike the
- * normalized `PatchInlineSettings`) because legacy rows stored before
- * those fields existed may surface settings without them — the `?? false`
- * / `?? []` / `?? 0` fallbacks mirror the schema defaults on purpose.
+ * The subset of a loaded policy-local patch config the snapshot reads. Only
+ * the policy's sources: auto-approval and per-app rules are ring-owned
+ * (#8186, #8188).
  */
 export interface PatchesSnapshotInput {
-  settings: Pick<PatchInlineSettings, 'sources'> &
-    Partial<
-      Pick<
-        PatchInlineSettings,
-        'autoApprove' | 'autoApproveSeverities' | 'autoApproveDeferralDays' | 'apps'
-      >
-    >;
+  settings: Pick<PatchInlineSettings, 'sources'>;
   ring: PatchRingResolution;
 }
 
@@ -41,18 +32,15 @@ export interface PatchesSnapshot {
   excludeCategories: string[];
   autoApprove: Record<string, unknown> | boolean;
   sources: PatchInlineSettings['sources'];
-  policyAutoApprove: {
-    enabled: boolean;
-    severities: PatchInlineSettings['autoApproveSeverities'];
-    deferralDays: number;
-  };
-  /** Policy-level per-app rules (the legacy key every executor version reads). */
-  apps: PatchInlineSettings['apps'];
   /**
-   * The ring's per-app rules (#8184). The executor enforces both keys,
-   * stricter verdict winning, and keeps parsing both for frozen snapshots.
+   * The ring's per-app rules (#8184). Every supported executor reads this key.
+   * The legacy `apps` mirror (and the inert `policyAutoApprove` block) are no
+   * longer written (#8188); the executor still parses `apps` from frozen
+   * snapshots so in-flight jobs keep their rules.
    */
   ringAppRules: PatchRingResolution['appRules'];
+  /** The ring's Windows feature-release policy, frozen with the job. */
+  ringFeatureUpdates: PatchRingResolution['featureUpdates'];
   ringValidation: {
     classification: PatchRingResolution['classification'];
     valid: boolean;
@@ -68,13 +56,8 @@ export function buildPatchesSnapshot(policyLocal: PatchesSnapshotInput): Patches
     excludeCategories: policyLocal.ring.excludeCategories,
     autoApprove: policyLocal.ring.autoApprove,
     sources: policyLocal.settings.sources,
-    policyAutoApprove: {
-      enabled: policyLocal.settings.autoApprove ?? false,
-      severities: policyLocal.settings.autoApproveSeverities ?? [],
-      deferralDays: policyLocal.settings.autoApproveDeferralDays ?? 0,
-    },
-    apps: policyLocal.settings.apps ?? [],
     ringAppRules: policyLocal.ring.appRules,
+    ringFeatureUpdates: policyLocal.ring.featureUpdates,
     ringValidation: {
       classification: policyLocal.ring.classification,
       valid: policyLocal.ring.valid,

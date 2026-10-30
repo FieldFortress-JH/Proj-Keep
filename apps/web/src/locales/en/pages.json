@@ -23,9 +23,12 @@
     "adminUsersDetailDevices": "User devices",
     "aiAgentsImpact": "AI Impact",
     "aiAgentsFixMemory": "Fix memory",
+    "flows": "Flows",
+    "flowDetail": "Flow",
+    "flowRun": "Flow run",
     "aiAgentsRunsDetail": "Run Detail",
     "aiAgentsRuns": "Agent Runs",
-    "aiForOffice": "AI for Office",
+    "aiForOffice": "Breeze AI for Office",
     "aiRisk": "AI Risk Engine",
     "alertsDelivery": "Alerts – Delivery",
     "alertsCorrelations": "Alert Correlations",
@@ -70,10 +73,10 @@
     "dnsSecurity": "DNS Security",
     "dr": "Disaster Recovery",
     "extensionsNamePath": "Extension",
-    "fleet": "Fleet Orchestration",
+    "fleet": "Findings",
     "forgotPassword": "Forgot Password",
     "incidentsDetail": "Incident Detail",
-    "incidents": "Incidents",
+    "incidents": "Security Incidents",
     "dashboard": "Dashboard",
     "integrations": "Integrations",
     "integrationsPsa": "PSA Integrations",
@@ -94,6 +97,7 @@
     "policies": "Policies",
     "policiesNew": "New Policy",
     "quick": "Quick Support",
+    "verify": "Review a support request",
     "registerPartner": "Register Your Company",
     "remoteFilesDevice": "Remote File Manager",
     "remoteFiles": "Start File Transfer",
@@ -138,6 +142,7 @@
     "settingsBilling": "Billing Settings",
     "settingsCatalog": "Product Catalog",
     "settingsConnectedApps": "Connected apps",
+    "settingsDeliverableTemplates": "Deliverable Templates",
     "settingsCustomFields": "Custom Fields",
     "settingsEnrollmentKeys": "Enrollment Keys",
     "settingsFilters": "Saved Filters",
@@ -151,6 +156,7 @@
     "settingsProfile": "Profile Settings",
     "settingsRoles": "Roles",
     "settingsSitesDetail": "Site Settings",
+    "settingsSites": "Sites",
     "settingsSso": "Single Sign-On",
     "settingsUsers": "Users",
     "settingsVariables": "Variables",
@@ -164,7 +170,6 @@
     "ticketsNew": "Create Ticket",
     "timesheet": "Timesheet",
     "vulnerabilities": "Vulnerabilities",
-    "workspace": "AI Assistant",
     "aiAgentsFleetDesign": "Fleet Design",
     "agreementTemplates": "Agreement templates",
     "agreementTemplateDetail": "Agreement template",
@@ -178,7 +183,19 @@
     "mdmProfiles": "MDM Profiles",
     "mdmProfileNew": "New MDM Profile",
     "mdmProfileEdit": "Edit MDM Profile",
-    "mdmSettings": "MDM Settings"
+    "mdmSettings": "MDM Settings",
+    "adminWisp": "Wisp",
+    "endpointMessages": "Endpoint Messages",
+    "securityDetectionRules": "Detection Rules",
+    "settingsPlan": "Plan & features",
+    "settingsWispMemory": "Wisp memory",
+    "wispThread": "Wisp thread",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "AI Tasks",
+    "aiTask": "AI task",
+    "settingsAi": "AI settings",
+    "settingsFlowLimits": "Flow limits" 
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote Monitoring and Management",
@@ -186,6 +203,10 @@
   },
   "authShell": {
     "tagline": "The modern RMM platform built for speed, clarity, and scale."
+  },
+  "authFooter": {
+    "reportAbuse": "Report abuse",
+    "security": "Security"
   },
   "errorPage": {
     "notFoundBody": "The page you’re looking for doesn’t exist or may have been moved.",
@@ -228,7 +249,7 @@
       },
       "connectedApps": {
         "title": "Connected Apps",
-        "description": "Review and revoke AI assistants and MCP clients authorized to access your tenant."
+        "description": "Review and revoke AI clients authorized to access your tenant."
       },
       "officeAddinBindings": {
         "title": "Outlook Add-in Bindings",
@@ -257,6 +278,18 @@
       },
       "alertTemplates": {
         "title": "Alert templates"
+      },
+      "plan": {
+        "title": "Plan & features",
+        "description": "Your plan, which features it includes, and where each one comes from."
+      },
+      "wispMemory": {
+        "title": "Wisp memory",
+        "description": "Review, confirm, and retract what Wisp remembers."
+      },
+      "flowLimits": {
+        "title": "Flow limits",
+        "description": "Monthly run limits and the AI token limit for flows."
       }
     },
     "groups": {
@@ -279,7 +312,7 @@
   },
   "settingsConnectedAppsPage": {
     "heading": "Connected apps",
-    "description": "AI assistants and other MCP clients that have been authorized to access your tenant via OAuth. Revoke access at any time — the app's token will be rejected within 10 minutes."
+    "description": "AI clients that have been authorized to access your tenant via OAuth. Revoke access at any time — the app's token will be rejected within 10 minutes."
   },
   "settingsOrganizationBillingPage": {
     "backLink": "← Organization settings",

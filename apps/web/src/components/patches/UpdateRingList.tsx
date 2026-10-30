@@ -10,6 +10,7 @@ import {
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
+import type { RingAppRule } from './RingAppRulesSection';
 
 export type UpdateRingStatus = 'active' | 'disabled';
 
@@ -40,6 +41,14 @@ export type RingAutoApprove = {
   autoApproveUnrated?: boolean;
 };
 
+/** The ring's Windows feature-release policy (`patch_policies.feature_updates`). */
+export type RingFeatureUpdates =
+  | { mode: 'block' }
+  | { mode: 'allow' }
+  | { mode: 'pin'; product: 'windows-11' | 'windows-10'; targetVersion: string };
+
+export const DEFAULT_RING_FEATURE_UPDATES: RingFeatureUpdates = { mode: 'block' };
+
 export type UpdateRingItem = {
   id: string;
   name: string;
@@ -51,6 +60,10 @@ export type UpdateRingItem = {
   gracePeriodHours: number;
   autoApprove?: RingAutoApprove;
   categoryRules?: CategoryRule[];
+  /** Per-app block / pin rules the ring enforces (#8187). */
+  appRules?: RingAppRule[];
+  /** Windows feature releases: block (default) | allow | pin. */
+  featureUpdates?: RingFeatureUpdates;
   compliancePercent?: number;
   deviceCount?: number;
   updatedAt?: string;
@@ -99,8 +112,43 @@ function AutoApproveBadges({ ring, t }: { ring: UpdateRingItem; t: TFunction<'pa
   const aa = ring.autoApprove;
   const osOn = !!aa?.enabled && aa.severities.length > 0;
   const tpOn = !!aa?.enabled && !!aa.thirdPartyApps;
+  const appRuleCount = ring.appRules?.length ?? 0;
+  const featureUpdates = ring.featureUpdates;
+  // Feature releases are blocked unless the ring says otherwise, so only a
+  // ring that allows or pins them gets a badge.
+  const featureUpdatesBadge = featureUpdates && featureUpdates.mode !== 'block' && (
+    <span
+      className="inline-flex items-center rounded-full border bg-muted/40 px-2 py-0.5 text-xs"
+      data-testid="ring-feature-updates-badge"
+    >
+      {featureUpdates.mode === 'pin'
+        ? t('updateRingList.badges.featureUpdatesPinned', {
+            // 22H2 exists for both Windows 10 and 11, so name the version too.
+            release: `${featureUpdates.product === 'windows-10'
+              ? t('updateRingForm.featureUpdates.productWindows10')
+              : t('updateRingForm.featureUpdates.productWindows11')} ${featureUpdates.targetVersion}`,
+          })
+        : t('updateRingList.badges.featureUpdatesNewest')}
+    </span>
+  );
+  // Block / pin rules are independent of auto-approval: a manual ring can
+  // still hold or pin specific applications.
+  const appRulesBadge = appRuleCount > 0 && (
+    <span
+      className="inline-flex items-center rounded-full border bg-muted/40 px-2 py-0.5 text-xs"
+      data-testid="ring-app-rules-badge"
+    >
+      {t('updateRingList.badges.appRules', { count: appRuleCount })}
+    </span>
+  );
   if (!osOn && !tpOn) {
-    return <span className="text-muted-foreground">{t('updateRingList.badges.manual')}</span>;
+    return (
+      <div className="flex flex-wrap items-center gap-1">
+        <span className="text-muted-foreground">{t('updateRingList.badges.manual')}</span>
+        {appRulesBadge}
+        {featureUpdatesBadge}
+      </div>
+    );
   }
   return (
     <div className="flex flex-wrap gap-1">
@@ -122,6 +170,8 @@ function AutoApproveBadges({ ring, t }: { ring: UpdateRingItem; t: TFunction<'pa
           {t('updateRingList.badges.thirdParty')}
         </span>
       )}
+      {appRulesBadge}
+      {featureUpdatesBadge}
     </div>
   );
 }

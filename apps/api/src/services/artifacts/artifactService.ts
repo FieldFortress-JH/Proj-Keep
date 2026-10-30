@@ -1,9 +1,10 @@
 import { isUtf8 } from 'node:buffer';
-import { and, desc, eq, gt, like, ne, or } from 'drizzle-orm';
+import { and, desc, eq, exists, gt, like, ne, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import { isTextArtifactContentType, type AiArtifactKind, type AiRunArtifactDto } from '@breeze/shared';
 import { db } from '../../db';
-import { aiRunArtifacts } from '../../db/schema';
+import { aiRunArtifacts, wispThreadAttachments } from '../../db/schema';
 import type { AuthContext } from '../../middleware/auth';
 import { redactAiToolOutputText, shrinkToJsonBudget } from '../aiToolOutput';
 import { captureException } from '../sentry';
@@ -363,6 +364,35 @@ export interface ArtifactCallerAnchor {
   runId?: string | null;
   /** The CALLER'S CURRENT chat session only — never "any session belonging to this user" (Q4). */
   sessionId?: string | null;
+  /**
+   * Wisp W04 (w00 A24): the `wisp_threads.id` the caller's chat session is
+   * attached to. A thread attachment is stored with `session_id` NULL, so it
+   * would never match the exact-session arm; when this is set, an artifact
+   * ALSO matches when a `wisp_thread_attachments` row binds it to THIS thread
+   * — one more exact pointer, never "any thread of this user". Absent / null
+   * leaves the compiled query byte-identical to the pre-W04 one.
+   */
+  wispThreadId?: string | null;
+}
+
+const threadAttachment = alias(wispThreadAttachments, 'ta');
+
+/**
+ * `exists (select 1 from wisp_thread_attachments ta where ta.artifact_id =
+ * ai_run_artifacts.id and ta.thread_id = $threadId)`. It only ever WIDENS the
+ * ownership arm; the org, expiry, export_dataset and redacted-marker
+ * predicates around it still apply to the artifact row itself, and
+ * `wisp_thread_attachments` is under its own org RLS.
+ */
+function threadAttachmentArm(wispThreadId: string) {
+  return exists(
+    db.select({ one: sql`1` })
+      .from(threadAttachment)
+      .where(and(
+        eq(threadAttachment.artifactId, aiRunArtifacts.id),
+        eq(threadAttachment.threadId, wispThreadId),
+      )),
+  );
 }
 
 /**
@@ -375,9 +405,12 @@ export interface ArtifactCallerAnchor {
 export function findArtifactForCallerQuery(handle: string, anchor: ArtifactCallerAnchor) {
   const runId = anchor.runId ?? null;
   const sessionId = runId ? null : (anchor.sessionId ?? null);
-  const ownership = runId
+  const anchored = runId
     ? eq(aiRunArtifacts.runId, runId)
     : eq(aiRunArtifacts.sessionId, sessionId as string);
+  const ownership = anchor.wispThreadId
+    ? or(anchored, threadAttachmentArm(anchor.wispThreadId))
+    : anchored;
   return db
     .select(ARTIFACT_COLUMNS)
     .from(aiRunArtifacts)
@@ -422,6 +455,7 @@ export async function findArtifactForCaller(
   // the `uuidParam` trap `resolveArtifact` above already documents).
   if (!UUID.safeParse(handle).success || !UUID.safeParse(anchor.orgId).success) return null;
   if (!anchor.runId && !anchor.sessionId) return null;
+  if (anchor.wispThreadId && !UUID.safeParse(anchor.wispThreadId).success) return null;
   const [row] = await findArtifactForCallerQuery(handle, anchor);
   return (row as ArtifactRecord | undefined) ?? null;
 }
@@ -457,13 +491,18 @@ export function artifactDownloadContentType(stored: string): string {
   return SAFE_DOWNLOAD_CONTENT_TYPES.has(normalised) ? normalised : 'application/octet-stream';
 }
 
-/** Route-side resolve: scoped by `auth.orgCondition`, which is `undefined` (no filter) for system scope. */
+/**
+ * Route-side resolve: scoped by `auth.orgCondition`, which is `undefined` (no filter) for system scope.
+ * An expired row is not downloadable (#8855): the AI tool output retention job
+ * expires a scrubbed capture immediately, and the hourly sweeper removes the
+ * blob only later.
+ */
 export async function findArtifactForAuth(handle: string, auth: AuthContext): Promise<ArtifactRecord | null> {
   if (!UUID.safeParse(handle).success) return null;
   const [row] = await db
     .select(ARTIFACT_COLUMNS)
     .from(aiRunArtifacts)
-    .where(and(eq(aiRunArtifacts.id, handle), auth.orgCondition(aiRunArtifacts.orgId)))
+    .where(and(eq(aiRunArtifacts.id, handle), auth.orgCondition(aiRunArtifacts.orgId), gt(aiRunArtifacts.expiresAt, new Date())))
     .limit(1);
   return (row as ArtifactRecord | undefined) ?? null;
 }

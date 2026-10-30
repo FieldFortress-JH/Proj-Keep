@@ -25,6 +25,7 @@ import {
 } from '../../db/schema';
 import type { AuthContext } from '../../middleware/auth';
 import { schedulePeripheralPolicyDevice } from '../../jobs/peripheralJobs';
+import { requestDeviceGroupReevaluationAfterCommit } from '../../jobs/deviceGroupJobs';
 import { requestLikeFromSnapshot, writeAuditEvent, type RequestLike } from '../auditEvents';
 import { listFeatureLinks, policyAccessCondition, updateConfigPolicy } from '../configurationPolicy';
 import { deleteDeviceGroup } from '../deviceGroupDelete';
@@ -148,6 +149,11 @@ async function rollbackRoleCorrection(ctx: RollbackCtx, row: FleetDesignLedgerRo
     .where(and(eq(devices.id, deviceId), eq(devices.orgId, ctx.orgId), eq(devices.deviceRoleSource, 'ai')))
     .returning({ id: devices.id });
   if (!updated) throw new RollbackRefused('modified_since_apply');
+  // Restoring the role can move the device in/out of role-filtered dynamic groups (#8943).
+  requestDeviceGroupReevaluationAfterCommit({
+    deviceId, orgId: ctx.orgId, eventType: 'device.updated',
+    changedFields: ['deviceRole'], reason: 'fleet_design_rollback',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +314,7 @@ async function rollbackFunction(ctx: RollbackCtx, row: FleetDesignLedgerRow): Pr
 
   if (refs.groupCreated && sameAsSnapshot) {
     // Guards (children / billing / quotes) throw DeviceGroupDeleteError → refused.
-    const result = await deleteDeviceGroup(groupId, ctx.orgId);
+    const result = await deleteDeviceGroup(groupId, { orgId: ctx.orgId });
     for (const deviceId of result.affectedDeviceIds) {
       await schedulePeripheralPolicyDevice(deviceId, 'manual_membership_changed').catch((error) => {
         console.error(`[fleetDesign] failed to schedule peripheral reconciliation for ${deviceId}:`, error);

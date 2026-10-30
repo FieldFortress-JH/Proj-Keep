@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,6 +64,22 @@ func runCollectorOutputWithContext(parent context.Context, timeout time.Duration
 	return output.buf.Bytes(), err
 }
 
+// collectorCommandHook, when non-nil, is called before every collector
+// subprocess starts. Production leaves it nil; tests set it to fail when a
+// code path that must stay in-process spawns a process (#9267).
+// Atomic because collector goroutines may outlive the test that set it.
+var collectorCommandHook atomic.Pointer[func(name string, args []string)]
+
+func notifyCollectorCommand(cmd *exec.Cmd, name string) {
+	if hook := collectorCommandHook.Load(); hook != nil {
+		var args []string
+		if len(cmd.Args) > 1 {
+			args = cmd.Args[1:]
+		}
+		(*hook)(name, args)
+	}
+}
+
 // collectorWaitDelay bounds how long Wait blocks on stdout/stderr pipes after
 // the command itself has exited (a descendant may have inherited them).
 const collectorWaitDelay = 10 * time.Second
@@ -80,6 +97,7 @@ const collectorStderrCaptureLimit = 64 * 1024
 // silently turn a benign orphaned handle into a permanent data gap (see
 // change_tracker.go, which clones the previous snapshot on error).
 func runCollectorCommand(cmd *exec.Cmd, name string) error {
+	notifyCollectorCommand(cmd, name)
 	err := cmd.Run()
 	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
 		slog.Warn("collector command exited but a descendant kept its output pipe open; output captured, pipe force-closed",
@@ -128,6 +146,7 @@ func runCollectorLimitedOutput(timeout time.Duration, name string, args ...strin
 	if err != nil {
 		return nil, fmt.Errorf("%s pipe failed: %w", name, err)
 	}
+	notifyCollectorCommand(cmd, name)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%s start failed: %w", name, err)
 	}
@@ -222,9 +241,42 @@ func newCollectorScanner(output []byte) *bufio.Scanner {
 }
 
 func truncateCollectorString(value string) string {
-	value = strings.TrimSpace(value)
+	value = strings.TrimSpace(stripCollectorControlChars(value))
 	if len(value) <= collectorStringLimit {
 		return value
 	}
 	return strings.TrimSpace(value[:collectorStringLimit]) + "... [truncated]"
+}
+
+// isCollectorControlChar reports whether r is a control character collectors
+// must not ship: C0 controls (including NUL) and DEL. Tab, LF and CR are kept
+// because multi-line command output and error text rely on them.
+func isCollectorControlChar(r rune) bool {
+	switch r {
+	case '\t', '\n', '\r':
+		return false
+	}
+	return r < 0x20 || r == 0x7f
+}
+
+// hasCollectorControlChars reports whether value contains a character that
+// stripCollectorControlChars would remove. A collector uses it to tell that a
+// raw read was corrupt (#8904), since the stripped value can still be wrong.
+func hasCollectorControlChars(value string) bool {
+	return strings.IndexFunc(value, isCollectorControlChar) >= 0
+}
+
+// stripCollectorControlChars removes NUL and other control characters from
+// value. A Windows CIM read once returned a service account as four NULs
+// followed by "lSystem" (#8904); PostgreSQL rejects NUL in text and jsonb.
+func stripCollectorControlChars(value string) string {
+	if !hasCollectorControlChars(value) {
+		return value
+	}
+	return strings.Map(func(r rune) rune {
+		if isCollectorControlChar(r) {
+			return -1
+		}
+		return r
+	}, value)
 }

@@ -81,6 +81,15 @@ const and = (...conditions: FilterConditionGroup['conditions']): FilterCondition
 const or = (...conditions: FilterConditionGroup['conditions']): FilterConditionGroup => ({ operator: 'OR', conditions });
 
 describe('evaluateNetworkAssetFilter', () => {
+  it.each([net(), manual()])('treats software version and vendor as agent-only for $deviceClass rows', device => {
+    for (const condition of [
+      { field: 'software.version', operator: 'below' as const, value: { name: 'Chrome', version: '130' } },
+      { field: 'software.vendor', operator: 'equals' as const, value: 'Google' }
+    ]) {
+      expect(evaluateNetworkAssetFilter(and(condition), device)).toEqual({ matches: false, inapplicableFields: [condition.field] });
+    }
+  });
+
   it('matches the Online chip for an online network device and rejects it for Offline', () => {
     expect(evaluateNetworkAssetFilter(and({ field: 'status', operator: 'equals', value: 'online' }), net())).toEqual({ matches: true, inapplicableFields: [] });
     expect(evaluateNetworkAssetFilter(and({ field: 'status', operator: 'equals', value: 'offline' }), net()).matches).toBe(false);
@@ -145,6 +154,15 @@ describe('matchesMergedListFilters', () => {
     expect(matchesMergedListFilters(net(), { ...base, query: '10.20.0' })).toBe(true);
     expect(matchesMergedListFilters(agent(), { ...base, query: '10.20.0' })).toBe(false);
     expect(matchesMergedListFilters(agent({ displayName: 'Front Desk' }), { ...base, query: 'front' })).toBe(true);
+  });
+
+  it('search matches the last logged-in user, case-insensitively (#8716)', () => {
+    const base = { serverFilterIds: null, advancedFilter: null, includeDecommissioned: false };
+    const pc = agent({ lastUser: 'CORP\\Harry.Smith' });
+    expect(matchesMergedListFilters(pc, { ...base, query: 'harry' })).toBe(true);
+    expect(matchesMergedListFilters(pc, { ...base, query: 'HARRY.S' })).toBe(true);
+    expect(matchesMergedListFilters(pc, { ...base, query: 'sally' })).toBe(false);
+    expect(matchesMergedListFilters(agent(), { ...base, query: 'harry' })).toBe(false);
   });
 
   it('search matches serial number and asset tag (manual assets)', () => {

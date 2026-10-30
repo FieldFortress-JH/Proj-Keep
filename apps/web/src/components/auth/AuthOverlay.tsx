@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
+import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, ensureSessionPermissions, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import { navigateTo } from '../../lib/navigation';
 import * as Sentry from '@sentry/astro';
@@ -8,6 +8,7 @@ import * as Sentry from '@sentry/astro';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 const CF_ACCESS_LOGIN_PARAM = 'cf-access-login';
 const SSO_CODE_FRAGMENT_PREFIX = 'ssoCode=';
@@ -32,7 +33,7 @@ function consumeSsoCodeFragment(): SsoCodeFragment {
   const hash = window.location.hash.replace(/^#/, '');
   if (!hash.startsWith(SSO_CODE_FRAGMENT_PREFIX)) return { present: false };
   const raw = hash.slice(SSO_CODE_FRAGMENT_PREFIX.length).split('&')[0] ?? '';
-  window.history.replaceState({}, '', window.location.pathname + window.location.search);
+  replaceUrl(window.location.pathname + window.location.search);
   let code: string | null;
   try {
     code = decodeURIComponent(raw) || null;
@@ -52,7 +53,7 @@ function consumeCfAccessLoginParam(): boolean {
     window.location.pathname +
     (cleanSearch ? `?${cleanSearch}` : '') +
     window.location.hash;
-  window.history.replaceState({}, '', cleanUrl);
+  replaceUrl(cleanUrl);
   return true;
 }
 
@@ -118,6 +119,8 @@ async function redirectToSsoExchangeFailed(): Promise<void> {
 export default function AuthOverlay() {
   const { t } = useTranslation('auth');
   const { isAuthenticated, isLoading, tokens, sessionExpiredReason, authThrottledUntil } = useAuthStore();
+  const permissionsUnknown = useAuthStore((s) => !!s.user && !Array.isArray(s.user.permissions));
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
@@ -300,6 +303,17 @@ export default function AuthOverlay() {
 
     return () => { cancelled = true; };
   }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, cfBootstrapAttempted, ssoBootstrapAttempted, sessionExpiredReason]);
+
+  // #9927 / #9586: a session whose stored user has no permission list (signup
+  // auto-login, forced-MFA hand-off, a blob persisted before /users/me
+  // answered) would keep every permission-gated nav item hidden until the next
+  // login-page sign-in. Once the access token is in hand, read /users/me once
+  // per session; the store helper owns the once-per-session guard.
+  const hasAccessToken = !!tokens?.accessToken;
+  useEffect(() => {
+    if (isLoading || !isAuthenticated || !hasAccessToken || !permissionsUnknown) return;
+    void ensureSessionPermissions();
+  }, [isLoading, isAuthenticated, hasAccessToken, permissionsUnknown, sessionGeneration]);
 
   // Authenticated with token — fade out then unmount
   const shouldHide = !isChecking && !isLoading && isAuthenticated && !!tokens?.accessToken;

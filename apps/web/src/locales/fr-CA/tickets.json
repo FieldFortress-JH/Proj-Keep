@@ -20,6 +20,7 @@
     "state": {
       "met": "Respecté",
       "notMet": "Non respecté",
+      "metLate": "Respecté en retard",
       "breached": "Violation",
       "pausedLeft": "En pause · temps restant : {{relative}}",
       "left": "Temps restant : {{relative}}"
@@ -81,7 +82,10 @@
       "high": "Élevée",
       "normal": "Normal",
       "low": "Faible"
-    }
+    },
+    "checklistProgress": "{{done}}/{{total}} étapes",
+    "checklistTitle": "Liste de vérification : {{done}} étapes sur {{total}} terminées",
+    "merged": "Fusionné"
   },
   "ticketArchivedList": {
     "emptyTitle": "Aucun billet archivé.",
@@ -173,7 +177,9 @@
       "broken": "Impossible de charger {{name}}",
       "open": "Ouvrir la pièce jointe",
       "remove": "Retirer la pièce jointe"
-    }
+    },
+    "mergedFrom": "de {{number}}",
+    "mergedFromUnknown": "d'un billet fusionné"
   },
   "ticketPartsCard": {
     "title": "Pièces",
@@ -233,6 +239,8 @@
     },
     "billedVsWorked": "{{worked}} h travaillées · {{billed}} h facturées",
     "includedMinutes": "{{hours}} h incluses au contrat",
+    "laborBreakdown": "{{hours}} h × {{rate}} = {{amount}}",
+    "laborRule": "Chaque entrée facture ses minutes arrondies en heures (2 décimales) × son taux.",
     "missingRateCount_one": "1 entrée n'a pas de taux horaire — non comptée dans le montant ci-dessus",
     "missingRateCount_other": "{{count}} entrées n'ont pas de taux horaire — non comptées dans le montant ci-dessus",
     "deleteEntry": "Supprimer l’entrée de temps de {{duration}} de {{tech}}",
@@ -245,7 +253,8 @@
       "deleteLost": "L’entrée a changé pendant sa suppression. Rechargez et réessayez.",
       "notFound": "Cette entrée n’existe plus."
     },
-    "deleteEntryWithDescription": "Supprimer l’entrée de temps de {{duration}} de {{tech}} : {{description}}"
+    "deleteEntryWithDescription": "Supprimer l’entrée de temps de {{duration}} de {{tech}} : {{description}}",
+    "noteInvoiceCue": "Les clients voient cette note sur leur facture, sauf si vos paramètres de facturation masquent les notes."
   },
   "inboundReviewQueue": {
     "title": "File de révision",
@@ -303,7 +312,8 @@
       "normal": "Normal",
       "high": "Élevée",
       "urgent": "Urgent"
-    }
+    },
+    "type": "Type"
   },
   "ticketFormFields": {
     "selectPlaceholder": "Sélectionner..."
@@ -329,6 +339,11 @@
     "selectedCount_other": "{{count}} sélectionnés",
     "clearSelection": "Effacer la sélection",
     "noSelection": "Choisissez un billet. Utilisez j/k pour naviguer et Entrée pour développer.",
+    "ticketNotInView": "Le billet {{number}} n’est pas dans cette vue.",
+    "movedToClosed": {
+      "message": "{{status}} — maintenant sous {{tab}}",
+      "view": "Voir dans {{tab}}"
+    },
     "ticketingSettings": "Paramètres de billetterie",
     "assignFailed": "Assignation échouée. Réessayez.",
     "assignedToYou": "Vous a été attribué",
@@ -398,13 +413,17 @@
       "title_other": "Supprimer {{count}} billets ?",
       "message": "Cela les cache de toutes les files d’attente ; un administrateur peut les restaurer depuis Archivé.",
       "confirm": "Supprimer les billets"
-    }
+    },
+    "filterByType": "Filtrer par type",
+    "allTypes": "Tous les types",
+    "showMerged": "Afficher les fusionnés"
   },
   "ticketWorkbench": {
     "notFound": "Billet non trouvé. Il se peut qu’il ait été supprimé, ou que vous n’y ayez peut-être pas accès.",
     "loadFailed": "Impossible de charger le billet.",
     "backToQueue": "Retour à la file d’attente",
     "ticketSubject": "Sujet du billet",
+    "subjectEditButton": "Modifier le sujet",
     "openFullPage": "Ouvrir la page entière",
     "priorityLabel": "Priorité",
     "categoryLabel": "Catégorie",
@@ -451,7 +470,9 @@
       "allMissingRate": "Rien n’a pu être facturé : chaque entrée de temps facturable de ce billet n’a pas de taux horaire.",
       "missingRateHeading": "Entrées de temps sans taux horaire (non facturées — définissez un taux puis recréez la facture) :",
       "missingRateEntry": "{{description}} — {{hours}} h",
-      "setRate": "Définir un taux dans la feuille de temps"
+      "setRate": "Définir un taux dans la feuille de temps",
+      "heldForHourBlock_one": "{{count}} saisie de temps ({{hours}} heures) est retenue pour la banque d'heures de cette organisation et sera facturée à la clôture de la période de la banque.",
+      "heldForHourBlock_other": "{{count}} saisies de temps ({{hours}} heures) sont retenues pour la banque d'heures de cette organisation et seront facturées à la clôture de la période de la banque."
     },
     "move": {
       "open": "Passer à une autre organisation...",
@@ -462,6 +483,91 @@
       "blockedCurrency": "Ce billet comporte {{timeCount}} entrées de temps non facturées et {{partCount}} pièces non facturées évaluées en {{sourceCurrency}}, mais {{targetOrg}} facture en {{targetCurrency}}. Facturez-les d’abord, ou déplacez quand même : les montants restent en {{sourceCurrency}} et ne peuvent être facturés que sur un brouillon en {{sourceCurrency}}.",
       "acceptCurrency": "Je comprends que ces montants restent en {{sourceCurrency}} et ne sont pas convertis.",
       "moveAnyway": "Déplacer quand même"
+    },
+    "merge": {
+      "open": "Fusionner avec…",
+      "title": "Fusionner {{number}} avec un autre billet",
+      "description": "Les commentaires, le temps, les pièces et les liens de {{number}} sont déplacés vers le billet choisi. {{number}} est ensuite fermé et renvoie vers ce billet.",
+      "pickerLabel": "Billet cible",
+      "searchPlaceholder": "Rechercher par numéro ou objet",
+      "pickerHint": "Seuls les billets ouverts de cette organisation sont listés, du plus ancien au plus récent.",
+      "loading": "Chargement des billets…",
+      "candidatesFailed": "Impossible de charger les billets. Fermez la boîte de dialogue et réessayez.",
+      "noCandidates": "Aucun autre billet ouvert dans cette organisation.",
+      "previewLoading": "Vérification de la fusion…",
+      "previewFailed": "Impossible de vérifier cette fusion. Sélectionnez de nouveau le billet pour réessayer.",
+      "side": {
+        "source": "Ce billet",
+        "survivor": "La cible",
+        "both": "Les deux billets"
+      },
+      "refusal": {
+        "MERGE_SAME_TICKET": "Un billet ne peut pas être fusionné avec lui-même.",
+        "MERGE_CROSS_ORG": "Les deux billets doivent appartenir à la même organisation.",
+        "MERGE_SOURCE_INELIGIBLE": "Ce billet ne peut pas être fusionné (il est supprimé ou déjà fusionné).",
+        "MERGE_SURVIVOR_INELIGIBLE": "La cible ne peut pas recevoir de fusion (elle est fermée, supprimée ou déjà fusionnée).",
+        "MERGE_DELIVERABLE_PINNED": "Un billet rattaché à un livrable de service ne peut pas être fusionné.",
+        "MERGE_IMPORT_WINDOW": "Un billet dans une fenêtre d'importation ouverte ne peut pas être fusionné.",
+        "MERGE_APPROVAL_STATE": "Les billets avec des demandes d'approbation ou un budget ne peuvent pas être fusionnés.",
+        "MERGE_WORK_KIND_MISMATCH": "Le soutien et le travail de projet ne peuvent pas être fusionnés.",
+        "MERGE_PENDING_INTENTS": "Ce billet a des actions d'IA en attente. Attendez qu'elles se terminent ou annulez-les.",
+        "ORG_MERGING": "Cette organisation est en cours de fusion. Réessayez plus tard.",
+        "MERGE_SCOPE_DENIED": "Vous n'avez pas accès à un appareil ou à un site de l'un de ces billets."
+      },
+      "suggested": "{{number}} est plus ancien; c'est généralement celui à conserver.",
+      "movesTo": "Déplacé vers {{number}}",
+      "nothingMoves": "Rien d'autre n'est déplacé.",
+      "counts": {
+        "ticket_comments": "Commentaires : {{count}}",
+        "time_entries": "Entrées de temps : {{count}}",
+        "ticket_parts": "Pièces : {{count}}",
+        "ticket_alert_links": "Liens d'alerte : {{count}}",
+        "ticket_attachments": "Pièces jointes : {{count}}",
+        "ticket_email_links": "Liens courriel : {{count}}",
+        "ticket_checklist_items": "Éléments de liste de vérification : {{count}}",
+        "ticket_external_refs": "Références externes : {{count}}",
+        "ticket_links": "Liens entre billets : {{count}}",
+        "device_vulnerabilities": "Vulnérabilités : {{count}}",
+        "organization_key_dates": "Rappels de dates clés : {{count}}",
+        "service_deliverable_occurrences": "Occurrences de livrables : {{count}}",
+        "ai_operator_task_targets": "Cibles de la tâche IA : {{count}}",
+        "ticket_drafts": "Brouillons supprimés : {{count}}"
+      },
+      "droppedHeading": "Liens supprimés",
+      "dropped": {
+        "between_pair": "lien entre les deux billets",
+        "pair_unique": "doublon d’un lien que la cible a déjà",
+        "self": "pointerait vers lui-même",
+        "canonical_duplicate": "doublon après réordonnancement",
+        "cycle": "créerait un cycle",
+        "limit": "dépasse la limite de liens par billet"
+      },
+      "retained": "Reste sur {{number}} : {{name}}",
+      "anIntegration": "une intégration",
+      "device": {
+        "keeps": "Le billet fusionné conserve {{device}}.",
+        "takes": "Le billet fusionné reprend {{device}}.",
+        "unknown": "un autre appareil"
+      },
+      "requesterAccess": "Le demandeur de {{source}} verra le fil public de {{survivor}} dans le portail et pourra y répondre.",
+      "notify": "Informer par courriel le demandeur de {{number}} que sa demande a été fusionnée",
+      "noRequester": "{{number}} n'a pas de demandeur à qui envoyer un courriel.",
+      "warning": "Cette action est irréversible. {{source}} passe en lecture seule et renvoie vers {{survivor}}.",
+      "confirm": "Fusionner",
+      "merging": "Fusion en cours…",
+      "failed": "Échec de la fusion. Réessayez.",
+      "merged": "Fusionné avec {{number}}",
+      "mfaRequired": "La fusion de billets exige l'authentification multifacteur. Reconnectez-vous avec l'AMF et réessayez.",
+      "alreadyMerged": "L'un de ces billets a déjà été fusionné. Choisissez une autre cible.",
+      "retry": "Ces billets ont été modifiés pendant la fusion. Réessayez."
+    },
+    "mergedBanner": {
+      "mergedInto": "Ce billet a été fusionné avec {{number}} le {{date}}.",
+      "pending": "Ce billet a été fusionné avec un autre billet le {{date}}.",
+      "deleted": "Ce billet a été fusionné le {{date}} avec un billet qui a été supprimé ou que vous ne pouvez pas voir.",
+      "open": "Ouvrir {{number}}",
+      "readOnly": "Les billets fusionnés sont en lecture seule. Répondez sur le billet avec lequel il a été fusionné.",
+      "railReadOnly": "Le temps, la facturation et les pièces sont en lecture seule sur un billet fusionné. Saisissez le temps et les pièces sur le billet avec lequel il a été fusionné."
     },
     "triage": {
       "title": "Triage suggéré",
@@ -515,7 +621,11 @@
     },
     "device": {
       "none": "Aucun appareil",
-      "unlink": "Dissocier"
+      "unlink": "Dissocier",
+      "link": "Lier un appareil",
+      "change": "Changer l'appareil",
+      "cancel": "Annuler",
+      "assigneeWarning": "Changer l'appareil revalide la personne assignée. Un technicien sans accès au nouvel appareil sera désassigné."
     },
     "toast": {
       "statusUpdated": "Statut mis à jour",
@@ -531,7 +641,8 @@
       "assigned": "Assigné",
       "unassigned": "Non attribué",
       "assignFailed": "Assignation échouée. Réessayez.",
-      "attachmentFailed": "Impossible de téléverser la pièce jointe."
+      "attachmentFailed": "Impossible de téléverser la pièce jointe.",
+      "typeUpdateFailed": "Impossible de mettre à jour le type de ticket."
     },
     "delete": {
       "failed": "Échec de la suppression. Réessayez.",
@@ -541,7 +652,8 @@
       "title": "Supprimer ce billet ?",
       "message": "Cela masque le billet de toutes les files d’attente. Un administrateur peut le restaurer depuis la file d’attente Archivée.",
       "confirm": "Supprimer le billet"
-    }
+    },
+    "typeLabel": "Type de ticket"
   },
   "billingOutcome": {
     "included": "Inclus",
@@ -551,5 +663,185 @@
     "missingRate": "Facturable · tarif non configuré",
     "recalculated": "La facturation est recalculée pour ce type de travail à l’enregistrement.",
     "unavailable": "Résultat de facturation indisponible"
+  },
+  "ticketApproval": {
+    "errors": {
+      "requestNotPending": "Cette demande d'approbation n'est plus en attente.",
+      "requestChanged": "La demande a changé pendant que vous la consultiez. La dernière version a été rechargée ; vérifiez-la puis réessayez.",
+      "requestExpired": "Cette demande d'approbation a expiré. Relancez-la pour en envoyer une nouvelle.",
+      "requestAlreadyPending": "Une demande d'approbation pour le même motif est déjà en attente sur ce billet.",
+      "requestNotReaskable": "Seule une demande refusée, expirée ou annulée qui a encore du temps en suspens peut être relancée.",
+      "nothingHeld": "Ce billet n'a aucun temps en suspens pour lequel demander une approbation.",
+      "approvalsDisabled": "L'approbation client n'est pas activée pour ce client.",
+      "entryNotResolvable": "Ce temps ne peut être passé en perte qu'une fois sa demande d'approbation refusée, expirée ou annulée.",
+      "approvalRequestPending": "Ce billet a une demande d'approbation en attente de réponse du client ; il ne peut donc pas être déplacé. Annulez ou résolvez d'abord la demande.",
+      "sourceAwaitingApproval": "Une partie du temps de cette facture attend l'approbation du client. Faites-la approuver ou passez-la en perte avant d'émettre la facture.",
+      "approvalRequired": "L'approbation du client est nécessaire avant de comptabiliser du temps facturable sur ce billet. Demandez l'approbation depuis le panneau d'approbations du billet."
+    },
+    "budget": {
+      "title": "Budget et approbation",
+      "hours": "Budget (heures)",
+      "amount": "Montant du budget",
+      "save": "Enregistrer le budget",
+      "saved": "Budget enregistré",
+      "saveFailed": "Impossible d'enregistrer le budget",
+      "invalidHours": "Saisissez un nombre d'heures supérieur à 0, ou laissez vide pour aucune limite.",
+      "invalidAmount": "Saisissez un montant supérieur à 0 avec au plus 2 décimales, ou laissez vide.",
+      "ceiling": "Plafond {{ceiling}}",
+      "ceilingWithExtensions": "Plafond {{ceiling}} (budget {{budget}} + {{extra}} approuvées)",
+      "noBudget": "Aucun budget défini",
+      "usedLegend": "Utilisé {{value}}",
+      "heldLegend": "En attente d'approbation {{value}}",
+      "unpriced_one": "{{count}} entrée en suspens n'a pas encore de prix.",
+      "unpriced_other": "{{count}} entrées en suspens n'ont pas encore de prix.",
+      "barLabel": "Consommation du budget",
+      "requestApproval": "Demander l'approbation"
+    },
+    "request": {
+      "trigger": "Motif",
+      "triggerBudget": "Budget dépassé",
+      "triggerAfterHours": "Travail hors heures ouvrées",
+      "extensionMinutes": "Minutes supplémentaires",
+      "extensionAmount": "Montant supplémentaire",
+      "windowStart": "Couvre à partir du",
+      "windowEnd": "Couvre jusqu'au",
+      "message": "Message au client (facultatif)",
+      "submit": "Envoyer la demande",
+      "sent": "Demande d'approbation envoyée",
+      "failed": "Impossible d'envoyer la demande d'approbation",
+      "invalidExtension": "Saisissez des minutes supplémentaires ou un montant supplémentaire supérieur à 0.",
+      "invalidWindow": "Choisissez un début et une fin, la fin étant postérieure au début et distante d'au plus 14 jours."
+    },
+    "panel": {
+      "title": "Approbations client",
+      "status": {
+        "pending": "En attente",
+        "approved": "Approuvée",
+        "denied": "Refusée",
+        "expired": "Expirée",
+        "cancelled": "Annulée"
+      },
+      "revision": "Révision {{n}}",
+      "ask": "Demande {{ask}}",
+      "window": "Couvre du {{from}} au {{to}}",
+      "expires": "Expire {{when}}",
+      "heldEntries_one": "{{count}} entrée en suspens",
+      "heldEntries_other": "{{count}} entrées en suspens",
+      "approvers": "Approbateurs",
+      "notified": "Personnes informées",
+      "noneListed": "Aucun",
+      "noApprover": "Aucun approbateur enregistré : ajoutez un contact de facturation ou enregistrez la décision au nom du client.",
+      "decidedByCustomer": "Décidé par {{who}}",
+      "customerFallback": "le client",
+      "decidedOnBehalf": "Enregistré par {{user}} au nom de {{signer}} · {{method}} · {{reference}}",
+      "method": {
+        "verbal": "Oral",
+        "email": "Courriel",
+        "signedDocument": "Document signé",
+        "other": "Autre"
+      },
+      "cancel": "Annuler la demande",
+      "cancelConfirmTitle": "Annuler cette demande d'approbation ?",
+      "cancelConfirmMessage": "Le client ne pourra plus répondre. Le temps déjà en suspens le reste jusqu'à ce que vous relanciez la demande ou le passiez en perte.",
+      "cancelled": "Demande d'approbation annulée",
+      "cancelFailed": "Impossible d'annuler la demande",
+      "reask": "Relancer",
+      "reaskSubmit": "Renvoyer",
+      "reasked": "Demande d'approbation renvoyée",
+      "reaskFailed": "Impossible de relancer la demande",
+      "record": "Enregistrer la décision"
+    },
+    "record": {
+      "title": "Enregistrer la décision du client",
+      "intro": "À utiliser lorsque le client vous a communiqué sa décision en dehors de Breeze. Elle est consignée sous votre nom.",
+      "target": "Révision {{revision}} · {{ask}}",
+      "decision": "Décision",
+      "approve": "Approuvée",
+      "deny": "Refusée",
+      "method": "Comment a-t-elle été donnée ?",
+      "reference": "Référence",
+      "referencePlaceholder": "p. ex. appel du 12 oct., objet du courriel, numéro de document",
+      "signerName": "Nom du client",
+      "signerEmail": "Courriel du client (facultatif)",
+      "note": "Note (facultatif)",
+      "submit": "Enregistrer la décision",
+      "recorded": "Décision enregistrée",
+      "failed": "Impossible d'enregistrer la décision"
+    },
+    "held": {
+      "chip": "En attente d'approbation du client",
+      "writeOff": "Passer en perte",
+      "writeOffTitle": "Passer en perte le temps en suspens ?",
+      "writeOffMessage": "Ce temps est en suspens car le client ne l'a pas approuvé. Le passer en perte le marque sans frais : il ne sera pas facturé.",
+      "writtenOff": "Temps passé en perte",
+      "writeOffFailed": "Impossible de passer le temps en perte"
+    },
+    "timer": {
+      "startNonBillable": "Démarrer comme non facturable"
+    },
+    "loadError": "Impossible de charger les approbations du client",
+    "retry": "Réessayer"
+  },
+  "ticketType": {
+    "incident": "Incident",
+    "service_request": "Demande de service",
+    "problem": "Problème",
+    "change": "Changement"
+  },
+  "ticketLinks": {
+    "title": "Tickets liés",
+    "loading": "Chargement des tickets liés…",
+    "loadFailed": "Impossible de charger les tickets liés.",
+    "empty": "Aucun ticket lié.",
+    "deleted": "Supprimé",
+    "add": "Lier un ticket",
+    "addTitle": "Lier un ticket",
+    "linkType": "Ce ticket…",
+    "addType": {
+      "related": "est lié à",
+      "caused_by": "a été causé par",
+      "resolves": "résout",
+      "duplicate_of": "est un doublon de"
+    },
+    "searchLabel": "Rechercher un ticket dans cette organisation",
+    "searchPlaceholder": "Rechercher par numéro ou sujet",
+    "searching": "Recherche en cours…",
+    "searchFailed": "La recherche a échoué. Réessayez.",
+    "noResults": "Aucun ticket correspondant.",
+    "changePick": "Choisir un autre ticket",
+    "addSubmit": "Ajouter le lien",
+    "adding": "Ajout en cours…",
+    "added": "Ticket lié.",
+    "addFailed": "Impossible d'ajouter le lien.",
+    "removed": "Lien supprimé.",
+    "removeFailed": "Impossible de supprimer le lien.",
+    "remove": "Supprimer le lien vers {{ticket}}",
+    "removeTitle": "Supprimer le lien ?",
+    "removeMessage": "Supprimer le lien vers {{ticket}} ? Les tickets eux-mêmes ne sont pas modifiés.",
+    "removeConfirm": "Supprimer le lien",
+    "linkedIncidents": "{{count}} incidents liés",
+    "linkedIncidents_one": "{{count}} incident lié",
+    "linkedIncidents_other": "{{count}} incidents liés",
+    "group": {
+      "caused_by": "Causé par",
+      "causes": "Cause",
+      "resolves": "Résout",
+      "resolved_by": "Résolu par",
+      "duplicate_of": "Doublon de",
+      "duplicates": "Doublons",
+      "related": "Liés"
+    },
+    "errors": {
+      "ALREADY_LINKED": "Ces tickets sont déjà liés.",
+      "LINK_CYCLE": "Ce lien créerait une chaîne de causes circulaire.",
+      "LINK_LIMIT": "Un ticket peut avoir au plus 50 liens, y compris les liens vers des tickets que vous ne pouvez pas voir. Supprimez un lien avant d'en ajouter un autre.",
+      "SOURCE_ALREADY_DUPLICATE": "Ce ticket est déjà marqué comme doublon d’un autre ticket (que vous ne pouvez peut-être pas voir).",
+      "SOURCE_HAS_DUPLICATES": "D’autres tickets (peut-être des tickets que vous ne pouvez pas voir) sont marqués comme doublons de ce ticket ; il ne peut donc pas être lui-même marqué comme doublon.",
+      "DUPLICATE_TARGET_IS_DUPLICATE": "Ce ticket est lui-même un doublon. Liez plutôt le ticket d’origine.",
+      "CROSS_ORG": "Les tickets ne peuvent être liés qu’au sein de la même organisation.",
+      "SELF_LINK": "Un ticket ne peut pas être lié à lui-même.",
+      "NOT_FOUND": "Ce ticket est introuvable ou n’est plus disponible.",
+      "LINK_GONE": "Ce lien a déjà été supprimé."
+    }
   }
 }

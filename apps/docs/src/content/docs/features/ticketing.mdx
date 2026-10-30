@@ -28,6 +28,17 @@ Across the top, view tabs slice the queue:
 
 Below the tabs, a filter bar narrows any view by **organization**, **priority**, **category**, and **assignee**, and a search box matches against ticket subjects. Each row shows the ticket number, subject, status, priority, and an SLA chip when the clock is running low.
 
+### Ticket types
+
+Every ticket has a **type**: **Incident**, **Service request**, **Problem**, or **Change**. The type tells your team what kind of work a ticket is, separately from its category.
+
+- **Defaults.** New tickets are Incidents, whether they come from an alert, the portal, email, the API, the AI assistant, or a technician. Planned work -- tickets created for a service deliverable occurrence or a project task -- starts as a Service request. The **Create ticket** form defaults to Incident and lets you pick another type.
+- **In the queue.** Each row shows a type chip, and the filter bar has a **Filter by type** control. The Service Desk section of the sidebar has an entry per type -- **Incidents**, **Service Requests**, **Problems**, and **Changes** -- next to **Tickets**, which shows every type. The type filter is kept in the page URL, so a filtered view can be bookmarked.
+- **On a ticket.** Users with ticket edit permission change the type from the **Ticket type** selector in the workbench; read-only users see the chip. Changing the type is recorded in the ticket's activity as an internal note. It does not recalculate the SLA or re-run category rules.
+- **In the portal.** Customers see the type as a label next to the ticket number, but cannot choose it: tickets they submit get the default type.
+
+The AI assistant's ticket tool can filter by type, set the type when it creates a ticket, and change it on an existing one.
+
 ### Site-scoped technicians
 
 Organization users restricted to specific sites only see tickets whose device belongs to one of their sites. Tickets with no device attached (general, org-level requests) remain visible to every technician in the organization. Site-restricted users also can't create tickets against — or move tickets onto — devices outside their sites.
@@ -42,21 +53,73 @@ The workbench shows everything you need to resolve a ticket without leaving the 
 - **Subject and description** -- click the subject to rename the ticket in place; the description has an **Edit** (or **Add description**) control. Changes save instantly and are recorded in the ticket's activity.
 - **Category, due date, and tags** -- set the category from a dropdown (including **No category**), pick or clear a due date, and add or remove tags directly on the ticket. Every change is logged in the activity feed.
 - **Requester** -- select or change who the ticket is for, so a ticket that came in under the wrong contact (or with none) can be corrected without recreating it.
-- **Properties rail** -- requester, source, created date, due date, the reason a ticket is waiting, the resolution note, a **linked device** that links straight to the device's page, and any **linked alerts** with one-click navigation to the alert itself.
+- **Properties rail** -- requester, source, created date, due date, the reason a ticket is waiting, the resolution note, a **linked device** that links straight to the device's page (use **Link device** to attach one to an existing ticket, or **Change device** to swap it, v0.124.0+), and any **linked alerts** with one-click navigation to the alert itself.
 
 Click the expand icon (or press `Enter`) to open the ticket as a full page when you need more room.
+
+### Related tickets
+
+The **Related tickets** panel in the workbench links a ticket to other tickets in the same organization -- for example, several incidents to the problem behind them, or a change to the problem it resolves. Click **Link a ticket**, choose how this ticket relates to the other one, then search for it by number or subject:
+
+| Link | Shown on this ticket | Shown on the other ticket |
+|---|---|---|
+| **is related to** | Related | Related |
+| **was caused by** | Caused by | Causes |
+| **resolves** | Resolves | Resolved by |
+| **is a duplicate of** | Duplicate of | Duplicates |
+
+Each linked ticket shows its number, subject, status, and type, and opens in its full-page view. A link to a ticket that was later deleted stays in the list with a **Deleted** marker so you can remove it.
+
+Linking never changes either ticket's status, SLA, or assignee -- marking a ticket as a duplicate only records the relationship, so close the duplicate yourself. Adding or removing a link writes an internal note on both tickets and an entry in the audit log.
+
+The panel refuses a link that breaks these rules, and says why:
+
+- Both tickets must be in the **same organization**, and a ticket cannot link to itself.
+- **Caused by** and **resolves** links cannot form a loop (A caused by B caused by A).
+- Duplicates are one level deep: a ticket can be a duplicate of only one ticket, a ticket that already has duplicates cannot itself be marked as a duplicate, and you cannot mark a ticket as a duplicate of another duplicate -- link to the original instead.
+- A ticket can have at most **50 links**. Links to tickets you cannot see (for example, at a site outside your access) still count toward the cap and these rules.
+
+Viewing links needs ticket read permission; adding and removing them needs ticket edit permission. The AI assistant's ticket tool can list, add, and remove links under the same rules. Links are not shown in the customer portal, and moving a ticket to another organization removes its links.
+
+### Assignment notifications
+
+When a ticket is assigned to someone, Breeze emails the new assignee. The email carries a short facts table (ticket number, customer, priority, status, requester and, when there is one, the linked device), the first 1,200 characters of the message, and an **Open ticket** link to the ticket in the dashboard. Assignees can also get a mobile push (see [Mobile app](/features/mobile/)) and, if they save their own key, a [Pushover push](/features/notifications/#ticket-assignments-over-pushover).
+
+For a newly created ticket, the assignment notification is sent on the next notification pass after the ticket is saved, usually about 5 seconds later.
 
 ### Moving a ticket to another organization
 
 If a ticket landed under the wrong customer, use **Move to another org…** in the ticket header to reassign it to a different organization. Pick the target from the dropdown and click **Move**. The ticket — along with its time entries, parts, and linked alerts — follows to the new organization, and the move is recorded in the activity feed and the audit log.
 
-Because the attached device belongs to the original organization, moving the ticket **detaches its device** (the ticket becomes device-less; you can link a device from the new org afterward). The assignee, category, and SLA carry over unchanged.
+Because the attached device belongs to the original organization, moving the ticket **detaches its device** (the ticket becomes device-less; you can link a device from the new org afterward). The assignee and category carry over unchanged. The ticket's business calendar is re-resolved for the target organization, and its response and resolution deadlines that haven't been met yet are recalculated on that calendar (see [Business hours](#business-hours)).
 
 If the two organizations bill in different currencies and the ticket still has **unbilled** time entries or parts with amounts, the move is blocked: the dialog explains how many entries and parts are priced in the old currency and in which currency the target organization bills. The clean path is to invoice that work first (or assemble a draft in the old currency from the ticket), then move. If you need to move regardless, tick the acknowledgement and click **Move anyway** -- those items keep their amounts in the old currency, they are never converted, and they can only be invoiced later on a draft in that currency. "Move anyway" additionally requires invoice edit permission, and the acknowledgement is recorded in the activity feed and the audit log.
 
 <Aside>
   Tickets can only be moved between organizations of the **same partner**. This is a high-privilege action: it requires ticket and organization edit permissions plus MFA confirmation, and isn't available to site-restricted technicians.
 </Aside>
+
+### Merging duplicate tickets
+
+When the same issue arrives twice (a customer emails and also calls, or two people report one outage), merge the duplicate into the ticket you want to keep.
+
+1. Open the duplicate and choose **Merge into…** in the ticket header.
+2. Pick the ticket to keep. The list shows the organization's open tickets, oldest first, and you can search it. Resolved and closed tickets cannot receive a merge.
+3. Read the preview. It lists what moves to the kept ticket (comments, attachments, time entries, parts, checklist items, linked alerts and emails, tags), the links that are dropped, and whether the kept ticket keeps its own device or takes the duplicate's. When the ticket you picked is not the older one, the preview suggests the older one, which is usually the one to keep.
+4. Decide whether to email the duplicate's requester. **Notify the requester** is ticked by default when the two tickets have different requesters.
+5. Click **Merge** and confirm with MFA.
+
+After the merge:
+
+- The duplicate becomes a **closed, read-only record** with a banner linking to the kept ticket. Nothing can be added to it or changed on it. Comments that moved show "from T-…" next to the author.
+- The kept ticket keeps its own SLA clock, priority and assignee. Time entries and parts move with their amounts and billing state unchanged.
+- **Replies follow the merge.** Email sent to the duplicate's thread is added to the kept ticket.
+- **In the customer portal**, the duplicate shows a "This request was merged into T-…" banner. Its requester can read and reply on the kept ticket.
+- Merged tickets are hidden from the queue. Tick **Show merged** above the list to see them.
+
+A merge cannot be undone. It is refused when the tickets belong to different organizations (move one first), when either ticket has a customer approval request or a budget, when either is tied to a service deliverable or an open migration import, when one is planned work and the other a support ticket, or when the duplicate has AI actions waiting for approval. The preview names the reason before you confirm.
+
+Merging needs ticket edit permission and access to both tickets' sites and devices. The AI assistant can preview and perform a merge through its ticket tool, under the same rules and with approval.
 
 ### Deleting and Restoring Tickets
 
@@ -101,6 +164,19 @@ Technicians can add attachments from the ticket workbench and from the mobile ap
 Each reply and internal note you wrote has **Edit** and **Delete** controls in its header. Editing opens the text inline with **Save** and **Cancel**; an edited entry is marked **edited** in the feed. Deleting asks you to confirm and leaves a small "deleted" placeholder in its place rather than removing the entry outright, so the conversation history stays intact.
 
 You can edit or delete your **own** comments; technicians with ticket management permission can edit or delete anyone's. System entries — status changes, assignments, and time logs — can't be edited or deleted, and comments that came in from the customer portal aren't editable from the workbench. Editing or deleting a reply does **not** re-notify the customer.
+
+## Checklists
+
+A ticket can carry a **Checklist** of steps to tick off as the work is done. Steps are internal -- never shown to the customer -- and each can carry a note. Resolving a ticket with unticked steps asks you to confirm first. In the queue, a ticket with a checklist shows its progress as **n/m steps** (v0.124.0+).
+
+### Checklist templates
+
+Reusable procedures live under **Settings → Ticketing → Templates**, in **Checklist templates**. A template is available to all organizations or to one, and has a name, a description, internal instructions and its steps; an inactive template stays linked where it is already used but stops appearing in pickers. On a ticket, **Apply template** either adds the template's steps to the existing checklist or replaces the unticked steps while keeping the completed ones.
+
+Two shortcuts arrived in v0.124.0:
+
+- **Save as template** turns the checklist on a ticket into a template. Give it a name and choose whether to make it available to all organizations. Steps created by an AI task and repeated steps are left out, and the confirmation says how many.
+- **Duplicate** copies an existing template so you can adapt it without editing the original.
 
 ## Canned Responses
 
@@ -164,6 +240,27 @@ Tickets enter the queue from four directions:
   on restores everything with its history intact. See
   [Service Management mode](/reference/partner-management/#service-management-mode).
 </Aside>
+
+## Routing rules
+
+Routing rules set who a new ticket goes to, and how it starts, the moment it is created. Manage them in **Settings → Ticketing → Routing**.
+
+A rule has **conditions** and **actions**:
+
+- **Conditions:** where the ticket came from (portal, email, alert, technician, API, AI), its priority, its category, words in the subject, and the requester's email domain. A domain is either exact (`example.com`) or every subdomain (`*.example.com`, which matches `help.example.com` but not `example.com` itself). Within one condition any value can match; every condition you fill in must match. A rule with no conditions matches every ticket, and the editor warns you about it. A priority condition matches only a priority someone chose (the technician, the customer or an intake form); a ticket whose priority was left at the default doesn't match one, even though it is saved as Normal.
+- **Actions:** assign a technician, set the priority, the category or the starting status, and add tags. A rule must have at least one action. The starting status can be a **New**, **Open**, **Pending** or **On hold** status; a ticket that starts Pending or On hold starts with its SLA clock paused.
+
+How rules are applied:
+
+- **Org rules first.** An organization's own rules are checked first, then the partner-wide rules (marked **All orgs**, or limited to the organizations you list). Within each group, the order on the page decides; drag a rule to reorder it. The **first** rule that matches wins.
+- **A rule never overrides a choice.** It only fills in what the person or form creating the ticket left empty: a priority a technician picked, an assignee they chose, or an intake form's own category and priority always win. The rule's category and priority then decide the ticket's SLA targets.
+- **If an action can't be applied**, it is skipped and the rest of the rule still applies. For example, if the technician a rule assigns can't be assigned that ticket (they were disabled, or they can't see that customer's organization), the ticket is created without that assignee. A rule whose only assignee has since been deleted becomes a rule with no action; the editor shows it so you can fix it.
+- **Every routed ticket says why.** The ticket gets an internal note naming the rule and listing the actions it applied and any it skipped, and the ticket keeps that note even if the rule is later renamed or deleted.
+- **Rules run once, at creation.** Editing a ticket later never re-routes it. Imported tickets, and tickets created as a continuation of a closed ticket (a reply to a closed email thread, an Office add-in follow-up), are not routed. Routing sends no notifications of its own; an assigned technician gets the usual [assignment notification](#assignment-notifications).
+
+Use **Test a ticket** on the Routing tab to see which rule a ticket would match, and what it would set, without creating anything.
+
+Partner-wide rules can be created and changed only by staff with access to all of your organizations. Staff with access to some organizations manage those organizations' own rules. Organization users can see the rules that apply to them but can't change them.
 
 ## Email-to-Ticket
 
@@ -248,12 +345,13 @@ Anything else is routed exactly as it would be with the setting off. The origina
 
 #### Default assignee for new inbound tickets
 
-An unassigned ticket sends no assignee notification, so staff can miss it. Pick a **Default assignee for new inbound tickets** on the same card to give every ticket created from inbound email an owner. It's empty (off) by default.
+An unassigned ticket sends no assignee notification, so staff can miss it. Set a default assignee to give every ticket created from inbound email an owner. It's empty (off) by default. The setting lives at the bottom of **Settings → Ticketing → Routing**, under **If no rule assigns an email ticket** (it used to be on the Inbound email card).
 
+- It is the **fallback** after [routing rules](#routing-rules): it applies only when no rule assigned the ticket, including when the matching rule set only a priority or category, or its assignee was skipped.
 - Only **new** tickets are assigned. A reply that threads onto an existing ticket never changes who it's assigned to, and a ticket something else already assigned is left alone.
 - You can pick an **active** member of your team whose organization access isn't set to none and whose role can view tickets. Breeze checks this every time the card saves, and rejects a user from another partner, a disabled user, or someone without ticket access. If the person you picked later stops qualifying, the card shows them as unavailable and won't save other changes until you pick someone else or clear the setting.
 - Each ticket is checked again when it arrives. If the default assignee can no longer be assigned that ticket (for example, they were disabled, or their access doesn't include that customer's organization), the ticket is created **unassigned** and Breeze records why in its inbound email log. The email is never rejected because of this setting.
-- The assignment is recorded like any other: it appears in the ticket's activity and the audit log, and the assignee gets the usual assignment notification once the ticket has been saved.
+- The assignment is recorded like any other: it appears in the ticket's activity and the audit log, and the assignee gets the usual [assignment notification](#assignment-notifications) once the ticket has been saved.
 - The setting applies to every inbound path: the native inbound address and connected Microsoft 365 and Gmail mailboxes.
 
 ### Who the requester is
@@ -283,6 +381,8 @@ Instead of forwarding to your Breeze inbound address, you can connect a Microsof
 </Steps>
 
 Once connected, Breeze polls the mailbox every minute or two, turns new messages into tickets (threading and the review queue work exactly as above), and marks each handled message as read so your team can see what's been picked up. Only mail that arrives after you connect is ticketed -- existing inbox history is not imported. Public replies go out **from the support address** and thread natively in the customer's mailbox; internal notes and technician notifications are unaffected. You can connect more than one mailbox (for example `support@` and `billing@`). **Disconnect** stops polling immediately; to fully remove access, also revoke the app's consent in your Microsoft Entra admin center.
+
+A temporary Microsoft Graph problem -- throttling, a Microsoft server error, a network failure or a request that times out -- does not stop the mailbox: it stays **Connected** and Breeze retries on the next poll. Only an authorization failure asks you to reconnect.
 
 If a connection does not complete:
 
@@ -333,6 +433,19 @@ Categories also carry SLA targets (response and resolution times) and can name a
 <Aside>
   The automated SLA engine is live. Breeze tracks each ticket against its category's response and resolution targets, pauses the clock while a ticket is **On Hold**, monitors for breaches, and notifies the assignee (and escalates to the configured contacts) as a target approaches or is missed.
 </Aside>
+
+## Business hours
+
+SLA deadlines can be counted on business hours instead of the clock. Go to **Settings → Ticketing → Priorities & SLAs** and open the **Business hours** card to manage calendars. A calendar has a time zone, a weekly schedule (each weekday can have several open intervals, such as a split shift), and a list of holidays.
+
+Which calendar a ticket uses is resolved when the ticket is created: the organization's own override if it has one, otherwise the partner's default calendar, otherwise round-the-clock (24×7). A partner-wide calendar is marked **All orgs**; the default is marked **Default**. The calendar and its current hours are then **snapshotted on the ticket**, so later edits don't silently shift deadlines on tickets that already exist.
+
+- **Choosing a calendar for one organization.** In the organization's **Ticketing** settings, the **Business hours** field is blank by default and shows what it inherits (for example "Inherited: Support hours (partner default)"). Pick a calendar to override it for that organization.
+- **Editing hours or the time zone affects new tickets only.** Open tickets keep the hours they were created with.
+- **Holidays.** Adding or removing a holiday dated in the future recomputes the deadlines of open tickets. Holidays dated today or earlier don't change open tickets.
+- **Apply to open tickets.** To move tickets that are already open onto a calendar's current hours, use **Apply to open tickets**. Breeze first shows a preview: how many tickets would be updated, how many of those would become breached immediately, and how many are skipped because they have been paused. Tickets that have ever been paused are never changed. If the hours change between the preview and your confirmation, the apply is rejected and the preview is reloaded so you can review the new counts.
+- **Archiving and deleting.** An archived calendar can't be chosen for new work. A calendar that tickets or organizations still use, or that is the default, can't be deleted.
+- **Customer portal.** The portal shows SLA status only; it doesn't show your calendars or hours.
 
 ## Custom Statuses & SLA Configuration
 
@@ -386,6 +499,22 @@ Click the stop icon in the header widget to open the stop popover, where you can
 
 Click **Log time** in the ticket's Time & Billing rail to open the quick-add form. Enter the number of minutes, an optional description, and whether the entry is billable, then click **Save**. The entry is back-dated so the end time is now and the start time is now minus the minutes you entered.
 
+### Deleting a time entry
+
+Each entry in the ticket's Time & Billing rail and on the **/timesheet** row has a **Delete** action with a confirm dialog. Deleting is permanent. It is offered on any entry that has not been invoiced to users with time-entry write access; the server then decides per entry, so you can delete your own unapproved entries, while deleting someone else's entry or an approved one needs an administrator who manages all time entries. A refusal is explained in the dialog. Deleting the entry of a running timer also clears the timer in the header.
+
+### Time without a ticket
+
+A time entry does not have to belong to a ticket. Through the API, `POST /time-entries/start` and `POST /time-entries` accept an optional `orgId` and `siteId` (plus `source`, which only the mobile app's arrival prompt sets), so time spent at a customer site can be recorded against the organization and site directly. A `siteId` needs an `orgId` or a `ticketId`. When a ticket is also given, the ticket's organization always wins: a different `orgId` is refused with `422 ORG_MISMATCH`, and a site outside the organization with `422 SITE_ORG_MISMATCH`. `GET /time-entries` returns each entry's `siteId` and can filter by it.
+
+### Location suggestions
+
+**Location suggestions** let the Breeze mobile app offer to start a timer when a technician arrives at a client site. Turn it on under **Settings → Ticketing → Time capture** with **Suggest a timer when a technician arrives at a client site**, and set a **Default arrival radius (m)** (default 150 m, 50--1000 m) for sites that have no radius of their own. The setting is partner-wide and **off by default**. Each technician must also allow location on their phone; location is checked on the phone and is never sent to Breeze. Only the site's own pinned coordinate is stored -- see [Site location](/reference/organizations-and-sites/#site-location) for how sites are pinned.
+
+<Aside type="note" title="Mobile prompt ships later">
+  v0.122.1 adds the setting, site pins and the API the mobile app reads (`GET /time-entries/location-sites`, which returns the setting, the default radius, whether the caller may pin sites, and the caller's sites, capped at 2,000 with a `truncated` flag). The arrival prompt itself ships in a later mobile app release, so turning the setting on changes nothing a technician sees yet.
+</Aside>
+
 ### Suggested time entries
 
 When a remote session ends, Breeze can offer it as a one-tap time entry: *"You ran a 38-minute desktop session on ACME-DC01 and closed T-2026-1041 -- log it?"* Nothing is ever written until you tap it.
@@ -394,10 +523,14 @@ When a remote session ends, Breeze can offer it as a one-tap time entry: *"You r
   The suggestion list, the one-tap confirm and the dismiss/restore control live in the **Breeze mobile app** and ship with it. In the web app this release adds only the partner setting described below and the provenance badge described at the end of this section -- there is no web suggestions panel. Turning the setting on changes nothing a technician sees on **/timesheet**.
 </Aside>
 
-**Turning it on.** Go to **Settings → Ticketing → Time Tracking** and enable **Suggest time entries from remote sessions**. The setting is off by default and applies partner-wide, to every technician in your organization. Two thresholds sit beside it:
+**Turning it on.** Go to **Settings → Ticketing → Time capture** and enable **Suggest time entries from remote sessions**. The setting is off by default and applies partner-wide, to every technician in your organization. Two thresholds sit beside it:
 
 - **Minimum session length** (default 120 seconds) -- sessions shorter than this are never suggested, so a mistyped connection does not become a billable line.
 - **Merge gap** (default 10 minutes) -- back-to-back sessions on the same device within this gap are combined into a single suggestion rather than offered separately.
+
+<Aside type="caution" title="Re-check this card if you saved it before v0.122.1">
+  Earlier versions always displayed **Suggest time entries from remote sessions** as off with default thresholds, and saving the card wrote those values back over your stored settings. From v0.122.1 the card loads and keeps the stored values. If you saved the Time Tracking card on an earlier version, open it and check the toggle and both thresholds.
+</Aside>
 
 **What gets suggested.** Ended remote sessions -- terminal, desktop and file transfer -- from the day you are looking at, attributed to the technician who ran them, with the session's recorded duration. Back-to-back sessions on one device inside the merge gap are combined into a single suggestion, and suggestions never overlap each other. Quick Support sessions appear with their attribution label and no organization until you attach a ticket.
 

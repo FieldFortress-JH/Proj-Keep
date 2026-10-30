@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Test on a device",
       "selectDevice": "Device",
-      "run": "Run test"
+      "run": "Run test",
+      "saveToTest": "Save to test your changes"
     },
     "deliveryPreview": {
       "selectOrg": "Select an organization to preview delivery.",
@@ -192,7 +193,8 @@
     "script": "Script check",
     "network_check": "Network check",
     "hardware_health": "Hardware health",
-    "time_sync": "Time synchronization"
+    "time_sync": "Time synchronization",
+    "container_image_currency": "Container image currency"
   },
   "fields": {
     "operator": "Comparison",
@@ -244,7 +246,9 @@
     "expectedValue": "Expected value",
     "nameserver": "Nameserver",
     "degradedIsFailure": "Treat degraded as failure",
-    "maxResponseMs": "Fail when slower than (ms)"
+    "maxResponseMs": "Fail when slower than (ms)",
+    "eventLogCollectionNoSource": "Information and Warning Application events are collected only from {{providers}}. Events from other sources match this rule only at Error or Critical level, unless an Event Logs configuration policy lists it (Configuration policy → Event Logs → Application providers).",
+    "eventLogCollectionSourceNotCollected": "The agent does not collect Information or Warning Application events from \"{{source}}\", unless an Event Logs configuration policy lists it (Configuration policy → Event Logs → Application providers). Otherwise, this rule only matches its Error or Critical events. Built-in providers: {{providers}}."
   },
   "operators": {
     "gt": "greater than",
@@ -268,6 +272,7 @@
     "system": "System"
   },
   "eventLevels": {
+    "info": "Information",
     "warning": "Warning",
     "error": "Error",
     "critical": "Critical"
@@ -328,10 +333,13 @@
     "cancel": "Cancel",
     "detachConfirm": "Detach from {{policy}}?",
     "errors": {
+      "loadGroups": "Couldn't load device groups.",
       "attach": "Failed to attach monitor",
       "detach": "Failed to detach monitor",
       "linkedFeature": "This policy's monitors come from a shared feature policy. Edit that policy or choose another one."
-    }
+    },
+    "partnerWideGroups": "All orgs (partner-wide)",
+    "organizationGroups": "Organization groups"
   },
   "policyTab": {
     "title": "Monitors",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Legacy alert rules",
     "description": "Standalone alert rules that are not managed by a monitor. Convert them to get responses, delivery and escalation in one place.",
-    "empty": "No legacy rules.",
+    "empty": "No standalone alert rules need conversion.",
     "columns": {
       "name": "Name",
       "template": "Template",
@@ -535,11 +543,13 @@
       "more": "Load more",
       "empty": "No conversion history.",
       "system": "System",
+      "unknownUser": "Unknown user",
       "reverted": "Reverted",
       "deadline": "Undo is unavailable after the legacy alerting retirement removes the source runtime."
     },
     "errorCodes": {
       "preview_stale": "The policy changed since this preview. Preview again before converting.",
+      "conversion_contended": "Other changes were happening at the same time, so the conversion did not complete. Nothing was changed. Try again.",
       "preview_failed": "The preview could not be produced. Try again later.",
       "equivalence_delta": "The converted monitors would not behave like the legacy rules on every device. Review the preview before converting.",
       "CONVERSION_PREREQUISITE_MISSING": "A required platform update has not been deployed yet, so this cannot be converted.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "Time policy was not applied",
           "policy_conflict_gpo": "Group Policy controls time settings"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Minimum days behind"
       }
     }
   },

@@ -13,6 +13,17 @@ const SITE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
 vi.mock('../services', () => ({}));
 
+// These org-only route regressions do not enter the separate OD5 read view.
+// Preserve ownership/locking helpers used by the real membership code, while
+// keeping the new cross-owner lookups out of their queued Drizzle responses.
+vi.mock('../services/deviceGroupOwnership', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/deviceGroupOwnership')>(),
+  resolveOrgSessionPartnerId: vi.fn().mockResolvedValue(null),
+  readPartnerGroupsForOrgSession: vi.fn().mockResolvedValue([]),
+  findPartnerOwnedGroupIds: vi.fn().mockResolvedValue([]),
+}));
+
+
 vi.mock('../services/auditEvents', () => ({
   writeRouteAudit: vi.fn()
 }));
@@ -63,6 +74,7 @@ vi.mock('../db', () => {
   mockDb.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockDb));
   return {
     db: mockDb,
+    getCurrentDbAccessContext: vi.fn(() => ({ scope: 'organization', orgId: '11111111-1111-1111-1111-111111111111' })),
     runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
     withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
     withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -286,6 +298,62 @@ describe('groups routes', () => {
       expect(body.error).toContain('its own parent');
     });
 
+    describe('group exclusion cycles (#9179)', () => {
+      const patch = (filterConditions: unknown) => app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ filterConditions })
+      });
+      const dynamic = () => makeGroup({ type: 'dynamic' });
+      const mockGroupLookup = () => vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([dynamic()]) })
+        })
+      } as any);
+
+      it('rejects a dynamic group that excludes itself', async () => {
+        mockGroupLookup();
+        const res = await patch({ operator: 'AND', conditions: [{ field: 'groupId', operator: 'notEquals', value: GROUP_ID }] });
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.details[0]).toContain('reference itself');
+      });
+
+      it('rejects flipping a static group with a stored self-referencing filter to dynamic', async () => {
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([makeGroup({
+                type: 'static',
+                filterConditions: { operator: 'AND', conditions: [{ field: 'groupId', operator: 'notEquals', value: GROUP_ID }] }
+              })])
+            })
+          })
+        } as any);
+        const res = await app.request(`/groups/${GROUP_ID}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({ type: 'dynamic' })
+        });
+        expect(res.status).toBe(400);
+      });
+
+      it('rejects a two-group cycle', async () => {
+        mockGroupLookup();
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              { id: GROUP_ID_2, filterConditions: { operator: 'AND', conditions: [{ field: 'groupId', operator: 'notIn', value: [GROUP_ID] }] } }
+            ])
+          })
+        } as any);
+        const res = await patch({ operator: 'AND', conditions: [{ field: 'groupId', operator: 'notEquals', value: GROUP_ID_2 }] });
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.details[0]).toContain('cycle');
+      });
+    });
+
     it('should return 404 when user cannot edit group from different org', async () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -388,7 +456,7 @@ describe('groups routes', () => {
         SITE_ID,
         ORG_ID,
         expect.anything(),
-        { deferPeripheralReconciliation: true },
+        { deferPeripheralReconciliation: true, group: expect.objectContaining({ id: GROUP_ID, orgId: ORG_ID }) },
       );
       expect(schedulePeripheralPolicyDevice).toHaveBeenCalledWith(
         DEVICE_ID,
@@ -498,7 +566,7 @@ describe('groups routes', () => {
       const body = await res.json();
       expect(body.data.id).toBe(GROUP_ID);
 
-      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, ORG_ID);
+      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, { orgId: ORG_ID });
       expect(schedulePeripheralPolicyDevice.mock.calls).toEqual([
         [DEVICE_ID, 'group_deleted'],
         [DEVICE_ID_2, 'group_deleted'],
@@ -542,7 +610,7 @@ describe('groups routes', () => {
       expect(res.status).toBe(400);
       const body = await res.json();
       expect(body.error).toContain('child groups');
-      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, ORG_ID);
+      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, { orgId: ORG_ID });
     });
 
     it('returns 409 with contractCount only when the caller lacks contracts:read', async () => {

@@ -211,6 +211,13 @@ describe('buildPartnerModelsSnapshot', () => {
     ]);
   });
 
+  it('does not count platform-only surfaces (patch_test) in defaultFor: no UI row can manage them (#9455)', async () => {
+    setOfferings([offering({ id: A })]);
+    h.allRows = [{ surface: 'chat', orgId: null, defaultOfferingId: A }, { surface: 'patch_test', orgId: null, defaultOfferingId: A }];
+    const s = await buildPartnerModelsSnapshot(P);
+    expect(s.offerings[0]!.defaultFor).toEqual([{ surface: 'chat', level: 'partner', orgId: null }]);
+  });
+
   it('returns one defaults row per configurable (surface, role), never patch_test', async () => {
     h.partnerRows = [assignment({ surface: 'chat', orgId: null, defaultOfferingId: A, allowUserChoice: true })];
     h.allRows = [{ surface: 'chat', role: 'default', orgId: 'o1', defaultOfferingId: null }, { surface: 'chat', role: 'default', orgId: 'o2', defaultOfferingId: null }];
@@ -289,6 +296,12 @@ describe('buildPartnerModelsSnapshot', () => {
       // Anthropic-dialect and platform connections expose no base URL and are never env-managed here.
       expect(s.connections.find((c) => c.id === C)).toMatchObject({ baseUrl: null, managedBy: null, effectiveInferenceGeo: 'us' });
       expect(s.connections[0]).toMatchObject({ kind: 'platform', baseUrl: null, managedBy: null });
+    });
+
+    it('an Anthropic-dialect connection is never env-managed, even with a stray managedBy in provider_config', async () => {
+      h.connections = [conn({ id: C, kind: 'catalog', providerConfig: { managedBy: 'env', envReleasedAt: '2026-10-01T00:00:00.000Z' } })];
+      const s = await buildPartnerModelsSnapshot(P);
+      expect(s.connections.find((c) => c.id === C)).toMatchObject({ managedBy: null, envReleased: false });
     });
 
     it('a released env connection stays managedBy env (read-only) and is flagged envReleased (the partner may disconnect it)', async () => {

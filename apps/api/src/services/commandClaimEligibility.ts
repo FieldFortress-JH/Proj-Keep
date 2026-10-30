@@ -12,10 +12,12 @@ import {
 } from './partnerTrust.commands';
 import type { PartnerTrustState } from '../db/schema/orgs';
 import { captureException } from './sentry';
+import { callerVerificationEnabled, callerVerificationWorkstationEnabled } from '../config/env';
 import { DRAIN_CLAIM_TYPE_ALLOWLIST } from './drainClaimAllowlist';
 import { PARKED_DEVICE_CANCEL_REASON } from './unassignedPool/deliveryEligibility';
 import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
+import { commandStampIsCurrent, SUPERSEDED_BY_REATTACH_REASON } from './commandIncarnation';
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -42,11 +44,19 @@ export type ClaimCancelReason =
    * removal is delivered. An org-type fact, deliberately not folded into
    * `device_lifecycle` (that one is the device's own status).
    */
-  | typeof PARKED_DEVICE_CANCEL_REASON;
+  | typeof PARKED_DEVICE_CANCEL_REASON
+  /**
+   * #8318 §4.2/§5.2: the row is stamped for an earlier install incarnation of
+   * the device. The install it was queued for is gone, so nothing of it is
+   * delivered to the install that now owns the row — removal included.
+   */
+  | typeof SUPERSEDED_BY_REATTACH_REASON;
 
 /** Why a claim candidate was withheld this heartbeat but left `pending`. */
 export type ClaimHoldReason =
   | 'held_maintenance_suppression'
+  /** A feature-gated type whose feature is currently dark; recoverable when re-enabled. */
+  | 'held_feature_disabled'
   | 'power_state_barrier'
   | 'eligibility_check_failed';
 
@@ -65,11 +75,19 @@ export type ClaimEligibilityDevice = {
    * forget to read it: a holding-org device gets lifecycle removal only.
    */
   orgType: string;
+  /**
+   * `devices.install_incarnation` (#8318). Required for the same reason as
+   * `orgType`: a claim path that forgot to read it could deliver an earlier
+   * install's work.
+   */
+  installIncarnation: number;
 };
 
 export type ClaimCandidate = {
   id: string;
   type: string;
+  /** `device_commands.device_incarnation`; NULL counts as incarnation 1. */
+  deviceIncarnation: number | null;
   createdBy: string | null;
   submittedOrgId: string | null;
   deliverBy: Date | null;
@@ -99,7 +117,10 @@ export type ClaimPartition = {
  * schedule a restart (with its own delay and user deferral), so it does not
  * need to be serialised against other work.
  */
-export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode']);
+// `force_reboot` (#8729) is here on purpose: it force-closes apps, but it still
+// waits its turn behind real in-flight work. Mark failed (#8508) is the way past
+// a stuck command, not a barrier bypass.
+export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode', 'force_reboot']);
 
 /**
  * Types the UNINSTALL DRAIN owns. Exempt from EVERY claim-time eligibility
@@ -386,7 +407,18 @@ export async function partitionClaimable(
   const assertTrusted = createDeviceExecuteBatchGate(device.id, () => readOrgTrustSnapshot(tx, device.orgId));
 
   for (const row of rows) {
-    // Checked FIRST, ahead of every cancel: see DRAIN_EXEMPT_TYPES above.
+    // #8318 §4.2/§5.2 — checked before everything, the drain exemption
+    // included: a row stamped for an earlier install incarnation was queued
+    // for an install that no longer exists. The boundary cancelled every such
+    // row that was open when it ran; this catches one that slipped past it,
+    // so it is terminalised here instead of waiting for the reaper. The flip
+    // to `sent` re-checks the same thing in SQL (commandDispatch.ts).
+    if (!commandStampIsCurrent(row.deviceIncarnation, device.installIncarnation)) {
+      cancelled.push({ id: row.id, reason: SUPERSEDED_BY_REATTACH_REASON });
+      continue;
+    }
+
+    // Checked FIRST among the rest, ahead of every other cancel: see DRAIN_EXEMPT_TYPES above.
     if (DRAIN_EXEMPT_TYPES.has(row.type)) {
       claimable.push(row);
       continue;
@@ -546,6 +578,14 @@ export async function partitionClaimable(
     }
     if (revalidation) {
       cancelled.push({ id: row.id, reason: revalidation });
+      continue;
+    }
+
+    // Workstation prompts created before the tier went dark (or while the
+    // feature is off) are not handed to an agent: held, not cancelled, so the
+    // row stays pending and expires normally, or resumes if re-enabled.
+    if (row.type === 'caller_verify' && !(callerVerificationEnabled() && callerVerificationWorkstationEnabled())) {
+      held.push({ id: row.id, reason: 'held_feature_disabled' });
       continue;
     }
 

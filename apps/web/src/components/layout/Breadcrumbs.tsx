@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
@@ -8,6 +9,20 @@ import '../../lib/i18n';
 interface BreadcrumbItem {
   label: string;
   href?: string;
+  /** Hover text, e.g. the hostname behind a device's display name. */
+  title?: string;
+  /** Extra context for assistive tech (rendered as `aria-description`). */
+  description?: string;
+  /**
+   * Handles a plain left click instead of following `href` (e.g. pop history
+   * so list filters and scroll survive). Modifier/middle clicks still open
+   * `href` normally, so the crumb stays a real link.
+   */
+  onClick?: () => void;
+}
+
+function isPlainLeftClick(e: MouseEvent<HTMLAnchorElement>): boolean {
+  return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
 }
 
 interface BreadcrumbsProps {
@@ -34,12 +49,26 @@ export default function Breadcrumbs({ items }: BreadcrumbsProps) {
             {item.href && index < items.length - 1 ? (
               <a
                 href={item.href}
-                className="truncate hover:text-foreground transition-colors"
+                title={item.title}
+                aria-description={item.description}
+                onClick={
+                  item.onClick
+                    ? (e) => {
+                        if (!isPlainLeftClick(e)) return;
+                        e.preventDefault();
+                        item.onClick?.();
+                      }
+                    : undefined
+                }
+                className="truncate transition-colors hover:text-foreground max-md:min-h-[32px] max-md:leading-8"
               >
                 {item.label}
               </a>
             ) : (
-              <span className={index === items.length - 1 ? 'truncate text-foreground font-medium max-w-[200px]' : 'truncate'}>
+              <span
+                title={item.title}
+                className={index === items.length - 1 ? 'truncate text-foreground font-medium max-w-[200px]' : 'truncate'}
+              >
                 {item.label}
               </span>
             )}

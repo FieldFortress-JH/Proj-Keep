@@ -15,8 +15,10 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState({
 // showed up. The title/blurb derivation here must stay identical to
 // apps/api/src/services/invoicePdf.ts (lineTitle/lineBlurb) so the portal and
 // the PDF the same customer downloads label a line the same way.
+let lineSeq = 0;
 function line(overrides: Partial<InvoiceLine> = {}): InvoiceLine {
   return {
+    id: `line-${++lineSeq}`,
     ticketNumber: null,
     name: null,
     // The API serializes a NULL description as '' (invoiceService's
@@ -48,13 +50,18 @@ function detail(lines: InvoiceLine[]): InvoiceDetail {
       taxRate: null,
       billToName: 'Acme Co',
       notes: null,
+      displayStatus: 'sent',
     },
     lines,
+    documentLocale: 'en',
+    branding: { partnerName: 'Lantern MSP', logoUrl: null, primaryColor: null, theme: 'classic', pageSize: 'letter' },
   };
 }
 
-function renderDetail(lines: InvoiceLine[]) {
-  return render(<InvoiceDetailView detail={detail(lines)} />);
+function renderDetail(lines: InvoiceLine[], lineGrouping?: 'entry' | 'day') {
+  const d = detail(lines);
+  if (lineGrouping) d.invoice.lineGrouping = lineGrouping;
+  return render(<InvoiceDetailView detail={d} />);
 }
 
 describe('InvoiceDetailView line labels (#3319)', () => {
@@ -88,15 +95,15 @@ describe('InvoiceDetailView line labels (#3319)', () => {
     expect(screen.getByText('—')).toBeTruthy();
   });
 
-  it('renders a linked ticket number and omits it for an unlinked line', () => {
+  it('names a linked ticket once, in its group header, and never again per line', () => {
     renderDetail([
       line({ ticketNumber: 'T-100' }),
       line({ ticketNumber: null }),
     ]);
-    expect(screen.getByTestId('invoice-line-ticket-0').textContent).toBe(
-      'Ticket #T-100',
-    );
-    expect(screen.queryByTestId('invoice-line-ticket-1')).toBeNull();
+    // The logged-in portal used to repeat "Ticket #N" under every line; the two portal
+    // pages now produce identical markup, so only the group header names it.
+    expect(screen.getAllByText('Ticket #T-100')).toHaveLength(1);
+    expect(document.querySelector('[data-testid^="document-line-ticket-"]')).toBeNull();
   });
 
   it('groups lines under ticket headers with category badge', () => {
@@ -124,20 +131,41 @@ describe('InvoiceDetailView line labels (#3319)', () => {
 // description elsewhere can never erase it here.
 describe('InvoiceDetailView worked-vs-billed note (#6467)', () => {
   it('shows the note for a time_entry line whose worked minutes differ from billed', () => {
-    renderDetail([line({ description: 'On-site', quantity: '1.00', workedMinutes: 30 })]);
-    expect(screen.getByTestId('invoice-line-worked-vs-billed-0')).toHaveTextContent(
+    renderDetail([line({ id: 'w1', description: 'On-site', quantity: '1.00', workedMinutes: 30 })]);
+    expect(screen.getByTestId('document-line-worked-vs-billed-w1')).toHaveTextContent(
       '0.50 h worked · 1.00 h billed',
     );
   });
 
   it('shows no note when worked minutes equal the billed quantity', () => {
-    renderDetail([line({ description: 'Remote', quantity: '1.00', workedMinutes: 60 })]);
-    expect(screen.queryByTestId('invoice-line-worked-vs-billed-0')).toBeNull();
+    renderDetail([line({ id: 'w2', description: 'Remote', quantity: '1.00', workedMinutes: 60 })]);
+    expect(screen.queryByTestId('document-line-worked-vs-billed-w2')).toBeNull();
   });
 
   it('shows no note for a non-time-entry line (workedMinutes absent)', () => {
-    renderDetail([line({ description: 'Widget', quantity: '2.00' })]);
-    expect(screen.queryByTestId('invoice-line-worked-vs-billed-0')).toBeNull();
+    renderDetail([line({ id: 'w3', description: 'Widget', quantity: '2.00' })]);
+    expect(screen.queryByTestId('document-line-worked-vs-billed-w3')).toBeNull();
+  });
+});
+
+describe('InvoiceDetailView — shared document (#9414 W1c)', () => {
+  it('uses the invoice document theme (D14)', () => {
+    const d = detail([line()]);
+    d.branding = { ...d.branding!, theme: 'condensed' };
+    render(<InvoiceDetailView initial={d} />);
+    expect(screen.getByTestId('document-root').getAttribute('data-doc-theme')).toBe('condensed');
+  });
+
+  it('puts the Pay button outside the document root', () => {
+    render(<InvoiceDetailView detail={detail([line()])} />);
+    const root = screen.getByTestId('document-root');
+    expect(root.contains(screen.getByTestId('invoice-pay-button'))).toBe(false);
+  });
+
+  it('renders the balance in the hero row', () => {
+    render(<InvoiceDetailView detail={detail([line()])} />);
+    expect(screen.getByTestId('document-totals-hero')).toHaveTextContent('Balance due');
+    expect(screen.getByTestId('document-totals-hero')).toHaveTextContent('$100.00');
   });
 });
 
@@ -271,15 +299,61 @@ describe('InvoiceDetailView — autopay payment waiting on the bank (off-session
 });
 
 describe('InvoiceDetailView — paper and rail layout (visual QA 2026-10-05)', () => {
-  it('the payment rail sticks at lg from its grid item (V-4), and paper dates are long (V-27)', () => {
+  it('the payment rail sticks at lg from its grid item (V-4), and paper dates come from the shared model (V-27)', () => {
     render(<InvoiceDetailView detail={detail([line()])} />);
     const wrapper = screen.getByTestId('invoice-payment-panel').parentElement!;
     expect(wrapper).toHaveClass('lg:sticky', 'lg:top-6', 'lg:self-start');
-    expect(screen.getByText('August 31, 2026')).toBeInTheDocument();
+    expect(screen.getByText('Aug 31, 2026')).toBeInTheDocument();
   });
   it('a long unbroken description wraps, and amounts never wrap (V-6)', () => {
     const name = 'Firewall-renewal-for-https://very-long-unbroken-host-name.example.internal/path';
     render(<InvoiceDetailView detail={detail([line({ name, lineTotal: '1234567.00', unitPrice: '1234567.00' })])} />);
     expect(screen.getByText(name).closest('td')).toHaveClass('[overflow-wrap:anywhere]');
+  });
+});
+
+// #8604: work date under each line (entry mode) or a per-day header (day mode).
+describe('InvoiceDetailView line detail (#8604)', () => {
+  it('entry mode shows the work date under a dated line and none for an undated one', () => {
+    renderDetail([
+      line({ id: 'dated', name: 'Dated', workDate: '2026-09-16' }),
+      line({ id: 'undated', name: 'Undated', workDate: null }),
+    ]);
+    expect(screen.getByTestId('document-line-date-dated').textContent).toBe('Sep 16, 2026');
+    expect(screen.queryByTestId('document-line-date-undated')).toBeNull();
+  });
+
+  it('day mode renders ascending day headers with totals, no per-line dates, undated last', () => {
+    renderDetail([
+      line({ name: 'A', workDate: '2026-09-17', quantity: '1.00', lineTotal: '100.00' }),
+      line({ name: 'B', workDate: '2026-09-16', quantity: '1.50', lineTotal: '150.00' }),
+      line({ name: 'C', workDate: '2026-09-16', quantity: '0.50', lineTotal: '50.00' }),
+      line({ name: 'Part', workDate: null, lineTotal: '20.00' }),
+    ], 'day');
+    const h16 = screen.getByTestId('document-day-2026-09-16');
+    const h17 = screen.getByTestId('document-day-2026-09-17');
+    expect(h16.compareDocumentPosition(h17) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(h16.textContent).toContain('Sep 16, 2026');
+    expect(h16.textContent).toContain('2');
+    expect(h16.textContent).toContain('$200.00');
+    expect(document.querySelector('[data-testid^="document-line-date-"]')).toBeNull();
+    const part = screen.getByText('Part');
+    const a = screen.getByText('A');
+    expect(a.compareDocumentPosition(part) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(document.querySelectorAll('[data-testid^="document-day-"]')).toHaveLength(2);
+  });
+
+  it('default render carries no date or day markers', () => {
+    renderDetail([line({ name: 'Plain' })]);
+    expect(document.querySelectorAll('[data-testid^="document-line-date-"], [data-testid^="document-day-"]')).toHaveLength(0);
+  });
+
+  it('worked-vs-billed note renders when minutes differ and not when null', () => {
+    renderDetail([
+      line({ id: 'x', name: 'X', quantity: '1.00', workedMinutes: 30 }),
+      line({ id: 'y', name: 'Y', quantity: '1.00', workedMinutes: null }),
+    ]);
+    expect(screen.getByTestId('document-line-worked-vs-billed-x').textContent).toBe('0.50 h worked · 1.00 h billed');
+    expect(screen.queryByTestId('document-line-worked-vs-billed-y')).toBeNull();
   });
 });

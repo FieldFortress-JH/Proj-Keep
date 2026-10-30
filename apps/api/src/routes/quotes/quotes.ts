@@ -12,7 +12,7 @@ import {
   changeCurrencySchema, buildStripeCurrencyWarning,
 } from '@breeze/shared';
 import {
-  createQuote, cloneQuote, reviseQuote, getQuote, refreshDraftQuoteTaxRate, listQuotes, updateQuote, deleteDraftQuote,
+  createQuote, cloneQuote, reviseQuote, getQuote, getAccessibleQuoteRow, refreshDraftQuoteTaxRate, listQuotes, updateQuote, deleteDraftQuote,
   addManualLine, addCatalogLine, updateLine, removeLine, addBlock, updateBlock, deleteBlock,
   reorderBlocks, reorderLines, moveLineToBlock, changeQuoteCurrency,
   refreshQuoteDeviceCounts, quoteDeviceSetEstimate,
@@ -28,17 +28,20 @@ import { safeContentDispositionFilename } from '../../utils/httpHeaders';
 import { resolveQuoteBranding } from '../../services/quoteBranding';
 import { getQuoteRecipients } from '../../services/quoteLifecycle';
 import { getConnection } from '../../services/stripeConnectService';
+import { getEmailService } from '../../services/email';
 import {
   renderContractBlocksForClient,
   loadContractPdfInputs,
   loadContractBlockAuthoring,
   attachContractAuthoring,
+  resolveQuoteEditorAutoVariables,
 } from '../../services/contractTemplateRender';
 import { ContractTemplateServiceError } from '../../services/contractTemplateService';
 import { PdfMergeError } from '../../services/pdfMerge';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { auditBillingDocument } from '../../services/billingDocumentAudit';
 import { QUOTE_ACCEPTANCE_EVIDENCE_META, toAcceptanceEvidenceMeta } from '../../services/quoteAcceptanceEvidence';
+import { assembleCustomerQuoteDocument } from '../../services/customerQuoteDocument';
 
 export const quoteCrudRoutes = new Hono();
 const scopes = requireScope('partner', 'system');
@@ -153,6 +156,22 @@ quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), asyn
     // carry `authoring`.
     const authoring = await loadContractBlockAuthoring(detail.blocks);
     const blocksForEditor = attachContractAuthoring(blocks, authoring);
+    // ADMIN-ONLY (#9867): each auto variable's value as the client will read it,
+    // so the editor's agreement block shows "Client name — Acme Co" instead of
+    // `{{client.name}}`. Quote-level (not per block) because the add-agreement
+    // form needs it before any contract block exists. Display-only: a failure
+    // degrades to null (the editor falls back to the token) rather than failing
+    // the whole quote load.
+    let contractAutoValues: Record<string, string> | null = null;
+    try {
+      contractAutoValues = resolveQuoteEditorAutoVariables(detail.quote, {
+        locale: branding.locale,
+        billTo: detail.billTo ?? null,
+        seller: branding.seller,
+      });
+    } catch (err) {
+      console.error('GET /quotes/:id: contract auto-variable resolution failed', { quoteId: id, err });
+    }
     // Who this quote actually went to. Written at send but, until now, only ever
     // read by the portal's signer-authorization check — so the tech who sent it
     // had no way to see the addresses. Empty on drafts and on legacy sends that
@@ -258,10 +277,34 @@ quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), asyn
     const autoEmailInvoiceOnAccept = partnerAutoEmailRow?.autoEmailInvoiceOnQuoteAccept ?? true;
     return c.json({ data: {
       ...detail, quote: quoteForClient, blocks: blocksForEditor, branding, presentation, recipients,
-      acceptance,
+      acceptance, contractAutoValues,
       stripeConnected, stripeAccountCurrency, currencyWarning,
       autoEmailInvoiceOnAccept,
+      // #9256: whether the server has an email transport at all, so the web can
+      // say "not emailed" instead of promising an email that cannot go out.
+      emailConfigured: !!getEmailService(),
     } });
+  } catch (err) { return handleServiceError(c, err); }
+});
+// GET /:id/customer-view (#9418, spec §3.4) — the customer quote document for
+// the staff Preview: the same assembler and allowlist the public link and the
+// portal serve, in `staff` mode (any status, drafts included). Access is
+// exactly the detail route's: same scopes + quotes:read, then the ownership
+// path getQuote opens with (raw select → 404, assertQuoteAccess → 403). Side-
+// effect free, unlike the detail route: no draft tax-rate refresh, no view
+// stamp, no accept token, no audit row (it reads what the caller can read).
+quoteCrudRoutes.get('/:id/customer-view', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  const id = c.req.valid('param').id;
+  try {
+    const quote = await getAccessibleQuoteRow(id, quoteActorFrom(c));
+    const data = await assembleCustomerQuoteDocument(quote, 'staff', {
+      assets: {
+        // The staff app's authenticated image routes (fetched as object URLs).
+        lineImage: (l) => (l.imageId ? `/quotes/${id}/images/${l.imageId}` : `/catalog/${l.catalogItemId}/image`),
+        contractFile: (blockId) => `/quotes/${id}/contract-file/${blockId}`,
+      },
+    });
+    return c.json({ data });
   } catch (err) { return handleServiceError(c, err); }
 });
 quoteCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam), zValidator('json', updateQuoteSchema), async (c) => {
@@ -401,7 +444,7 @@ quoteCrudRoutes.patch('/:id/orders/:orderId/lines/:lineId', scopes, fulfillPerm,
 // the bare `db` is correct here — same pattern the service uses to read its
 // tables). Branding resolves like invoicePdf: partner name + portal logo/color +
 // partner invoice footer/currency. Footer precedence is
-// quote.terms ?? partner invoice footer ?? portal footer text.
+// quote.terms ?? org portal footer text ?? partner invoice footer (#7510).
 quoteCrudRoutes.get('/:id/pdf', scopes, readPerm, zValidator('param', idParam), async (c) => {
   const id = c.req.valid('param').id;
   try {

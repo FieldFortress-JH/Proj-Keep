@@ -132,8 +132,8 @@
     "tryAgain": "Tentar novamente",
     "recoveryReadiness": "Prontidão para recuperação",
     "score0100": "Pontuação (0-100)",
-    "estRtoMin": "Est. RTO (min)",
-    "estRpoMin": "Est. RPO (min)",
+    "estRtoMin": "RTO estimado (min)",
+    "estRpoMin": "RPO estimado (min)",
     "noRiskFactors": "Nenhum fator de risco",
     "noVerificationHistoryRunAVerificationToCheck": "Nenhum histórico de verificação. Execute uma verificação para checar a integridade do backup.",
     "verificationActions": "Ações de verificação",
@@ -219,6 +219,7 @@
     "created2": "Criado",
     "expires2": "Expira",
     "protection2": "Proteção",
+    "integrity": "Integridade",
     "hold": "Retenção",
     "standard": "Padrão",
     "restorePointCount_one": "{{count}} ponto de restauração",
@@ -487,6 +488,22 @@
     "selectASnapshot": "Selecione um snapshot",
     "chooseTheRecoveryPointYouWantToRestore": "Escolha o ponto de recuperação a partir do qual deseja restaurar.",
     "noSnapshotsAvailable": "Nenhum snapshot disponível.",
+    "device": "Dispositivo",
+    "selectADevice": "Selecione um dispositivo",
+    "chooseTheDeviceToRestore": "Escolha o dispositivo cujo backup você deseja restaurar.",
+    "deviceOption_one": "{{device}} ({{count}} instantâneo)",
+    "deviceOption_other": "{{device}} ({{count}} instantâneos)",
+    "unknownDevice": "Dispositivo desconhecido",
+    "reviewDevice": "Dispositivo: {{device}}",
+    "snapshotNeedsSecondFactor": "Exige segundo fator",
+    "secondFactorNote": "Este ponto de restauração não está verificado. Ao iniciar a restauração, você precisará confirmar com seu segundo fator.",
+    "secondFactorNoteNotEnrolled": "Este ponto de restauração não está verificado e você não tem um segundo fator configurado. Iniciar a restauração exigirá um.",
+    "secondFactorSetUp": "Configurar a autenticação de dois fatores",
+    "commandDetails": "Detalhes do comando",
+    "copyCommandId": "Copiar ID do comando",
+    "commandIdCopied": "ID do comando copiado",
+    "commandIdCopyFailed": "Não foi possível copiar o ID do comando",
+    "carriedSnapshotUnavailable": "O instantâneo com o qual você abriu o assistente não está mais disponível. Escolha um dispositivo e um de seus instantâneos.",
     "selectRestoreType": "Selecione o tipo de restauração",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "A restauração completa restaura tudo; a seletiva restaura arquivos específicos.",
     "fullRestore": "Restauração completa",
@@ -529,9 +546,18 @@
     "noRestoreHistoryYet": "Ainda não há histórico de restauração.",
     "files2": "Arquivos:",
     "size": "Tamanho:",
-    "filesSelected_one": "{{count}} arquivo selecionado",
-    "filesSelected_other": "{{count}} arquivos selecionados",
-    "unknownDevice": "Dispositivo desconhecido",
+    "filesSelected_one": "{{formatted}} arquivo selecionado",
+    "filesSelected_other": "{{formatted}} arquivos selecionados",
+    "folderFileCount_one": "{{formatted}} arquivo",
+    "folderFileCount_other": "{{formatted}} arquivos",
+    "allFilesFromSnapshot": "Todos os arquivos do snapshot",
+    "selectionFiles_one": "{{formatted}} arquivo",
+    "selectionFiles_other": "{{formatted}} arquivos",
+    "selectionFolders_one": "{{formatted}} pasta",
+    "selectionFolders_other": "{{formatted}} pastas",
+    "largeFolderSelectionTitle": "Seleção grande",
+    "selectFolder": "Selecionar a pasta {{name}}",
+    "confirmLargeFolderSelection": "Esta seleção abrange cerca de {{formatted}} arquivos e a restauração pode demorar. Continuar?",
     "kindVm": "Restaurar como VM",
     "kindInstantBoot": "Inicialização instantânea",
     "kindSelective": "Restauração seletiva",
@@ -629,6 +655,10 @@
     "path": "Caminho:",
     "useTheRestoreWorkflowToRecoverOrExport": "Use o fluxo de restauração para recuperar ou exportar arquivos deste snapshot.",
     "select": "Selecionar",
+    "folderFileCount_one": "{{count}} arquivo",
+    "folderFileCount_other": "{{count}} arquivos",
+    "selectFolder": "Selecionar a pasta {{name}}",
+    "confirmLargeFolderSelection": "Esta seleção abrange cerca de {{count}} arquivos e a restauração pode demorar. Continuar?",
     "name": "Nome",
     "size2": "Tamanho",
     "modified": "Modificado"
@@ -720,7 +750,9 @@
     "vaultType": "Tipo de vault",
     "retentionCount": "Contagem de retenção",
     "numberOfSnapshotsToKeepInTheVault": "Número de snapshots a manter no vault (1-100).",
-    "cancel": "Cancelar"
+    "cancel": "Cancelar",
+    "failedToSave": "Não foi possível salvar o cofre. Tente novamente.",
+    "deviceConfigNotSent": "Cofre salvo, mas a configuração não pôde ser enviada ao dispositivo: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Carregando vaults...",
@@ -742,7 +774,12 @@
     "actions": "Ações",
     "sync": "Sincronizar",
     "edit": "Editar",
-    "deactivate": "Desativar"
+    "deactivate": "Desativar",
+    "inactive": "Inativo",
+    "syncStarted": "Sincronização do cofre iniciada",
+    "failedToSync": "Não foi possível iniciar a sincronização do cofre. Tente novamente.",
+    "failedToDeactivate": "Não foi possível desativar o cofre. Tente novamente.",
+    "deviceConfigNotSent": "Cofre salvo, mas a configuração não pôde ser enviada ao dispositivo: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Carregando recuperação de desastre...",
@@ -993,6 +1030,8 @@
     "codeExpires": "Expira às {{time}}",
     "overdueNotice": "Ainda sem confirmação — verifique o console de recuperação.",
     "fileIndexPreparing": "Preparando o índice de arquivos para referências entre snapshots…",
+    "snapshotsLoadFailed": "Não foi possível carregar os snapshots. Recarregue a página para tentar novamente.",
+    "noSnapshots": "Ainda não há snapshots restauráveis em bare-metal. É necessário um backup completo da máquina marcado como restaurável em bare-metal.",
     "statusFailed": "Falha na recuperação",
     "statusRefused": "Recuperação recusada",
     "status": {
@@ -1002,7 +1041,8 @@
       "restoring": "Restaurando",
       "validated": "Validada",
       "rebooted": "Reiniciada",
-      "checked_in": "Confirmada"
+      "checked_in": "Confirmada",
+      "completed": "Concluído"
     }
   },
   "backupHealth": {
@@ -1013,6 +1053,7 @@
     "statusTitle": "Status",
     "recencyTitle": "Último backup bem-sucedido",
     "coverage": "{{covered}} de {{total}} endpoints têm um backup recente",
+    "definition": "“Recente” significa um backup bem-sucedido nas últimas 48 horas. A integridade de um dispositivo reflete sua última execução, então ele pode ter um backup recente e ainda mostrar Crítico se essa execução falhou.",
     "providerOnly": "{{value}} endpoints apenas do provedor",
     "m365Accounts": "{{value}} contas do Microsoft 365",
     "status": {
@@ -1069,10 +1110,14 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare metal",
+      "m365_mail": "E-mail do Microsoft 365",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
       "m365_onedrive": "OneDrive",
       "m365_teams": "Teams",
+      "gws_mail": "E-mail do Google Workspace",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Drives compartilhados do Google",
       "other": "Outros"
     },
     "noObservation": "Sem observação",
@@ -1091,7 +1136,12 @@
       "errorUnlink": "Não foi possível desvincular o dispositivo do provedor",
       "error": "Não foi possível carregar o status do backup externo",
       "alsoCheck": "Verifique também as conexões de backup de terceiros em Integrações."
-    }
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} contas SaaS",
+    "workloadBackup": "Backup de {{workload}}",
+    "sourceProvider": "Provedores de backup"
   },
   "restoreResultNotices": {
     "systemStateRequiresRebuildTitle": "O estado do sistema é aplicado por uma reconstrução bare-metal",
@@ -1129,5 +1179,10 @@
     "checking": "Verificando",
     "unverified": "Não verificado",
     "failed": "Falha na verificação de integridade"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} ponto de nova análise ignorado: junções e pontos de montagem não são seguidos nem restaurados. Isso é esperado, não é um erro.",
+    "summary_other": "{{count}} pontos de nova análise ignorados: junções e pontos de montagem não são seguidos nem restaurados. Isso é esperado, não é um erro.",
+    "showDetails": "Mostrar caminhos ignorados"
   }
 }

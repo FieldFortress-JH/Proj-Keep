@@ -9,10 +9,12 @@ import {
   softwarePolicies,
 } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { managedSoftwarePolicyRefusal } from '../services/securityAgents/managedSoftwarePolicyGuard';
 import { writeRouteAudit } from '../services/auditEvents';
 import { scheduleSoftwareComplianceCheck } from '../jobs/softwareComplianceWorker';
 import { scheduleSoftwareRemediation } from '../jobs/softwareRemediationWorker';
 import {
+  cleanupSoftwarePolicyElevations,
   normalizeSoftwarePolicyRules,
   recordSoftwarePolicyAudit,
 } from '../services/softwarePolicyService';
@@ -28,7 +30,6 @@ import { assertMayArmInstall } from '../services/softwarePolicyAuthorization';
 import { assertMayManageExecutableRules } from '../services/softwarePolicyExecutableRulesAuthorization';
 import { captureException } from '../services/sentry';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
-import { requestPamCleanup } from '../services/pamActuationLifecycle';
 
 export const softwarePoliciesRoutes = new Hono();
 const requireSoftwarePolicyRead = requirePermission(
@@ -104,6 +105,13 @@ const listPoliciesQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional(),
 });
 
+// #6960: only the security_agents generator sets managed_by_link_id. Named in
+// both write schemas so a client that sends it gets a 400 instead of a silent
+// strip that would look like it took effect.
+const managedByLinkIdNotSettable = z
+  .never({ error: 'managedByLinkId is set only by a configuration policy and cannot be written here' })
+  .optional();
+
 const createPolicySchema = z.object({
   orgId: z.string().guid().optional(),
   // Ownership axis (#2126, mirroring config policies #1724). 'organization'
@@ -118,6 +126,7 @@ const createPolicySchema = z.object({
   rules: softwareRulesSchema,
   enforceMode: z.boolean().optional(),
   remediationOptions: remediationOptionsSchema.optional(),
+  managedByLinkId: managedByLinkIdNotSettable,
 });
 
 const updatePolicySchema = z.object({
@@ -128,6 +137,7 @@ const updatePolicySchema = z.object({
   isActive: z.boolean().optional(),
   enforceMode: z.boolean().optional(),
   remediationOptions: remediationOptionsSchema.optional(),
+  managedByLinkId: managedByLinkIdNotSettable,
 });
 
 const violationsQuerySchema = z.object({
@@ -189,40 +199,6 @@ function softwarePolicyAccessCondition(auth: AuthContext): SQL | undefined {
     return sql`(${orgCond} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`;
   }
   return orgCond;
-}
-
-type SoftwarePolicyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-
-export async function cleanupSoftwarePolicyElevations(
-  tx: SoftwarePolicyTx,
-  policyId: string,
-): Promise<number> {
-  const result = await tx.execute<{ id: string }>(sql`
-    WITH matching AS (
-      SELECT id
-      FROM elevation_requests
-      WHERE metadata->>'software_policy_match_id' = ${policyId}
-        AND status IN ('approved', 'auto_approved', 'actuating')
-      FOR UPDATE
-    )
-    UPDATE elevation_requests AS request
-    SET status = 'revoked',
-        revoked_at = now(),
-        revision = request.revision + 1,
-        updated_at = now()
-    FROM matching
-    WHERE request.id = matching.id
-      AND request.status IN ('approved', 'auto_approved', 'actuating')
-    RETURNING request.id
-  `);
-  const rows = (result as { rows?: Array<{ id: string }> }).rows ?? [];
-  for (const row of rows) {
-    await requestPamCleanup(tx, {
-      elevationRequestId: row.id,
-      cause: 'policy_removed',
-    });
-  }
-  return rows.length;
 }
 
 async function getPolicyWithAccess(policyId: string, auth: AuthContext) {
@@ -643,6 +619,10 @@ softwarePoliciesRoutes.patch(
       return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
     }
 
+    // #6960: a generated (security_agents) policy is owned by its config policy.
+    const managed = await managedSoftwarePolicyRefusal(policy);
+    if (managed) return c.json(managed, 409);
+
     // #5505 D3: evaluated over the POST-WRITE merged state — the stored row
     // overlaid with this body — so editing an ALREADY-armed policy is gated
     // too. Adding a catalogId to an armed policy installs new software, and
@@ -776,6 +756,10 @@ softwarePoliciesRoutes.delete(
     if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
       return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
     }
+
+    // #6960: removed by deleting or editing its config policy, never directly.
+    const managed = await managedSoftwarePolicyRefusal(policy);
+    if (managed) return c.json(managed, 409);
 
     try {
       await db.transaction(async (tx) => {
@@ -986,6 +970,11 @@ softwarePoliciesRoutes.post(
     if (!policy) {
       return c.json({ error: 'Policy not found' }, 404);
     }
+
+    // #6960: manual remediation authorizes uninstall independently of the
+    // policy's own autoUninstall, which a generated policy never sets.
+    const managed = await managedSoftwarePolicyRefusal(policy);
+    if (managed) return c.json(managed, 409);
 
     if (policy.mode === 'audit') {
       return c.json({ error: 'Remediation is not available for audit-only policies' }, 400);

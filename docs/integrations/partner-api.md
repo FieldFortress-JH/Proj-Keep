@@ -5,6 +5,10 @@ The partner API is a partner-wide API for durable reconstruction facts
 principals; human JWTs and ordinary organization API keys are not accepted at
 `/api/v1/partner-api`.
 
+> The endpoint table and scopes are also summarised in the published
+> [API reference](https://docs.breezermm.com/reference/api/#partner-api-service-principals).
+> This page is the full contract (envelope, cursors, enrollment keys).
+
 ## Provision a service principal
 
 An authenticated partner or system operator with organization-write permission
@@ -54,6 +58,7 @@ Weavestream delegation. They must be granted explicitly, per principal:
 | `enrollment-keys:write` | Mint device-join enrollment credentials |
 | `contracts:write` | Create a contract, update header fields, add/patch/remove lines, and GET one contract to confirm contents. Does not grant activate/pause/cancel, documents, or the human JWT `/api/v1/contracts` surface. Line removal is contents, not tenancy deletion. |
 | `tickets:write` | Create, update, change status, assign and comment on tickets in any accessible organization (the `/api/v1/partner-api/tickets` surface). Does not grant delete, restore, move-org, bulk actions, attachments, time entries, AI drafts or the mailbox — those stay with signed-in staff on the main API, under each person's own ticket permissions (moving a ticket between organizations and changing a ticket mailbox connection also require MFA). The principal acts as **itself**: comments and audit rows name the principal, never a person. |
+| `alerts:write` | Acknowledge and resolve alerts, and set or delete the principal's external ticket references, in accessible organizations. Opt-in, never a default or preset; does not imply `alerts:read` or grant alert suppression, dismissal, deletion, bulk actions, or rules. |
 
 `tickets:read` is a further **opt-in read** scope, like `alerts:read`: ticket
 subjects, descriptions and comments are customer-authored data across every
@@ -128,6 +133,11 @@ See the MCP server documentation.
 | `GET /api/v1/partner-api/custom-fields` | `custom-fields:read` |
 | `GET /api/v1/partner-api/custom-field-values` | `custom-fields:read` |
 | `GET /api/v1/partner-api/alerts` | `alerts:read` (opt-in) |
+| `POST /api/v1/partner-api/alerts/<alert-uuid>/acknowledge` | `alerts:write` (opt-in) |
+| `POST /api/v1/partner-api/alerts/<alert-uuid>/resolve` | `alerts:write` (opt-in) |
+| `PUT /api/v1/partner-api/alerts/<alert-uuid>/external-ticket` | `alerts:write` (opt-in) |
+| `DELETE /api/v1/partner-api/alerts/<alert-uuid>/external-ticket` | `alerts:write` (opt-in) |
+| `GET /api/v1/partner-api/alerts/<alert-uuid>/external-tickets` | `alerts:read` (opt-in) |
 | `GET /api/v1/partner-api/tickets` | `tickets:read` (opt-in) |
 | `GET /api/v1/partner-api/tickets/ids` | `tickets:read` (opt-in) |
 | `GET /api/v1/partner-api/tickets/<ticket-uuid>` | `tickets:read` (opt-in) |
@@ -363,6 +373,15 @@ Every signed v1 cursor binds the traversal to its exact material filters. The si
 
 Organizations, sites, devices, and device hardware maintain a dedicated millisecond-precision `partner_export_updated_at` watermark. The columns are database-owned and direct caller updates are ignored. Only durable fields projected by the partner DTO advance them; volatile heartbeat, online/offline, health, and last-seen changes do not. Device group membership changes advance the owning device watermark. Device hardware identity is folded into the effective device watermark, and deleting hardware advances the parent device so the null identity is emitted incrementally.
 
+Organization records include `externalLinks`, an array of
+`{ system: string, externalId: string, label: string | null }` objects, ordered
+by `system` then `externalId`. Only links owned by the exporting partner are
+included; an organization without links has `externalLinks: []`. Link inserts,
+changes to exported link fields (including `label`), and deletes advance the
+organization's export watermark. The organization therefore reappears in the
+next incremental `since` traversal, including when its last link is deleted.
+Links and the organization record are read in the same locked snapshot.
+
 Foundational exports use transaction-scoped PostgreSQL advisory locks. The fixed hierarchy is:
 
 1. Partner discovery/intent — namespace `1000202`, keyed by the partner UUID hash.
@@ -384,12 +403,18 @@ Content-Type: application/json
 
 {
   "orgId": "<organization-uuid>",
-  "siteId": "<optional-site-uuid>",
+  "siteId": "<site-uuid>",
   "name": "Automated device enrollment",
   "maxUsage": 1,
   "ttlMinutes": 60
 }
 ```
+
+`siteId` is required in practice. The mint endpoint accepts a request without
+it and stores a key with `siteId: null`, but agents cannot enroll with such a
+key: enrollment is rejected with `400 Enrollment key must be associated with a
+site`. Always pass the `siteId` the devices should land in (it must belong to
+`orgId`).
 
 Pass either `ttlMinutes` or `expiresAt`, never both. `X-Idempotency-Key` is
 optional; supplying it is strongly recommended for automated callers.
@@ -403,7 +428,7 @@ no-secret allowlist:
   "data": {
     "id": "<enrollment-key-uuid>",
     "orgId": "<organization-uuid>",
-    "siteId": null,
+    "siteId": "<site-uuid>",
     "name": "Automated device enrollment",
     "usageCount": 0,
     "maxUsage": 1,
@@ -537,6 +562,124 @@ Guarantees and limits:
 - Checkpoints and cursors are signed, bound to the partner, filters and
   organization set, and cursors expire after 24 hours.
 
+## Alert write-back (`alerts:write`)
+
+`alerts:write` is an explicit opt-in scope, never part of a default scope set
+or preset. The granter must hold `alerts.write`. It grants acknowledge,
+resolve, and management of the principal's external ticket reference, with the
+principal acting as itself; it does not imply
+`alerts:read` or grant alert suppression, dismissal, deletion, bulk actions, or rule changes.
+
+| Endpoint | Body |
+|---|---|
+| `POST /api/v1/partner-api/alerts/<alertId>/acknowledge` | No body or `{}`. Any key is rejected. |
+| `POST /api/v1/partner-api/alerts/<alertId>/resolve` | No body, `{}`, or `{ "note": "Closed in the helpdesk" }`. The optional note is at most 2,000 characters, allows newlines and tabs but no other control characters, and is trimmed; an empty trimmed note is stored as no note. |
+
+Acknowledgment accepts an active alert. Resolution accepts active,
+acknowledged, or suppressed alerts. A repeated acknowledge on an acknowledged
+alert or resolve on a resolved alert returns `200` with `changed: false`,
+without another event or action audit. Concurrent requests use the same
+compare-and-set transition; only the request that changes the row emits an event.
+
+Both endpoints return `404 partner_alert_not_found` for an unknown alert or
+one outside the principal's accessible organizations, including another
+partner's alert or an alert in an organization that is not active. A missing
+`alerts:write` scope returns `403`.
+
+| Status | Code | Cause |
+|---|---|---|
+| `409` | `partner_alert_not_acknowledgeable` | The alert is resolved, dismissed, or suppressed, or a competing transition made it no longer acknowledgeable. `details.status` gives the current status. |
+| `409` | `partner_alert_not_resolvable` | The alert is dismissed, or a competing transition made it no longer resolvable. `details.status` gives the current status. |
+
+A successful response has this shape:
+
+```json
+{
+  "schemaVersion": "1",
+  "changed": true,
+  "data": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "orgId": "22222222-2222-4222-8222-222222222222",
+    "status": "resolved",
+    "acknowledgedAt": null,
+    "resolvedAt": "2027-01-12T12:00:00.000Z",
+    "resolutionReason": "manual",
+    "acknowledgedByPrincipalId": null,
+    "resolvedByPrincipalId": "33333333-3333-4333-8333-333333333333"
+  }
+}
+```
+
+Timestamps and the resolution reason are nullable. The response contains no
+alert content, resolution note, device, rule, or user ids. Grant `alerts:read`
+separately to read alert details.
+
+The alert records `acknowledgedByPrincipalId` or `resolvedByPrincipalId`, while
+its corresponding user attribution (`acknowledgedBy` or `resolvedBy`) is
+null. A principal resolve records `resolution_reason = 'manual'` and counts
+as a person's resolve, so it starts no automatic AI verdict run.
+
+v2 alert webhooks always carry both principal attribution keys, nullable when
+absent. V1 `alert.acknowledged` and `alert.resolved` data gains the corresponding
+principal key only when a principal acted, with `acknowledgedBy` or `resolvedBy`
+null; existing human and system payloads retain their shape. To suppress echoes,
+skip webhook events whose acknowledging or resolving principal id is your own.
+
+These endpoints use the default write budget of 120 requests per hour per
+principal and key, shared with provisioning writes on that key. Use a dedicated
+principal for write-back so provisioning traffic does not consume its budget.
+
+## Alert external ticket references
+
+These routes attach an existing external helpdesk ticket to a Breeze alert;
+they do not create a ticket in the external system.
+
+| Endpoint | Scope | Body and result |
+|---|---|---|
+| `PUT /api/v1/partner-api/alerts/<alertId>/external-ticket` | `alerts:write` | `{ "externalId": "CW-123", "externalUrl": "https://helpdesk.example.com/tickets/123", "externalNumber": "123" }`; creates with `201`, replaces with `200`. |
+| `DELETE /api/v1/partner-api/alerts/<alertId>/external-ticket` | `alerts:write` | No body; `200 { "schemaVersion": "1", "deleted": true }`, or `deleted: false` when the caller has no reference. |
+| `GET /api/v1/partner-api/alerts/<alertId>/external-tickets` | `alerts:read` | `200 { "schemaVersion": "1", "data": [...] }`; all principals' references plus eligible PSA mappings. |
+
+`externalId` is required, trimmed, and 1–255 characters. `externalNumber`
+is optional or null; when present it is trimmed and 1–255 characters. Both
+fields reject control characters other than newlines and tabs. `externalUrl` is optional or null, must be
+an HTTPS URL, and is limited to 2,048 characters. HTTP and other schemes,
+unknown body keys, and invalid values return `400`.
+
+Each principal owns one reference per alert. PUT and DELETE affect only that
+principal's row; rotating its key preserves ownership. Multiple alerts may
+reference the same external ticket. PUT is full replacement: omitting
+`externalUrl` or `externalNumber` clears it to null. A successful PUT returns
+`{ schemaVersion: "1", changed, data }`, where `data` contains `alertId`,
+`orgId`, `partnerServicePrincipalId`, `externalId`, `externalUrl`,
+`externalNumber`, `createdAt`, and `updatedAt`. Timestamps are ISO 8601 strings.
+Repeating an identical PUT returns `200` with `changed: false` and preserves
+the timestamps; it makes no write or action audit. DELETE is also idempotent.
+These operations do not require an `X-Idempotency-Key`. Real changes are audited
+as `alert.external_ticket.set` or `alert.external_ticket.delete`, attributed
+to the caller's principal. URL query strings are not included in the audit.
+
+GET items contain `source` (`partner_api` or `psa`),
+`partnerServicePrincipalId` (null for PSA mappings), `externalId`,
+`externalUrl`, `externalNumber`, `state`, `createdAt`, and nullable `updatedAt`.
+`externalUrl`, `externalNumber`, and `state` are nullable. Partner-level readers
+can see every principal's references on an alert they can read, plus PSA
+mappings from connections owned by that partner or by the alert's organization;
+another partner's connection is never included. Org-scoped users and org-owned
+webhooks see only mappings from PSA connections owned by the alert's organization
+(with no partner owner). They do not receive partner-principal references or
+partner-owned PSA connection mappings. Staff use
+`GET /api/v1/alerts/<alertId>/external-tickets` under the alert's usual
+permission, organization, and site restrictions. The alert page displays these
+references as read-only chips, linking only HTTPS URLs.
+
+All three Partner API routes return `404 partner_alert_not_found` for an
+unknown alert or one outside the principal's accessible organizations, and
+`403` without the route's required scope. PUT and DELETE use the default
+partner write budget (120 requests per hour per principal and key). V2
+webhooks include the references permitted for their owner at enrichment time;
+use GET for current state, subject to the same viewer restrictions.
+
 ## Tickets feed (`tickets:read`)
 
 `GET /api/v1/partner-api/tickets` is a read-only, **coalesced latest-state**
@@ -578,7 +721,12 @@ Each feed item is one of two shapes:
   (`requester.contactId` / `requester.portalUserId`, plus the name/email
   snapshot taken at creation), `tags`, `externalTicketId` /
   `externalTicketUrl` (this principal's ref), SLA targets and stamps,
-  `source`, `workKind`, `changeVersion` and `revision`. Free text
+  `source`, `workKind`, `ticketType` (`incident` | `service_request` |
+  `problem` | `change`), `migrationWindowId`, `changeVersion` and
+  `revision`. `migrationWindowId` is the migration window that imported the
+  ticket from another helpdesk, and null for a ticket created in Breeze: a
+  mirror that feeds a helpdesk skips imported rows with it, so an import is
+  never pushed back into its own source. Free text
   (`description`, `resolutionNote`, `pendingReason`) is capped at 12,000
   characters with a trailing `…`. Raw `custom_fields`, `field_provenance`,
   attachments and time entries are not exported.
@@ -609,7 +757,11 @@ Guarantees and limits, in addition to the alerts feed's:
 - Comments carry `originPrincipalKind` (`user`, `ai_agent`, `system`,
   `service_principal`) and `originPrincipalId`: compare the latter to your
   own principal id to skip exactly the comments your integration wrote, even
-  when several integrations share one partner. An edited comment carries
+  when several integrations share one partner. An imported comment also
+  carries `migrationWindowId` and `originalAuthor` (`{ name, email, kind }`,
+  `kind` being `staff` or `requester`): who wrote it in the source helpdesk,
+  for display only. It keeps the source's `createdAt`, so it can appear
+  before comments you already hold; the re-read below picks it up. An edited comment carries
   `editedAt` and a changed `revision`; a deleted one is returned in its
   creation-order slot as `{ id, ticketId, orgId, removed: true, deletedAt,
   createdAt }` with no content. Re-read the (bounded) list **without `since`**
@@ -695,8 +847,8 @@ partner, Service Management must be on, and the status FSM is enforced.
 
 | Route | Body | Notes |
 |---|---|---|
-| `POST /tickets` | `orgId`, `subject`, `description?`, `priority?`, `dueDate?`, `deviceId?`, `categoryId?`, `assigneeId?`, `requesterContactId?`, `submitterName?`, `submitterEmail?`, `externalTicketId?`, `externalTicketUrl?` | `source` is always `api`. `orgId` outside the principal's organizations → `403 partner_tickets_org_access_denied`. Supports `X-Idempotency-Key`. Returns `201` with the record. |
-| `PATCH /tickets/<id>` | any of `subject`, `description`, `priority`, `dueDate`, `deviceId`, `categoryId`, `tags`, `requesterContactId`, `submitterName`, `submitterEmail`, `externalTicketId`, `externalTicketUrl` (`null` clears a nullable field) | Not `status` or `assigneeId` (use the dedicated routes), never SLA targets or the portal login. Unknown keys are a `400`. |
+| `POST /tickets` | `orgId`, `subject`, `description?`, `priority?`, `ticketType?`, `dueDate?`, `deviceId?`, `alertId?`, `categoryId?`, `assigneeId?`, `requesterContactId?`, `submitterName?`, `submitterEmail?`, `externalTicketId?`, `externalTicketUrl?` | `source` is always `api`. `ticketType` defaults to `incident`. `orgId` outside the principal's organizations → `403 partner_tickets_org_access_denied`. Supports `X-Idempotency-Key`. Returns `201` with the record. |
+| `PATCH /tickets/<id>` | any of `subject`, `description`, `priority`, `ticketType`, `dueDate`, `deviceId`, `categoryId`, `tags`, `requesterContactId`, `submitterName`, `submitterEmail`, `externalTicketId`, `externalTicketUrl` (`null` clears a nullable field) | Not `status` or `assigneeId` (use the dedicated routes), never SLA targets or the portal login. Unknown keys are a `400`. |
 | `POST /tickets/<id>/status` | exactly one of `status` (core value) or `statusId` (a custom status of the partner); `resolutionNote` (required when resolving), `pendingReason?` | Same coherence rules as the staff route, without AI drafts. Invalid transitions → `400 INVALID_TRANSITION`. |
 | `POST /tickets/<id>/assign` | `assigneeId` (a technician of the partner, or `null` to unassign) | Assigning a `new` ticket opens it. |
 | `POST /tickets/<id>/comments` | `content`, `isPublic` (**required**, no default) | `isPublic: true` is a customer-visible reply and emails the requester; `false` is an internal note. Supports `X-Idempotency-Key`. Returns `201` with the comment. |
@@ -712,6 +864,16 @@ Every write answers with `{ schemaVersion, id, orgId, data }` (comments add
 text; the ids are always present. A ticket in another partner, outside the
 principal's organizations, or soft-deleted is a `404 partner_ticket_not_found`
 on every by-id route.
+
+**Create from an alert.** `POST /tickets` accepts an optional UUID `alertId`.
+The alert must be reachable by the principal and belong to `orgId`. An unknown
+or out-of-reach alert returns `404 partner_alert_not_found`; an alert in a
+different accessible organization returns `422 partner_ticket_alert_org_mismatch`.
+Success creates one `ticket_alert_links` row with `link_type = created_from`
+in the same transaction as the ticket, external reference, and idempotency
+claim. A linking failure rolls the entire create back. `alertId` is included
+in the request fingerprint: reusing an `X-Idempotency-Key` with a different
+`alertId` returns `409 partner_tickets_idempotency_key_reused`.
 
 **Attribution.** On the Partner API a partner service principal acts as
 itself, identified by the principal id (stable across key rotations):

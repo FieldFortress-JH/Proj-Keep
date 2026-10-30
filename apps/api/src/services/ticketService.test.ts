@@ -68,6 +68,9 @@ vi.mock('./aiOperator/humanWorkService', () => ({
 }));
 
 vi.mock('./ticketEvents', () => ({ emitTicketEvent: emitMock }));
+// #8972 W1: the tombstone carrier is its own unit (ticketMergeMovers IT); the
+// moveTicketOrg statement-sequence tests below pin the survivor's own statements.
+vi.mock('./ticketMerge/movers', () => ({ carryMergedTombstonesInTx: vi.fn(async () => []) }));
 vi.mock('./ticketPush', async () => {
   const actual = await vi.importActual<typeof import('./ticketPush')>('./ticketPush');
   return { ...actual, isEligibleTicketRecipient: assigneeEligibleMock };
@@ -85,7 +88,15 @@ vi.mock('./ticketMoveCurrencyGuard', async () => {
 });
 // #8181: the block-drawn guard runs real Postgres in hourBlockOrgMove.integration.test.ts;
 // here it is a mock so its placement relative to the currency guard can be pinned.
-const { hourBlockGuardMock } = vi.hoisted(() => ({ hourBlockGuardMock: vi.fn().mockResolvedValue(undefined) }));
+const { hourBlockGuardMock, approvalGuardMock } = vi.hoisted(() => ({
+  hourBlockGuardMock: vi.fn().mockResolvedValue(undefined),
+  approvalGuardMock: vi.fn().mockResolvedValue(undefined),
+}));
+// #4617: the pending-approval move guard (real-DB behaviour in ticketApprovalRequests.integration.test.ts).
+vi.mock('./ticketMoveApprovalGuard', async () => {
+  const actual = await vi.importActual<typeof import('./ticketMoveApprovalGuard')>('./ticketMoveApprovalGuard');
+  return { ...actual, assertNoPendingApprovalRequest: approvalGuardMock };
+});
 vi.mock('./ticketMoveHourBlockGuard', async () => {
   const actual = await vi.importActual<typeof import('./ticketMoveHourBlockGuard')>('./ticketMoveHourBlockGuard');
   return { ...actual, assertNoHourBlockDrawnTime: hourBlockGuardMock };
@@ -148,7 +159,9 @@ vi.mock('../db', () => ({
                 limit: vi.fn((l) => {
                   selectLimitMock(l);
                   return dbMocks.selectResult();
-                })
+                }),
+                // #8972 W1: lockTicketsForWrite (`.orderBy(asc(id)).for('update')`).
+                for: vi.fn(() => Promise.resolve(dbMocks.selectResult())),
               };
             })
           };
@@ -255,7 +268,8 @@ vi.mock('../db/schema', () => ({
     createdAt: 'createdAt',
     submitterEmail: 'submitterEmail',
     requesterContactId: 'requesterContactId',
-    deletedAt: 'deletedAt'
+    deletedAt: 'deletedAt',
+    ticketType: 'ticketType'
   },
   // #4524: moveTicketOrg nulls the reverse pointer ticket_comments.agent_run_id,
   // so these two columns must exist on the mock or the WHERE builds on undefined.
@@ -293,12 +307,13 @@ import {
   updateTicketFields, editTicketComment, deleteTicketComment, portalCommentMutable,
   moveTicketOrg, revalidateTicketAssignee, softDeleteTicket, restoreTicket, listOrgTicketsForAddin,
   listActiveTicketDrafts, sendTicketDraft, discardTicketDraft,
-  postProposalNote,
+  postProposalNote, addAiTriageNote, applyAiFieldUpdates, addCallerVerificationSystemComment,
   actorUserFk, actorAuditIdentity, actorAuditDetails, actorEventIdentity, actorAuthorFields, actorOwnsComment, humanUserId,
   actorProvenance,
   TicketServiceError, TICKET_STATUS_TRANSITIONS, SYSTEM_COMMENT_TYPES
 } from './ticketService';
 import { TicketMoveCurrencyBlockedError } from './ticketMoveCurrencyGuard';
+import { TicketMergedError } from './ticketMerge/errors';
 import { ServiceManagementOffError } from './serviceManagement';
 import { TICKET_ORG_DENORMALIZED_TABLES } from './ticketOrgMoveLockOrder';
 
@@ -1761,8 +1776,9 @@ describe('assignTicket', () => {
 
     await assignTicket('t-1', 'u-2', actor);
 
-    // call 0 is the assignment feed comment; call 1 is the outbox row.
-    expect(valuesMock).toHaveBeenCalledTimes(2);
+    // call 0 is the assignment feed comment; call 1 is the assigned outbox row;
+    // call 2 is the implicit new->open ticket.status_changed row (#8367).
+    expect(valuesMock).toHaveBeenCalledTimes(3);
     const outboxPayload = valuesMock.mock.calls[1]![0];
     expect(outboxPayload).toMatchObject({ orgId: 'o-1', ticketId: 't-1', eventType: 'ticket.assigned' });
     expect(outboxPayload.payload).toEqual({
@@ -2194,13 +2210,76 @@ describe('assignTicket — additional status cases', () => {
     expect(updatePayload).toMatchObject({ assignedTo: 'u-2' });
     expect(updatePayload).not.toHaveProperty('status');
   });
+
+  // #8367: the implicit new -> open move must reach webhook / Partner API
+  // consumers as ticket.status_changed, in the same transaction as
+  // ticket.assigned.
+  const outboxRows = () =>
+    valuesMock.mock.calls
+      .map((c) => c[0])
+      .filter((v) => v && typeof v.eventType === 'string');
+
+  it('assigns on new ticket: writes ticket.assigned AND ticket.status_changed (new->open) outbox rows (#8367)', async () => {
+    dbMocks.selectResult.mockResolvedValue([{
+      id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', assignedTo: null
+    }]);
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: 'u-2', status: 'open', statusId: null }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await assignTicket('t-1', 'u-2', actor);
+
+    const rows = outboxRows();
+    expect(rows.map((r) => r.eventType)).toEqual(['ticket.assigned', 'ticket.status_changed']);
+    expect(rows[1]).toMatchObject({ orgId: 'o-1', ticketId: 't-1' });
+    expect(rows[1].payload).toEqual({ from: 'new', to: 'open', statusId: null });
+  });
+
+  it('stamps the open system statusId on the ticket and carries it in the status_changed row (#8367)', async () => {
+    dbMocks.selectResult.mockResolvedValue([{
+      id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', statusId: 's-new', assignedTo: null
+    }]);
+    configMocks.getSystemStatusId.mockResolvedValueOnce('s-open');
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: 'u-2', status: 'open', statusId: 's-open' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await assignTicket('t-1', 'u-2', actor);
+
+    expect(configMocks.getSystemStatusId).toHaveBeenCalledWith('p-1', 'open');
+    expect(setMock.mock.calls[0]![0]).toMatchObject({ status: 'open', statusId: 's-open' });
+    expect(outboxRows()[1].payload).toEqual({ from: 'new', to: 'open', statusId: 's-open' });
+  });
+
+  it('assigns on open ticket: no ticket.status_changed outbox row (#8367)', async () => {
+    dbMocks.selectResult.mockResolvedValue([{
+      id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: null
+    }]);
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: 'u-2', status: 'open' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await assignTicket('t-1', 'u-2', actor);
+
+    expect(outboxRows().map((r) => r.eventType)).toEqual(['ticket.assigned']);
+  });
+
+  it('unassigning a new ticket: no ticket.status_changed outbox row (#8367)', async () => {
+    dbMocks.selectResult.mockResolvedValue([{
+      id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'new', assignedTo: null
+    }]);
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: null, status: 'new' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await assignTicket('t-1', null, actor);
+
+    expect(outboxRows().map((r) => r.eventType)).toEqual(['ticket.assigned']);
+  });
 });
 
 describe('updateTicketFields', () => {
   const BASE_TICKET = {
     id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open',
     subject: 'Printer offline', description: null, categoryId: null,
-    priority: 'normal', dueDate: null, deviceId: null, tags: []
+    priority: 'normal', dueDate: null, deviceId: null, tags: [],
+    createdAt: new Date('2026-06-01T09:00:00Z'), // #8973: SLA deadline anchor
   };
 
   beforeEach(() => {
@@ -2323,19 +2402,51 @@ describe('updateTicketFields', () => {
   });
 
   it('clearing deviceId (null) skips the device lookup and records the change', async () => {
-    dbMocks.selectResult.mockResolvedValue([{ ...BASE_TICKET, deviceId: 'd-1' }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ ...BASE_TICKET, deviceId: 'd-1' }])
+      .mockResolvedValueOnce([{ id: 'd-1', orgId: 'o-1', hostname: 'DESK-OLD', displayName: null }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1' }]); // #8972 W0: lockTicketForWrite
     dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, deviceId: null }]);
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
 
     await updateTicketFields('t-1', { deviceId: null }, actor);
 
-    // Only ONE select consumed (the ticket lookup) — no device lookup for null
-    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1);
+    // Ticket lookup + the old device's name for the feed + the row lock; no new-device lookup for null
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(3);
     expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({
       type: 'ticket.updated',
       payload: { changed: ['deviceId'] }
     }));
-    expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ content: 'Updated device' }));
+    expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ content: 'Updated device (was DESK-OLD, now none)' }));
+  });
+
+  it('names the device in the feed entry when linking one to a ticket that has none (#8962)', async () => {
+    // selects in order: ticket, device (same org)
+    dbMocks.selectResult
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([{ id: 'd-2', orgId: 'o-1', hostname: 'DESK-NEW', displayName: null }]);
+    dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, deviceId: 'd-2' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await updateTicketFields('t-1', { deviceId: 'd-2' }, actor);
+
+    expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ content: 'Updated device (now DESK-NEW)' }));
+  });
+
+  it('names both devices in the feed entry when replacing a linked device (#8962)', async () => {
+    // selects in order: ticket, new device (same org), old device name
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ ...BASE_TICKET, deviceId: 'd-1' }])
+      .mockResolvedValueOnce([{ id: 'd-2', orgId: 'o-1', hostname: 'DESK-NEW', displayName: null }])
+      .mockResolvedValueOnce([{ id: 'd-1', orgId: 'o-1', hostname: 'DESK-OLD', displayName: 'Front desk' }]);
+    dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, deviceId: 'd-2' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await updateTicketFields('t-1', { deviceId: 'd-2' }, actor);
+
+    expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Updated device (was Front desk, now DESK-NEW)',
+    }));
   });
 
   it('throws 404 when the ticket does not exist', async () => {
@@ -2434,8 +2545,9 @@ describe('updateTicketFields', () => {
 
     await updateTicketFields('t-1', { submittedBy: null, submitterName: 'Walk-in', submitterEmail: null }, actor);
 
-    // No portal-user lookup needed when clearing — only the ticket select.
-    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1);
+    // No portal-user lookup needed when clearing — only the ticket select
+    // (+ the #8972 W0 lockTicketForWrite read, served by the same default).
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(2);
     expect(setMock.mock.calls[0]![0]).toMatchObject({
       submittedBy: null,
       submitterName: 'Walk-in',
@@ -2886,13 +2998,15 @@ describe('category tenant validation', () => {
   it('updateTicketFields allows clearing the category (null) without a lookup', async () => {
     dbMocks.selectResult
       // priority is NOT NULL on real rows; the #6691 SLA restamp reads it.
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', categoryId: 'cat-1', priority: 'normal', subject: 'Printer' }]); // ticket only
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', categoryId: 'cat-1', priority: 'normal', subject: 'Printer' }]) // ticket only
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1' }]) // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', categoryId: 'cat-1', priority: 'normal', subject: 'Printer' }]); // re-read under the lock (a category change can restamp SLA)
     dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', categoryId: null }]);
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]); // system feed comment insert
 
     const t = await updateTicketFields('t-1', { categoryId: null }, actor);
     expect(t?.categoryId).toBeNull();
-    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1); // no category lookup
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(3); // ticket + row lock + locked re-read; no category lookup
   });
 });
 
@@ -2967,12 +3081,13 @@ describe('assignee tenant validation', () => {
 
   it('assignTicket skips validation when unassigning (null assignee)', async () => {
     dbMocks.selectResult
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: 'u-2' }]); // ticket only
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', assignedTo: 'u-2' }]) // ticket only
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1' }]); // #8972 W0: lockTicketForWrite
     dbMocks.updateReturning.mockResolvedValue([{ id: 't-1', assignedTo: null }]);
 
     const t = await assignTicket('t-1', null, actor);
     expect(t?.assignedTo).toBeNull();
-    expect(dbMocks.selectResult).toHaveBeenCalledTimes(1); // no user lookup
+    expect(dbMocks.selectResult).toHaveBeenCalledTimes(2); // ticket + row lock; no user lookup
   });
 
   it('assignTicket fails closed (500, not a blame-the-input 400) when the ticket partner is unresolvable', async () => {
@@ -3487,8 +3602,10 @@ describe('editTicketComment', () => {
     const updatedRow = { ...BASE_COMMENT, content: 'new', editedAt: new Date() };
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])  // loadCommentWithTicket: comment lookup
-      .mockResolvedValueOnce([BASE_TICKET]);  // loadCommentWithTicket: getTicketOrThrow
-    dbMocks.updateReturning.mockResolvedValue([updatedRow]);
+      .mockResolvedValueOnce([BASE_TICKET])  // loadCommentWithTicket: getTicketOrThrow
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([updatedRow]);
 
     const result = await editTicketComment('c1', { content: 'new' }, { kind: 'user' as const, userId: 'tech-1', name: 'Tech' }, { canManageAny: false });
 
@@ -3525,8 +3642,10 @@ describe('editTicketComment', () => {
     const updatedRow = { ...BASE_COMMENT, content: 'x', editedAt: new Date() };
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
-    dbMocks.updateReturning.mockResolvedValue([updatedRow]);
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([updatedRow]);
 
     const result = await editTicketComment('c1', { content: 'x' }, { kind: 'user' as const, userId: 'admin' }, { canManageAny: true });
     expect(result.content).toBe('x');
@@ -3549,8 +3668,10 @@ describe('editTicketComment', () => {
     const updatedRow = { ...BASE_COMMENT, content: 'compat', editedAt: new Date() };
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
-    dbMocks.updateReturning.mockResolvedValue([updatedRow]);
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([updatedRow]);
 
     // No expectedTicketId in opts — must still succeed
     const result = await editTicketComment('c1', { content: 'compat' }, { kind: 'user' as const, userId: 'tech-1' }, { canManageAny: false });
@@ -3611,9 +3732,11 @@ describe('deleteTicketComment', () => {
   it('soft-deletes (sets deletedAt) and audits with previousContent', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
+      .mockResolvedValueOnce([BASE_TICKET])
     // delete path: update returns the soft-deleted row (required by TOCTOU guard)
-    dbMocks.updateReturning.mockResolvedValue([{ id: 'c1' }]);
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([{ id: 'c1' }]);
 
     const res = await deleteTicketComment('c1', { kind: 'user' as const, userId: 'tech-1' }, { canManageAny: false });
 
@@ -3648,8 +3771,10 @@ describe('deleteTicketComment', () => {
   it('allows a non-author WITH canManageAny', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
-    dbMocks.updateReturning.mockResolvedValue([{ id: 'c1' }]);
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([{ id: 'c1' }]);
 
     const res = await deleteTicketComment('c1', { kind: 'user' as const, userId: 'admin' }, { canManageAny: true });
     expect(res.id).toBe('c1');
@@ -3671,8 +3796,10 @@ describe('deleteTicketComment', () => {
   it('passes through when expectedTicketId is omitted (backward-compat)', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
-    dbMocks.updateReturning.mockResolvedValue([{ id: 'c1' }]);
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([{ id: 'c1' }]);
 
     // No expectedTicketId in opts — must still succeed
     const res = await deleteTicketComment('c1', { kind: 'user' as const, userId: 'tech-1' }, { canManageAny: false });
@@ -3702,9 +3829,11 @@ describe('deleteTicketComment', () => {
   it('throws 409 when the soft-delete update races and returns zero rows (TOCTOU)', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([BASE_COMMENT])
-      .mockResolvedValueOnce([BASE_TICKET]);
+      .mockResolvedValueOnce([BASE_TICKET])
     // Simulate concurrent soft-delete: the UPDATE matched nothing.
-    dbMocks.updateReturning.mockResolvedValue([]);
+      .mockResolvedValueOnce([BASE_TICKET])   // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([BASE_COMMENT]); // #8972 W0: the comment, FOR UPDATE
+    dbMocks.txUpdateReturning.mockResolvedValue([]);
 
     const err = await deleteTicketComment('c1', { kind: 'user' as const, userId: 'tech-1' }, { canManageAny: false }).catch(e => e);
     expect(err).toBeInstanceOf(TicketServiceError);
@@ -3712,6 +3841,87 @@ describe('deleteTicketComment', () => {
     // Audit and event must NOT have fired.
     expect(auditMock).not.toHaveBeenCalled();
     expect(emitMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('comment writers re-check on the locked rows (#8972 W0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    setMock.mockClear();
+    dbMocks.selectResult.mockReset();
+    dbMocks.txUpdateReturning.mockReset();
+  });
+
+  const author = { kind: 'user' as const, userId: 'tech-1', name: 'Tech' };
+
+  it('edit: a ticket gone by the time it is locked answers 404 "Ticket not found" and writes nothing', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([BASE_COMMENT])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([]); // lockTicketForWrite: not visible any more
+    const err = await editTicketComment('c1', { content: 'x' }, author, { canManageAny: false }).catch((e) => e);
+    expect(err).toBeInstanceOf(TicketServiceError);
+    expect(err).toMatchObject({ status: 404, message: 'Ticket not found' });
+    expect(setMock).not.toHaveBeenCalled();
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('edit: a comment that left the locked ticket is indistinguishable from missing', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([BASE_COMMENT])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([{ ...BASE_COMMENT, ticketId: 't-elsewhere' }]);
+    const err = await editTicketComment('c1', { content: 'x' }, author, { canManageAny: false }).catch((e) => e);
+    expect(err).toMatchObject({ status: 404, message: 'Comment not found' });
+    expect(setMock).not.toHaveBeenCalled();
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('edit: previousContent in the audit is the content of the LOCKED row', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([BASE_COMMENT])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([{ ...BASE_COMMENT, content: 'changed meanwhile' }]);
+    dbMocks.txUpdateReturning.mockResolvedValue([{ ...BASE_COMMENT, content: 'new' }]);
+    await editTicketComment('c1', { content: 'new' }, author, { canManageAny: false });
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
+      details: expect.objectContaining({ previousContent: 'changed meanwhile' }),
+    }));
+  });
+
+  it('delete: a comment deleted while waiting for the lock answers 409 and writes nothing', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([BASE_COMMENT])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([BASE_TICKET])
+      .mockResolvedValueOnce([{ ...BASE_COMMENT, deletedAt: new Date() }]);
+    const err = await deleteTicketComment('c1', author, { canManageAny: false }).catch((e) => e);
+    expect(err).toMatchObject({ status: 409, message: 'Comment already deleted' });
+    expect(setMock).not.toHaveBeenCalled();
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('add: a ticket gone by the time it is locked answers 404 and inserts nothing', async () => {
+    dbMocks.selectResult.mockResolvedValueOnce([]); // lockTicketForWrite
+    const err = await addTicketComment('t-1', { content: 'hi', isPublic: true }, actor).catch((e) => e);
+    expect(err).toMatchObject({ status: 404, message: 'Ticket not found' });
+    expect(valuesMock).not.toHaveBeenCalled();
+    expect(emitMock).not.toHaveBeenCalled();
+  });
+
+  it('add: the first-response decision reads the ticket AFTER the lock', async () => {
+    // Lock row, then the full ticket re-read under it: already stamped, so a
+    // public reply must not restamp first_response_at.
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1' }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', firstResponseAt: new Date('2026-01-01T00:00:00Z') }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', isPublic: true }]);
+    const result = await addTicketComment('t-1', { content: 'again', isPublic: true }, actor);
+    expect(result.firstResponseStamped).toBe(false);
+    expect(setMock).not.toHaveBeenCalled();
   });
 });
 
@@ -3780,7 +3990,9 @@ describe('restoreTicket', () => {
   });
 
   it('clears deletedAt/deletedBy and audits ticket.restore', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([{ ...BASE_TICKET, ticketNumber: 'ABC123', subject: 'Spam', deletedAt: new Date() }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ ...BASE_TICKET, ticketNumber: 'ABC123', subject: 'Spam', deletedAt: new Date() }])
+      .mockResolvedValueOnce([{ ...BASE_TICKET, mergedIntoTicketId: null }]); // #8972 W1: lockTicketForWrite
     dbMocks.updateReturning.mockResolvedValue([{ id: 't1', deletedAt: null }]);
 
     const res = await restoreTicket('t1', actor);
@@ -3801,7 +4013,9 @@ describe('restoreTicket', () => {
   // emitTicketEvent call existed for restore before this PR, and none is added
   // — restoreTicket's only announcement is the outbox row).
   it('writes a ticket_outbox row (restored), id-only payload; still emits no legacy event', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([{ ...BASE_TICKET, ticketNumber: 'ABC123', subject: 'Spam', deletedAt: new Date() }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ ...BASE_TICKET, ticketNumber: 'ABC123', subject: 'Spam', deletedAt: new Date() }])
+      .mockResolvedValueOnce([{ ...BASE_TICKET, mergedIntoTicketId: null }]); // #8972 W1: lockTicketForWrite
     dbMocks.updateReturning.mockResolvedValue([{ id: 't1', deletedAt: null }]);
 
     await restoreTicket('t1', actor);
@@ -4121,7 +4335,7 @@ describe('moveTicketOrg', () => {
 
     const texts = executedSqlTexts();
     expect(texts[0]).toBe(
-      'SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk DEFERRED'
+      'SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk, ticket_links_source_org_fk, ticket_links_target_org_fk, tickets_merged_into_org_fk DEFERRED'
     );
     // Never `SET CONSTRAINTS ALL DEFERRED` — that would also defer the three
     // constraints this path relies on failing fast.
@@ -4135,12 +4349,18 @@ describe('moveTicketOrg', () => {
     // ticket_alert_links, ticket_outbox, ticket_attachments, ticket_email_links,
     // ticket_checklist_items, ticket_external_refs, partner_api_idempotency_keys,
     // ticket_approval_requests — same 10 tables as the 'moves ticket to a
-    // same-partner org' test below).
-    expect(texts).toHaveLength(12);
+    // same-partner org' test below) + 1 ticket_links delete on both legs
+    // (#7900 W02, the TICKET_ORG_MOVE_DELETE_TABLES tail, after the rewrites).
+    // + 1 shared ticket_links advisory lock right after SET CONSTRAINTS
+    // (services/ticketLinkLock.ts), before any row lock.
+    expect(texts).toHaveLength(14);
+    expect(texts[1]).toMatch(/^SELECT pg_advisory_xact_lock_shared\(hashtextextended\(/);
+    const linkDelete = texts.findIndex((t) => /DELETE FROM ticket_links WHERE source_ticket_id = .* OR target_ticket_id = /.test(t));
+    expect(linkDelete).toBe(texts.length - 1);
     // The Operator target detach severs the plain ticket_id FK and stamps the
     // detach in the same statement (one_pointer_chk).
     expect(texts.filter((t) => /UPDATE ai_operator_task_targets\s+SET ticket_id = NULL/.test(t))).toHaveLength(1);
-    expect(texts.filter((t) => t === 'SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk DEFERRED')).toHaveLength(1);
+    expect(texts.filter((t) => t === 'SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk, ticket_links_source_org_fk, ticket_links_target_org_fk, tickets_merged_into_org_fk DEFERRED')).toHaveLength(1);
   });
 
   it('#5573 W02: refuses to move a ticket pinned to a deliverable occurrence, before the ticket UPDATE', async () => {
@@ -4207,6 +4427,17 @@ describe('moveTicketOrg', () => {
     // #4657 fixed on the device axis, which moveOrg.test.ts pins the same way.
     // Compared against the shared constant so the two stay coupled.
     expect(executedTableNames()).toEqual([...TICKET_ORG_DENORMALIZED_TABLES]);
+
+    // #8356: time_entries.site_id is a plain FK to sites and tickets carry no
+    // site, so the moved entries must drop their source-org site link in the
+    // SAME statement that re-stamps org_id (one UPDATE keeps the shared lock
+    // order unchanged). Every other child table keeps the org_id-only rewrite.
+    const rewrites = executedSqlTexts().filter((t) => t.startsWith('UPDATE '));
+    const timeEntryRewrites = rewrites.filter((t) => t.startsWith('UPDATE time_entries '));
+    expect(timeEntryRewrites).toEqual(['UPDATE time_entries SET org_id = ::uuid, site_id = NULL WHERE ticket_id = ::uuid']);
+    for (const t of rewrites.filter((r) => !r.startsWith('UPDATE time_entries '))) {
+      expect(t, 'only time_entries carries a site_id to re-point').not.toContain('site_id');
+    }
 
     // System feed comment inserted with "Moved to <org name>"
     expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -4489,6 +4720,27 @@ describe('moveTicketOrg', () => {
     expect(blockOrder).toBeLessThan(guardOrder);
   });
 
+  it('(g) #4617: the pending-approval guard runs on the moving ticket after tx.update(tickets), before the other guards', async () => {
+    seedCrossCurrencyMove();
+    guardMock.mockResolvedValueOnce({ sourceCurrency: 'USD', targetCurrency: 'EUR', unbilledTimeEntries: 0, unbilledParts: 0, accepted: false });
+    await moveTicketOrg('t1', 'oB', { kind: 'user' as const, userId: 'admin' });
+    expect(approvalGuardMock).toHaveBeenCalledWith(expect.anything(), { ticketIds: ['t1'] });
+    const updateOrder = setMock.mock.invocationCallOrder[0]!;
+    const approvalOrder = approvalGuardMock.mock.invocationCallOrder.at(-1)!;
+    expect(updateOrder).toBeLessThan(approvalOrder);
+    expect(approvalOrder).toBeLessThan(hourBlockGuardMock.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it('(h) #4617: a pending-approval refusal is a 409 that aborts before any child rewrite', async () => {
+    const { TicketMoveApprovalPendingError } = await vi.importActual<typeof import('./ticketMoveApprovalGuard')>('./ticketMoveApprovalGuard');
+    seedCrossCurrencyMove();
+    approvalGuardMock.mockRejectedValueOnce(new TicketMoveApprovalPendingError({ pendingApprovalRequests: 1 }));
+    await expect(moveTicketOrg('t1', 'oB', { kind: 'user' as const, userId: 'admin' }))
+      .rejects.toMatchObject({ status: 409, code: 'APPROVAL_REQUEST_PENDING', details: { pendingApprovalRequests: 1 } });
+    expect(guardMock).not.toHaveBeenCalled();
+    expect(hourBlockGuardMock).not.toHaveBeenCalled();
+  });
+
   it('(f) #8181: a block-drawn refusal aborts before the currency guard and any child rewrite', async () => {
     const { TicketMoveHourBlockError } = await vi.importActual<typeof import('./ticketMoveHourBlockGuard')>('./ticketMoveHourBlockGuard');
     seedCrossCurrencyMove();
@@ -4639,7 +4891,8 @@ describe('postProposalNote (#4211)', () => {
   it('posts under the technician identity, private, linked to the run', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1', partnerId: 'p-1' }])
-      .mockResolvedValueOnce([{ id: RUN_ID }]);
+      .mockResolvedValueOnce([{ id: RUN_ID }])
+      .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1' }]); // #8972 W0: lockTicketForWrite
     dbMocks.insertReturning.mockResolvedValueOnce([{ id: 'comment-1' }]);
 
     await postProposalNote(TICKET_ID, RUN_ID, 'Proposed summary', { kind: 'user' as const, userId: USER_ID, name: 'Tech' });
@@ -4658,7 +4911,8 @@ describe('postProposalNote (#4211)', () => {
   it('audits the technician as actor and the run in details', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1', partnerId: 'p-1' }])
-      .mockResolvedValueOnce([{ id: RUN_ID }]);
+      .mockResolvedValueOnce([{ id: RUN_ID }])
+      .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1' }]); // #8972 W0: lockTicketForWrite
     dbMocks.insertReturning.mockResolvedValueOnce([{ id: 'comment-1' }]);
 
     await postProposalNote(TICKET_ID, RUN_ID, 'Proposed summary', { kind: 'user' as const, userId: USER_ID, name: 'Tech' });
@@ -4685,6 +4939,7 @@ describe('postProposalNote (#4211)', () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1', partnerId: 'p-1' }]) // getTicketOrThrow
       .mockResolvedValueOnce([{ id: RUN_ID }]) // run lookup
+      .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1' }]) // #8972 W0: lockTicketForWrite
       .mockResolvedValueOnce([{ id: 'existing-comment' }]); // catch's existing-row lookup
     dbMocks.insertReturning.mockRejectedValueOnce(Object.assign(new Error('duplicate key value'), { code: '23505' }));
 
@@ -4700,7 +4955,8 @@ describe('postProposalNote (#4211)', () => {
   it('rethrows a non-unique-violation insert failure unchanged', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1', partnerId: 'p-1' }])
-      .mockResolvedValueOnce([{ id: RUN_ID }]);
+      .mockResolvedValueOnce([{ id: RUN_ID }])
+      .mockResolvedValueOnce([{ id: TICKET_ID, orgId: 'org-1' }]); // #8972 W0: lockTicketForWrite
     dbMocks.insertReturning.mockRejectedValueOnce(new Error('connection reset'));
 
     await expect(postProposalNote(TICKET_ID, RUN_ID, 'Proposed summary', { kind: 'user' as const, userId: USER_ID, name: 'Tech' }))
@@ -4727,7 +4983,8 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
   const replyDraft = { id: 'draft-1', ticketId: 't-1', kind: 'reply', state: 'active', content: 'Draft body', runId: 'run-1' };
 
   it('sendTicketDraft writes the aiDraft claim (draft, run, trigger) into the ticket.commented outbox payload', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([replyDraft]);
+    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([replyDraft])
+      .mockResolvedValueOnce([ticket]); // #8972 W1: lockTicketForWrite
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', originPrincipalKind: 'user', originPrincipalId: null }]);
     dbMocks.updateReturning.mockResolvedValue([{ id: 'draft-1' }]);
 
@@ -4743,7 +5000,8 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
   });
 
   it('sendTicketDraft writes no claim for a draft with no run', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([{ ...replyDraft, runId: null }]);
+    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([{ ...replyDraft, runId: null }])
+      .mockResolvedValueOnce([ticket]); // #8972 W1: lockTicketForWrite
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', originPrincipalKind: 'user', originPrincipalId: null }]);
     dbMocks.updateReturning.mockResolvedValue([{ id: 'draft-1' }]);
 
@@ -4755,7 +5013,9 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
   it('resolving with an aiDraftId writes the resolved_with_ai_note claim into the ticket.status_changed outbox payload', async () => {
     dbMocks.selectResult
       .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null }])
-      .mockResolvedValueOnce([{ id: 'draft-1', ticketId: 't-1', kind: 'resolution_note', state: 'active', content: 'AI note', runId: 'run-9' }]);
+      .mockResolvedValueOnce([{ id: 'draft-1', ticketId: 't-1', kind: 'resolution_note', state: 'active', content: 'AI note', runId: 'run-9' }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1' }]) // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null }]); // re-read under the lock
     dbMocks.updateReturning
       .mockResolvedValueOnce([{ id: 't-1', status: 'resolved' }])
       .mockResolvedValueOnce([{ id: 'draft-1' }]);
@@ -4772,7 +5032,10 @@ describe('AI time-entry proposal claim on the ticket outbox (#4177, W04)', () =>
   });
 
   it('resolving without an aiDraftId writes the unchanged status_changed payload', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null }]);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1' }]) // #8972 W0: lockTicketForWrite
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null }]); // re-read under the lock
     dbMocks.updateReturning.mockResolvedValueOnce([{ id: 't-1', status: 'resolved' }]);
     dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
 
@@ -4807,8 +5070,12 @@ describe('assignee eligibility after ticket scope changes (#5551)', () => {
     const changed = { ...ticket, deviceId: 'd-new' };
     dbMocks.selectResult
       .mockResolvedValueOnce([ticket])
-      .mockResolvedValueOnce([{ id: 'd-new', orgId: ticket.orgId }])
+      .mockResolvedValueOnce([{ id: 'd-new', orgId: ticket.orgId, hostname: 'NEW' }])
+      .mockResolvedValueOnce([{ hostname: 'OLD', displayName: null }])
+      .mockResolvedValueOnce([ticket]) // #8972 W0: lockTicketForWrite (updateTicketFields' ticket write)
       .mockResolvedValueOnce([assignee]);
+    // #8972 W0: the unassignment inside revalidateTicketAssignee locks again
+    if (!eligible) dbMocks.selectResult.mockResolvedValueOnce([ticket]);
     dbMocks.updateReturning.mockResolvedValueOnce([changed]).mockResolvedValueOnce([{ ...changed, assignedTo: null }]);
     assigneeEligibleMock.mockResolvedValue(eligible);
     const result = await updateTicketFields(ticket.id, { deviceId: 'd-new' }, actor);
@@ -4821,7 +5088,8 @@ describe('assignee eligibility after ticket scope changes (#5551)', () => {
   });
 
   it('clears a missing assignee and attributes an AI unassignment without a user foreign key', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([]);
+    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([])
+      .mockResolvedValueOnce([ticket]); // #8972 W0: lockTicketForWrite
     dbMocks.updateReturning.mockResolvedValueOnce([{ ...ticket, assignedTo: null }]);
     await revalidateTicketAssignee(ticket.id, { kind: 'ai_agent', agentId: 'agent-id' });
     expect(assigneeEligibleMock).not.toHaveBeenCalled();
@@ -4833,7 +5101,8 @@ describe('assignee eligibility after ticket scope changes (#5551)', () => {
   });
 
   it('does not audit an unassignment lost to a concurrent scope or assignee change', async () => {
-    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([assignee]);
+    dbMocks.selectResult.mockResolvedValueOnce([ticket]).mockResolvedValueOnce([assignee])
+      .mockResolvedValueOnce([ticket]); // #8972 W0: lockTicketForWrite
     assigneeEligibleMock.mockResolvedValue(false);
     dbMocks.updateReturning.mockResolvedValueOnce([]);
     await expect(revalidateTicketAssignee(ticket.id, actor)).rejects.toMatchObject({ code: 'CONCURRENT_MODIFICATION' });
@@ -4851,7 +5120,8 @@ describe('assignee eligibility after ticket scope changes (#5551)', () => {
         { id: 'o-1', partnerId: 'p-1', name: 'Alpha', currencyCode: 'USD' },
         { id: 'o-2', partnerId: 'p-1', name: 'Beta', currencyCode: 'USD' },
       ])
-      .mockResolvedValueOnce([assignee]);
+      .mockResolvedValueOnce([assignee])
+      .mockResolvedValueOnce([moved]); // #8972 W0: lockTicketForWrite (revalidateTicketAssignee on the tx)
     dbMocks.txUpdateReturning.mockResolvedValueOnce([moved]).mockResolvedValueOnce([{ ...moved, assignedTo: null }]);
     assigneeEligibleMock.mockResolvedValue(false);
     const result = await moveTicketOrg(ticket.id, 'o-2', actor);
@@ -5093,3 +5363,949 @@ describe('service-principal actor (Partner API tickets, Wave 1)', () => {
   });
 });
 
+
+// ─── #7900 / #8592 W01: ticket_type ────────────────────────────────────────────
+
+describe('ticket_type — create-path defaults and provenance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    setMock.mockClear();
+    allocateMock.mockResolvedValue('T-2026-0042');
+    assertTicketCreationAllowedMock.mockReset().mockResolvedValue(undefined);
+    assigneeEligibleMock.mockResolvedValue(true);
+  });
+
+  it.each(['manual', 'api', 'ai'] as const)('a %s ticket with no explicit type defaults to incident and stamps no provenance', async (source) => {
+    dbMocks.selectResult.mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-tt-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Type default', source }, actor);
+
+    const insertPayload = valuesMock.mock.calls[0]![0];
+    expect(insertPayload.ticketType).toBe('incident');
+    expect(insertPayload.fieldProvenance).toBeUndefined();
+  });
+
+  it('a portal ticket defaults to incident', async () => {
+    dbMocks.selectResult.mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]).mockResolvedValueOnce([]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-tt-2', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Portal', source: 'portal', submittedBy: 'pu-1', submitterEmail: 'a@example.com' }, actor);
+
+    expect(valuesMock.mock.calls[0]![0].ticketType).toBe('incident');
+  });
+
+  it('honours an explicit ticketType and stamps it with the caller provenance', async () => {
+    dbMocks.selectResult.mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-tt-3', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Explicit', source: 'manual', ticketType: 'problem' }, actor);
+
+    const insertPayload = valuesMock.mock.calls[0]![0];
+    expect(insertPayload.ticketType).toBe('problem');
+    expect(insertPayload.fieldProvenance).toEqual({ ticketType: 'user' });
+  });
+
+  it('planned work (non-support work kind) defaults to service_request with no provenance', async () => {
+    dbMocks.selectResult.mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-tt-4', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    const { createPlannedWorkTicket } = await import('./plannedWorkTicket');
+    const result = await createPlannedWorkTicket(
+      { orgId: 'o-1', workKind: 'deliverable', subject: 'Monthly review', dueDate: new Date('2026-11-01T00:00:00Z'), assigneeId: null, categoryId: null },
+      { kind: 'system', source: 'planned_work' } as never,
+      {},
+    );
+
+    expect(result.kind).toBe('created');
+    const insertPayload = valuesMock.mock.calls[0]![0];
+    expect(insertPayload).toMatchObject({ workKind: 'deliverable', ticketType: 'service_request' });
+    expect(insertPayload.fieldProvenance).toBeUndefined();
+  });
+
+  it('an alert-created ticket is an incident (no explicit value, so no provenance)', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'a-1', orgId: 'o-1', deviceId: null, title: 'Disk 90%', message: 'C: at 92%', severity: 'high' }])
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])
+      .mockResolvedValueOnce([{ id: 't-tt-5', orgId: 'o-1', partnerId: 'p-1', status: 'new' }])
+      .mockResolvedValueOnce([{ id: 'a-1', orgId: 'o-1', title: 'Disk 90%' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-tt-5', orgId: 'o-1', internalNumber: 'T-2026-0042' }]);
+
+    await createTicketFromAlert('a-1', actor);
+
+    const insertPayload = valuesMock.mock.calls[0]![0];
+    expect(insertPayload.ticketType).toBe('incident');
+    expect(insertPayload.fieldProvenance).toBeUndefined();
+  });
+});
+
+describe('ticket_type — updateTicketFields', () => {
+  const BASE_TICKET = {
+    id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', firstResponseAt: null,
+    subject: 'Printer offline', description: null, categoryId: null,
+    priority: 'normal', dueDate: null, deviceId: null, tags: [], ticketType: 'incident',
+    responseSlaMinutes: 60, resolutionSlaMinutes: 480, workKind: 'support', fieldProvenance: {},
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    setMock.mockClear();
+    matchContactMock.mockResolvedValue({ kind: 'no-match' });
+  });
+
+  it('changes the type: ONE internal system comment with old/new, ticket.updated changed=[ticketType], provenance, no SLA/due-date restamp', async () => {
+    dbMocks.selectResult.mockResolvedValue([BASE_TICKET]);
+    dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, ticketType: 'problem' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    const t = await updateTicketFields('t-1', { ticketType: 'problem' }, actor);
+    expect(t).toMatchObject({ ticketType: 'problem' });
+
+    const updatePayload = setMock.mock.calls[0]![0];
+    expect(updatePayload.ticketType).toBe('problem');
+    for (const key of ['responseSlaMinutes', 'resolutionSlaMinutes', 'dueDate', 'categoryId', 'priority']) {
+      expect(updatePayload).not.toHaveProperty(key);
+    }
+    // Provenance is stamped in the same statement (a SQL jsonb merge).
+    expect(updatePayload.fieldProvenance).toBeDefined();
+
+    // Exactly one feed comment (then the outbox row).
+    expect(valuesMock).toHaveBeenCalledTimes(2);
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({
+      ticketId: 't-1',
+      commentType: 'system',
+      isPublic: false,
+      content: 'Updated type',
+      oldValue: 'incident',
+      newValue: 'problem',
+    });
+
+    expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ticket.updated',
+      payload: { changed: ['ticketType'] },
+    }));
+    // No category/priority triage feedback for a classification edit.
+    expect(emitTriageFeedbackMock).not.toHaveBeenCalled();
+  });
+
+  it('a type change mixed with another field keeps a single comment', async () => {
+    dbMocks.selectResult.mockResolvedValue([BASE_TICKET]);
+    dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, subject: 'New', ticketType: 'change' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await updateTicketFields('t-1', { subject: 'New', ticketType: 'change' }, actor);
+
+    expect(valuesMock).toHaveBeenCalledTimes(2);
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({ content: 'Updated subject, type', oldValue: 'incident', newValue: 'change' });
+    expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({ payload: { changed: ['subject', 'ticketType'] } }));
+  });
+
+  it('an unchanged type is a no-op (no write, no comment, no event)', async () => {
+    dbMocks.selectResult.mockResolvedValue([BASE_TICKET]);
+
+    await updateTicketFields('t-1', { ticketType: 'incident' }, actor);
+
+    expect(setMock).not.toHaveBeenCalled();
+    expect(valuesMock).not.toHaveBeenCalled();
+    expect(emitMock).not.toHaveBeenCalled();
+  });
+
+  it('a non-type edit leaves oldValue/newValue unset on the feed comment', async () => {
+    dbMocks.selectResult.mockResolvedValue([BASE_TICKET]);
+    dbMocks.updateReturning.mockResolvedValue([{ ...BASE_TICKET, subject: 'New' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+
+    await updateTicketFields('t-1', { subject: 'New' }, actor);
+
+    const comment = valuesMock.mock.calls[0]![0];
+    expect(comment.oldValue).toBeUndefined();
+    expect(comment.newValue).toBeUndefined();
+  });
+});
+
+describe('ticket_type — listOrgTicketsForAddin (additive field)', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('selects ticketType for both lists and returns it on each summary', async () => {
+    const row = {
+      id: 't-1', internalNumber: 'T-1', subject: 'S', status: 'open', priority: 'normal',
+      updatedAt: new Date('2026-08-14T00:00:00Z'), submitterEmail: null, ticketType: 'problem',
+    };
+    dbMocks.selectResult.mockResolvedValueOnce([row]).mockResolvedValueOnce([row]);
+
+    const result = await listOrgTicketsForAddin({ orgId: 'org-1', partnerId: 'partner-1' });
+
+    const { db } = await import('../db');
+    const selections = (db.select as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => c[0]);
+    expect(selections).toHaveLength(2);
+    for (const sel of selections) expect(sel).toMatchObject({ ticketType: 'ticketType' });
+    expect(result.openTickets[0]!.ticketType).toBe('problem');
+    expect(result.recentTickets[0]!.ticketType).toBe('problem');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #8973 W3 — stored SLA deadlines written at every write point (spec §4.3).
+// Each patch must ride the SAME update statement as the change that caused
+// it (the status CAS / first-response stamp), never a separate write.
+// ---------------------------------------------------------------------------
+
+describe('SLA deadlines — createTicket stamps due/warn (#8973)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-11T10:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: null, resolutionMinutes: null });
+  });
+
+  it('computes both deadlines from the created_at it inserts', async () => {
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: 60, resolutionMinutes: 480 });
+    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Printer', source: 'manual' }, actor);
+
+    const insert = valuesMock.mock.calls[0]![0];
+    const createdAt = new Date('2026-06-11T10:00:00Z');
+    expect(insert).toMatchObject({
+      createdAt,
+      updatedAt: createdAt,
+      responseSlaMinutes: 60,
+      resolutionSlaMinutes: 480,
+      responseDueAt: new Date('2026-06-11T11:00:00Z'),
+      responseWarnAt: new Date('2026-06-11T10:48:00Z'),
+      resolutionDueAt: new Date('2026-06-11T18:00:00Z'),
+      resolutionWarnAt: new Date('2026-06-11T16:24:00Z'),
+    });
+  });
+
+  it('null targets store null deadlines', async () => {
+    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Printer', source: 'manual' }, actor);
+
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({
+      responseDueAt: null, responseWarnAt: null, resolutionDueAt: null, resolutionWarnAt: null,
+    });
+  });
+});
+
+describe('SLA deadlines — changeTicketStatus pause end and reopen (#8973)', () => {
+  const created = new Date('2026-06-11T08:00:00Z');
+  const base = {
+    id: 't-1', orgId: 'o-1', partnerId: 'p-1', createdAt: created,
+    responseSlaMinutes: 60, resolutionSlaMinutes: 480,
+    slaPausedMinutes: 10, slaPausedBusinessMinutes: 10,
+    firstResponseAt: null, resolvedAt: null, slaBreachReason: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setMock.mockClear();
+    vi.useFakeTimers();
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('pause end → open accrues business minutes and recomputes both arms in the CAS update', async () => {
+    vi.setSystemTime(new Date('2026-06-11T10:30:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'on_hold', slaPausedAt: new Date('2026-06-11T10:00:00Z') }]);
+
+    await changeTicketStatus('t-1', { status: 'open' }, {}, actor);
+
+    // setMock call 0 is the status CAS update itself.
+    expect(setMock.mock.calls[0]![0]).toMatchObject({
+      status: 'open',
+      slaPausedAt: null,
+      slaPausedMinutes: 40,
+      slaPausedBusinessMinutes: 40,
+      responseDueAt: new Date(created.getTime() + 100 * 60_000),
+      responseWarnAt: new Date(created.getTime() + 88 * 60_000),
+      resolutionDueAt: new Date(created.getTime() + 520 * 60_000),
+      resolutionWarnAt: new Date(created.getTime() + 424 * 60_000),
+    });
+  });
+
+  it('a responded ticket recomputes resolution only', async () => {
+    vi.setSystemTime(new Date('2026-06-11T10:30:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{
+      ...base, status: 'pending', slaPausedAt: new Date('2026-06-11T10:00:00Z'), firstResponseAt: new Date('2026-06-11T08:20:00Z'),
+    }]);
+
+    await changeTicketStatus('t-1', { status: 'open' }, {}, actor);
+
+    const cas = setMock.mock.calls[0]![0];
+    expect(cas).not.toHaveProperty('responseDueAt');
+    expect(cas).not.toHaveProperty('responseWarnAt');
+    expect(cas.resolutionDueAt).toEqual(new Date(created.getTime() + 520 * 60_000));
+  });
+
+  it.each(['resolved', 'closed'] as const)('resolve/close while paused accrues the open pause first, then freezes resolution (→ %s)', async (to) => {
+    vi.setSystemTime(new Date('2026-06-11T10:05:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'pending', slaPausedAt: new Date('2026-06-11T10:00:00Z') }]);
+
+    await changeTicketStatus('t-1', { status: to }, { resolutionNote: 'Fixed' }, actor);
+
+    const cas = setMock.mock.calls[0]![0];
+    expect(cas.resolvedAt).toBeInstanceOf(Date);
+    expect(cas.slaPausedBusinessMinutes).toBe(15);
+    // The resolution deadline includes the final pause (10 + 5), so "met"
+    // compares against the clock that actually ran.
+    expect(cas.resolutionDueAt).toEqual(new Date(created.getTime() + 495 * 60_000));
+  });
+
+  it('entering a pause writes no deadline', async () => {
+    vi.setSystemTime(new Date('2026-06-11T10:05:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'open', slaPausedAt: null }]);
+
+    await changeTicketStatus('t-1', { status: 'pending' }, {}, actor);
+
+    const cas = setMock.mock.calls[0]![0];
+    expect(cas.slaPausedAt).toBeInstanceOf(Date);
+    for (const key of ['responseDueAt', 'responseWarnAt', 'resolutionDueAt', 'resolutionWarnAt', 'slaPausedBusinessMinutes']) {
+      expect(cas).not.toHaveProperty(key);
+    }
+  });
+
+  it('reopen unfreezes resolution and recomputes it with the same formula', async () => {
+    vi.setSystemTime(new Date('2026-06-12T10:00:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{
+      ...base, status: 'resolved', slaPausedAt: null,
+      firstResponseAt: new Date('2026-06-11T08:20:00Z'), resolvedAt: new Date('2026-06-11T12:00:00Z'),
+      resolutionSlaMinutes: 600,
+    }]);
+
+    await changeTicketStatus('t-1', { status: 'open' }, {}, actor);
+
+    const cas = setMock.mock.calls[0]![0];
+    expect(cas.resolvedAt).toBeNull();
+    expect(cas).not.toHaveProperty('responseDueAt');
+    expect(cas.resolutionDueAt).toEqual(new Date(created.getTime() + 610 * 60_000));
+    expect(cas.resolutionWarnAt).toEqual(new Date(created.getTime() + 490 * 60_000));
+  });
+
+  it('a stamped resolution breach stays frozen across a reopen (one-shot rule)', async () => {
+    vi.setSystemTime(new Date('2026-06-12T10:00:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{
+      ...base, status: 'resolved', slaPausedAt: null, slaBreachReason: 'resolution',
+      firstResponseAt: new Date('2026-06-11T08:20:00Z'), resolvedAt: new Date('2026-06-11T20:00:00Z'),
+    }]);
+
+    await changeTicketStatus('t-1', { status: 'open' }, {}, actor);
+
+    expect(setMock.mock.calls[0]![0]).not.toHaveProperty('resolutionDueAt');
+  });
+});
+
+describe('SLA deadlines — live first-response writers freeze the response deadline (#8973)', () => {
+  const created = new Date('2026-06-11T08:00:00Z');
+  const ticket = {
+    id: 't-1', orgId: 'o-1', partnerId: 'p-1', status: 'open', createdAt: created,
+    responseSlaMinutes: 60, resolutionSlaMinutes: 480,
+    slaPausedMinutes: 10, slaPausedBusinessMinutes: 10, slaPausedAt: null,
+    firstResponseAt: null, resolvedAt: null, slaBreachReason: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setMock.mockClear();
+    valuesMock.mockClear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-11T08:30:00Z'));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('addTicketComment: the freeze rides the firstResponseAt stamp', async () => {
+    dbMocks.selectResult.mockResolvedValue([ticket]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', isPublic: true }]);
+
+    await addTicketComment('t-1', { content: 'On it', isPublic: true }, actor);
+
+    const stamp = setMock.mock.calls[0]![0];
+    expect(stamp.firstResponseAt).toBeInstanceOf(Date);
+    expect(stamp).toMatchObject({
+      responseDueAt: new Date(created.getTime() + 70 * 60_000),
+      responseWarnAt: new Date(created.getTime() + 58 * 60_000),
+    });
+    expect(stamp).not.toHaveProperty('slaPausedBusinessMinutes');
+  });
+
+  it('addTicketComment while paused: transient accrual, nothing persisted', async () => {
+    dbMocks.selectResult.mockResolvedValue([{ ...ticket, status: 'pending', slaPausedAt: new Date('2026-06-11T08:10:00Z') }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', isPublic: true }]);
+
+    await addTicketComment('t-1', { content: 'Update', isPublic: true }, actor);
+
+    const stamp = setMock.mock.calls[0]![0];
+    // 10 persisted + 20 open-pause minutes, counted transiently.
+    expect(stamp.responseDueAt).toEqual(new Date(created.getTime() + 90 * 60_000));
+    expect(stamp).not.toHaveProperty('slaPausedBusinessMinutes');
+    expect(stamp).not.toHaveProperty('slaPausedMinutes');
+  });
+
+  it('no second freeze once a first response exists', async () => {
+    dbMocks.selectResult.mockResolvedValue([{ ...ticket, firstResponseAt: new Date('2026-06-11T08:05:00Z') }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', isPublic: true }]);
+
+    await addTicketComment('t-1', { content: 'More', isPublic: true }, actor);
+
+    expect(setMock.mock.calls.some((c) => 'responseDueAt' in (c[0] as object))).toBe(false);
+  });
+
+  it('sendTicketDraft: the freeze rides the firstResponseAt stamp', async () => {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([ticket])
+      .mockResolvedValueOnce([{ id: 'draft-1', ticketId: 't-1', kind: 'reply', state: 'active', content: 'Draft body' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1' }]);
+    dbMocks.updateReturning.mockResolvedValue([{ id: 'draft-1' }]);
+
+    await sendTicketDraft('t-1', 'draft-1', undefined, actor);
+
+    const stamp = setMock.mock.calls.find((c) => 'firstResponseAt' in (c[0] as object))![0];
+    expect(stamp).toMatchObject({
+      responseDueAt: new Date(created.getTime() + 70 * 60_000),
+      responseWarnAt: new Date(created.getTime() + 58 * 60_000),
+    });
+  });
+});
+
+// ── #8972 W1 Task 1.2: tombstones are read-only (spec §3.2) ─────────────────
+describe('tombstone guard: every ticketService writer refuses a merged ticket (#8972 W1)', () => {
+  // One row shape that answers every unlocked read AND the lock: a live-looking
+  // ticket (and comment / alert, for the writers that read those first) whose
+  // locked row says it was merged into t-survivor.
+  const TOMB = {
+    id: 't1', ticketId: 't1', orgId: 'o1', partnerId: 'p1', status: 'open', statusId: null,
+    mergedIntoTicketId: 't-survivor', deletedAt: null, firstResponseAt: new Date(), resolvedAt: null,
+    assignedTo: null, deviceId: null, workKind: 'support', priority: 'normal', categoryId: null,
+    userId: 'u-1', portalUserId: null, authorType: 'internal', commentType: 'comment', isPublic: false,
+    originPrincipalKind: 'user', content: 'x', createdAt: new Date(), kind: 'reply', state: 'active',
+    alertId: 'a1', severity: 'high', fieldProvenance: {}, slaPausedAt: null, slaPausedMinutes: 0,
+    rowVersion: 'v1',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbMocks.selectResult.mockResolvedValue([TOMB]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', originPrincipalKind: 'user', originPrincipalId: null }]);
+    dbMocks.updateReturning.mockResolvedValue([TOMB]);
+    dbMocks.txUpdateReturning.mockResolvedValue([TOMB]);
+    dbMocks.txExecuteMock.mockResolvedValue(undefined);
+  });
+  afterEach(() => {
+    dbMocks.selectResult.mockReset();
+    dbMocks.insertReturning.mockReset();
+    dbMocks.updateReturning.mockReset();
+    dbMocks.txUpdateReturning.mockReset();
+  });
+
+  const writers: Array<[string, () => Promise<unknown>]> = [
+    ['addTicketComment', () => addTicketComment('t1', { content: 'hi', isPublic: true }, actor)],
+    ['editTicketComment', () => editTicketComment('t1', { content: 'edit' }, actor, { canManageAny: true })],
+    ['deleteTicketComment', () => deleteTicketComment('t1', actor, { canManageAny: true })],
+    ['addAiTriageNote', () => addAiTriageNote('t1', 'run-1', 'note', 'o1')],
+    ['postProposalNote', () => postProposalNote('t1', 'run-1', 'note', actor)],
+    ['changeTicketStatus', () => changeTicketStatus('t1', { status: 'resolved' }, { resolutionNote: 'done' }, actor)],
+    ['updateTicketFields', () => updateTicketFields('t1', { subject: 'new subject' }, actor)],
+    ['assignTicket', () => assignTicket('t1', null, actor)],
+    ['linkAlertToTicket', () => linkAlertToTicket('t1', 'a1', actor)],
+    ['unlinkAlertFromTicket', () => unlinkAlertFromTicket('t1', 'a1', actor)],
+    ['sendTicketDraft', () => sendTicketDraft('t1', 'draft-1', undefined, actor)],
+    ['discardTicketDraft', () => discardTicketDraft('t1', 'draft-1')],
+    ['applyAiFieldUpdates', () => applyAiFieldUpdates('t1', 'o1', { priority: { value: 'high', expectedCurrent: 'normal' } }, 'run-1')],
+    ['restoreTicket', () => restoreTicket('t1', actor)],
+    ['moveTicketOrg', () => moveTicketOrg('t1', 'o2', actor)],
+  ];
+
+  it.each(writers)('refuses %s on a tombstone with TICKET_MERGED', async (_name, run) => {
+    if (_name === 'restoreTicket') dbMocks.selectResult.mockResolvedValue([{ ...TOMB, deletedAt: new Date() }]);
+    const err = (await run().then(() => null, (e: unknown) => e)) as TicketMergedError;
+    expect(err).toBeInstanceOf(TicketMergedError);
+    expect(err).toMatchObject({ code: 'TICKET_MERGED', status: 409, mergedIntoTicketId: 't-survivor' });
+    expect(err.toBody()).toEqual({
+      error: expect.any(String), code: 'TICKET_MERGED', details: { mergedIntoTicketId: 't-survivor' },
+    });
+  });
+
+  it('revalidateTicketAssignee skips a tombstone (the movers carry it) instead of failing the move', async () => {
+    assigneeEligibleMock.mockResolvedValueOnce(false);
+    const current = { ...TOMB, assignedTo: 'u-gone' } as never;
+    const res = await revalidateTicketAssignee('t1', actor, undefined, current);
+    expect(res).toBe(current);
+    expect(setMock).not.toHaveBeenCalled();
+  });
+
+  it('verification decision on a merged ticket lands on the survivor (Gate B6: never throws)', async () => {
+    const survivor = { ...TOMB, id: 't-survivor', mergedIntoTicketId: null };
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-survivor' }]) // unlocked pointer peek
+      .mockResolvedValueOnce([survivor]) // lockTicketForWrite(survivor) — the ONLY ticket lock
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-survivor' }]); // pointer re-checked under that lock
+    await expect(addCallerVerificationSystemComment({
+      orgId: 'o1', ticketId: 't1', verificationId: 'v-1', event: 'rejected',
+    })).resolves.toBeUndefined();
+    const comment = valuesMock.mock.calls.map((c) => c[0] as Record<string, unknown>).find((v) => v.commentType === 'system');
+    expect(comment).toMatchObject({ ticketId: 't-survivor', content: 'Caller verification rejected (v-1)' });
+    const outbox = valuesMock.mock.calls.map((c) => c[0] as Record<string, unknown>).find((v) => v.eventType === 'ticket.commented');
+    expect(outbox).toMatchObject({ ticketId: 't-survivor' });
+  });
+
+  it('a verification decision on a live ticket still lands on that ticket', async () => {
+    const live = { ...TOMB, mergedIntoTicketId: null };
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ mergedIntoTicketId: null }])
+      .mockResolvedValueOnce([live]);
+    await addCallerVerificationSystemComment({ orgId: 'o1', ticketId: 't1', verificationId: 'v-2', event: 'approved' });
+    const comment = valuesMock.mock.calls.map((c) => c[0] as Record<string, unknown>).find((v) => v.commentType === 'system');
+    expect(comment).toMatchObject({ ticketId: 't1' });
+  });
+
+  it('re-reads when the tombstone was re-pointed between the peek and the lock (path compression)', async () => {
+    const survivorB = { ...TOMB, id: 't-b', mergedIntoTicketId: 't-c' };
+    const survivorC = { ...TOMB, id: 't-c', mergedIntoTicketId: null };
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-b' }]) // peek: A → B
+      .mockResolvedValueOnce([survivorB]) // lock B …
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-c' }]) // … but A now points at C: savepoint rolls back
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-c' }]) // peek again: A → C
+      .mockResolvedValueOnce([survivorC]) // lock C
+      .mockResolvedValueOnce([{ mergedIntoTicketId: 't-c' }]); // stable under C's lock
+    await addCallerVerificationSystemComment({ orgId: 'o1', ticketId: 't1', verificationId: 'v-3', event: 'rejected' });
+    const comment = valuesMock.mock.calls.map((c) => c[0] as Record<string, unknown>).find((v) => v.commentType === 'system');
+    expect(comment).toMatchObject({ ticketId: 't-c' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #8973 W4 — business-hours calendars at the SLA write points (spec §4.3).
+// The resolver and the snapshot loader are module-mocked here (the unit db
+// mock has no execute); real Postgres coverage lives in
+// businessCalendarCallerContexts / ticket-move-org integration tests.
+// Default: no calendar applies (24×7), so every test above is unchanged.
+// ---------------------------------------------------------------------------
+
+const { calendarMocks } = vi.hoisted(() => ({
+  calendarMocks: {
+    resolve: vi.fn(async (..._args: unknown[]) => ({ revisionId: null as string | null, calendarId: null as string | null, source: 'none' as 'org' | 'partner' | 'none' })),
+    load: vi.fn(async (_db: unknown, _revisionId: string | null): Promise<unknown> => null),
+  },
+}));
+vi.mock('./businessCalendars/resolve', () => ({ resolveBusinessCalendar: calendarMocks.resolve }));
+vi.mock('./ticketSlaDeadlines', async () => {
+  const actual = await vi.importActual<typeof import('./ticketSlaDeadlines')>('./ticketSlaDeadlines');
+  return { ...actual, loadTicketCalendar: calendarMocks.load };
+});
+
+/** Mon–Fri 09:00–17:00 America/New_York (EDT = UTC-4 in June). */
+const NY_WEEKDAYS = {
+  revision: { timezone: 'America/New_York', intervals: [1, 2, 3, 4, 5].map((weekday) => ({ weekday, startMinute: 540, endMinute: 1020 })) },
+  holidays: [] as string[],
+};
+
+function useCalendar(revisionId: string) {
+  calendarMocks.resolve.mockResolvedValue({ revisionId, calendarId: 'cal-1', source: 'partner' });
+  calendarMocks.load.mockImplementation(async (_db: unknown, id: string | null) => (id === revisionId ? NY_WEEKDAYS : null));
+}
+
+function resetCalendar() {
+  calendarMocks.resolve.mockReset().mockResolvedValue({ revisionId: null, calendarId: null, source: 'none' });
+  calendarMocks.load.mockReset().mockImplementation(async () => null);
+}
+
+describe('SLA calendars — createTicket snapshots the resolved revision (#8973 W4)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    vi.useFakeTimers();
+    // Friday 16:00 in New York.
+    vi.setSystemTime(new Date('2026-06-12T20:00:00Z'));
+    useCalendar('rev-1');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    resetCalendar();
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: null, resolutionMinutes: null });
+  });
+
+  it('resolves for the ticket org + its partner and writes business-time due/warn', async () => {
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: 120, resolutionMinutes: 480 });
+    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Printer', source: 'manual' }, actor);
+
+    expect(calendarMocks.resolve).toHaveBeenCalledWith(expect.anything(), { partnerId: 'p-1', orgId: 'o-1' });
+    expect(calendarMocks.load).toHaveBeenCalledWith(expect.anything(), 'rev-1');
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({
+      slaCalendarRevisionId: 'rev-1',
+      // Fri 16:00 + 120 business minutes = Mon 10:00 NY; warn 96 = Mon 09:36.
+      responseDueAt: new Date('2026-06-15T14:00:00Z'),
+      responseWarnAt: new Date('2026-06-15T13:36:00Z'),
+      // 480 = Fri 60 + Mon 420 → Mon 16:00; warn 384 → Mon 14:24.
+      resolutionDueAt: new Date('2026-06-15T20:00:00Z'),
+      resolutionWarnAt: new Date('2026-06-15T18:24:00Z'),
+    });
+  });
+
+  it('with no calendar the snapshot is null and the deadlines are wall clock', async () => {
+    resetCalendar();
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: 120, resolutionMinutes: null });
+    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Printer', source: 'manual' }, actor);
+
+    expect(valuesMock.mock.calls[0]![0]).toMatchObject({ slaCalendarRevisionId: null, responseDueAt: new Date('2026-06-12T22:00:00Z') });
+  });
+});
+
+describe('SLA calendars — write points use the ticket snapshot (#8973 W4)', () => {
+  // Mon 2026-06-15 09:00 New York.
+  const created = new Date('2026-06-15T13:00:00Z');
+  const base = {
+    id: 't-1', orgId: 'o-1', partnerId: 'p-1', createdAt: created, slaCalendarRevisionId: 'rev-1',
+    responseSlaMinutes: 60, resolutionSlaMinutes: 480,
+    slaPausedMinutes: 10, slaPausedBusinessMinutes: 10,
+    firstResponseAt: null, resolvedAt: null, slaBreachReason: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setMock.mockClear();
+    vi.useFakeTimers();
+    dbMocks.updateReturning.mockResolvedValue([{ id: 't-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'c-1', isPublic: true }]);
+    useCalendar('rev-1');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    resetCalendar();
+  });
+
+  it('pause end accrues BUSINESS minutes over a weekend and recomputes on the calendar', async () => {
+    // Paused Fri 16:00 NY, resumed Mon 10:00 NY: 66 wall-clock hours, 120 business minutes.
+    vi.setSystemTime(new Date('2026-06-22T14:00:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'pending', slaPausedAt: new Date('2026-06-19T20:00:00Z') }]);
+
+    await changeTicketStatus('t-1', { status: 'open' }, {}, actor);
+
+    expect(calendarMocks.load).toHaveBeenCalledWith(expect.anything(), 'rev-1');
+    expect(setMock.mock.calls[0]![0]).toMatchObject({
+      slaPausedMinutes: 10 + 66 * 60,
+      slaPausedBusinessMinutes: 130,
+      // created Mon 09:00 + (60 + 130) business minutes = Mon 12:10 NY.
+      responseDueAt: new Date('2026-06-15T16:10:00Z'),
+      // + (480 + 130) = Mon 480 + Tue 130 → Tue 11:10 NY.
+      resolutionDueAt: new Date('2026-06-16T15:10:00Z'),
+    });
+  });
+
+  it('a first response freezes on the ticket calendar (addTicketComment)', async () => {
+    vi.setSystemTime(new Date('2026-06-15T13:30:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'open', slaPausedAt: null }]);
+
+    await addTicketComment('t-1', { content: 'On it', isPublic: true }, actor);
+
+    expect(calendarMocks.load).toHaveBeenCalledWith(expect.anything(), 'rev-1');
+    // 60 + 10 paused business minutes from Mon 09:00 → Mon 10:10 NY.
+    expect(setMock.mock.calls[0]![0]).toMatchObject({ responseDueAt: new Date('2026-06-15T14:10:00Z') });
+  });
+
+  it('a target override recomputes on the ticket calendar (updateTicketFields)', async () => {
+    vi.setSystemTime(new Date('2026-06-15T13:30:00Z'));
+    dbMocks.selectResult.mockResolvedValue([{ ...base, status: 'open', slaPausedAt: null, fieldProvenance: {} }]);
+
+    await updateTicketFields('t-1', { responseSlaMinutes: 600 }, actor).catch(() => undefined);
+
+    expect(calendarMocks.load).toHaveBeenCalledWith(expect.anything(), 'rev-1');
+  });
+});
+
+describe('SLA calendars — moveTicketOrg re-resolves for the target org (#8973 W4)', () => {
+  const created = new Date('2026-06-15T13:00:00Z'); // Mon 09:00 NY
+  const snapshot = {
+    id: 't1', orgId: 'oA', partnerId: 'p1', createdAt: created, slaCalendarRevisionId: 'rev-src',
+    responseSlaMinutes: 60, resolutionSlaMinutes: 480, slaPausedAt: null, slaPausedBusinessMinutes: 0,
+    firstResponseAt: null, resolvedAt: null, slaBreachReason: null,
+  };
+
+  function queueMove(ticket: object) {
+    dbMocks.selectResult
+      .mockResolvedValueOnce([ticket])
+      .mockResolvedValueOnce([{ currencyCode: 'USD' }])
+      .mockResolvedValueOnce([{ currencyCode: 'USD' }])
+      .mockResolvedValueOnce([
+        { id: 'oA', partnerId: 'p1', name: 'Alpha', currencyCode: 'USD' },
+        { id: 'oB', partnerId: 'p1', name: 'Beta', currencyCode: 'USD' },
+      ]);
+    dbMocks.txUpdateReturning.mockResolvedValue([{ id: 't1', orgId: 'oB' }]);
+    dbMocks.txExecuteMock.mockResolvedValue(undefined);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 'comment' }]);
+  }
+  const moveSet = () => setMock.mock.calls.map((c) => c[0] as Record<string, unknown>).find((s) => s.orgId === 'oB' && 'requesterContactId' in s)!;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setMock.mockClear();
+    guardMock.mockReset().mockResolvedValue(null);
+  });
+  afterEach(() => resetCalendar());
+
+  it('snapshots the target org revision and recomputes the unfrozen arms in the move statement', async () => {
+    useCalendar('rev-tgt');
+    queueMove(snapshot);
+
+    await moveTicketOrg('t1', 'oB', actor);
+
+    expect(calendarMocks.resolve).toHaveBeenCalledWith(expect.anything(), { orgId: 'oB', partnerId: 'p1' });
+    expect(moveSet()).toMatchObject({
+      orgId: 'oB',
+      slaCalendarRevisionId: 'rev-tgt',
+      responseDueAt: new Date('2026-06-15T14:00:00Z'), // Mon 10:00 NY
+      resolutionDueAt: new Date('2026-06-15T21:00:00Z'), // Mon 17:00 NY
+    });
+  });
+
+  it('a frozen arm keeps its deadline across the move', async () => {
+    useCalendar('rev-tgt');
+    queueMove({ ...snapshot, firstResponseAt: new Date('2026-06-15T13:20:00Z') });
+
+    await moveTicketOrg('t1', 'oB', actor);
+
+    const set = moveSet();
+    expect(set.slaCalendarRevisionId).toBe('rev-tgt');
+    expect(set).not.toHaveProperty('responseDueAt');
+    expect(set).toHaveProperty('resolutionDueAt');
+  });
+
+  it("never leaves the source org's calendar referenced: no target calendar → null snapshot, wall clock", async () => {
+    queueMove(snapshot);
+
+    await moveTicketOrg('t1', 'oB', actor);
+
+    expect(moveSet()).toMatchObject({
+      slaCalendarRevisionId: null,
+      responseDueAt: new Date(created.getTime() + 60 * 60_000),
+    });
+  });
+
+  it('the same revision on both sides writes no SLA columns', async () => {
+    useCalendar('rev-src');
+    queueMove(snapshot);
+
+    await moveTicketOrg('t1', 'oB', actor);
+
+    const set = moveSet();
+    expect(set).not.toHaveProperty('slaCalendarRevisionId');
+    expect(set).not.toHaveProperty('responseDueAt');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #8883 W5 T5.3 — routing rules at create (spec §5.2). The evaluator is
+// module-mocked (the unit db mock has no execute); its own behaviour is
+// covered by ticketRouting/evaluate.test.ts and real Postgres by
+// ticketCreateCallerContexts.integration.test.ts. Default: no rule matched,
+// so every test above is unchanged.
+// ---------------------------------------------------------------------------
+
+const { routingMocks } = vi.hoisted(() => ({
+  routingMocks: {
+    evaluate: vi.fn(async (..._args: unknown[]): Promise<unknown> => ({
+      ruleId: null, ruleName: null, applied: {}, skipped: [], appliedStatusCore: null,
+    })),
+  },
+}));
+vi.mock('./ticketRouting/evaluate', () => ({ evaluateRoutingRules: routingMocks.evaluate }));
+
+function routeTo(outcome: Record<string, unknown>) {
+  routingMocks.evaluate.mockResolvedValue({
+    ruleId: 'rule-1', ruleName: 'Printers', applied: {}, skipped: [], appliedStatusCore: null, ...outcome,
+  });
+}
+
+describe('createTicket — routing rules (#8883 W5 T5.3)', () => {
+  const insertedTicket = () => valuesMock.mock.calls[0]![0] as Record<string, unknown>;
+  const valuesOf = (pred: (v: Record<string, unknown>) => boolean) =>
+    valuesMock.mock.calls.map((c) => c[0] as Record<string, unknown>).filter(pred);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    valuesMock.mockClear();
+    routingMocks.evaluate.mockReset().mockResolvedValue({ ruleId: null, ruleName: null, applied: {}, skipped: [], appliedStatusCore: null });
+    dbMocks.selectResult.mockResolvedValue([{ id: 'o-1', partnerId: 'p-1' }]);
+    dbMocks.insertReturning.mockResolvedValue([{ id: 't-1', orgId: 'o-1', internalNumber: 'T-2026-0042', status: 'new' }]);
+    assigneeEligibleMock.mockResolvedValue(true);
+    configMocks.getSystemStatusId.mockImplementation(async (_p: string, core: string) => `sys-${core}`);
+  });
+  afterEach(() => {
+    configMocks.getSystemStatusId.mockReset().mockResolvedValue(null);
+    configMocks.getPartnerPrioritySla.mockResolvedValue({ responseMinutes: null, resolutionMinutes: null });
+  });
+
+  it('evaluates once with the ticket org + partner + device, the final requester email, and explicit-choice flags', async () => {
+    await createTicket({
+      orgId: 'o-1', subject: 'Printer jam', source: 'email', submitterEmail: 'jane@example.com', priority: 'high',
+    }, actor);
+    expect(routingMocks.evaluate).toHaveBeenCalledTimes(1);
+    const [, owner, facts, explicit] = routingMocks.evaluate.mock.calls[0]!;
+    expect(owner).toEqual({ partnerId: 'p-1', orgId: 'o-1', deviceId: null });
+    expect(facts).toEqual({ source: 'email', priority: 'high', categoryId: null, subject: 'Printer jam', requesterEmail: 'jane@example.com' });
+    expect(explicit).toEqual({ priority: true, categoryId: false, assigneeId: false, statusId: false });
+  });
+
+  it('is skipped for a continuation ticket (Gate B14): nothing is copied or routed', async () => {
+    routeTo({ applied: { priority: 'urgent' } });
+    await createTicket({ orgId: 'o-1', subject: 'Re: T-1 (continued)', source: 'email', submitterEmail: 'a@b.com', continuationOfTicketId: 't-0' }, actor);
+    expect(routingMocks.evaluate).not.toHaveBeenCalled();
+    expect(insertedTicket()).toMatchObject({ priority: 'normal', routingRuleId: null });
+  });
+
+  it('no priority and no matching rule still stores normal (the service default stays)', async () => {
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    expect(insertedTicket()).toMatchObject({ priority: 'normal', routingRuleId: null, status: 'new', statusId: 'sys-new', assignedTo: null });
+    // No rule matched: no routing note, no routing audit keys.
+    expect(valuesOf((v) => v.commentType === 'system')).toEqual([]);
+    expect(auditMock.mock.calls[0]![0].details).not.toHaveProperty('routingRuleId');
+  });
+
+  it("a rule's priority feeds the SLA target resolution and the insert", async () => {
+    routeTo({ applied: { priority: 'urgent' } });
+    configMocks.getPartnerPrioritySla.mockImplementation(async (_p: string, prio: string) =>
+      (prio === 'urgent' ? { responseMinutes: 15, resolutionMinutes: 60 } : { responseMinutes: null, resolutionMinutes: null }));
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    expect(insertedTicket()).toMatchObject({ priority: 'urgent', responseSlaMinutes: 15, resolutionSlaMinutes: 60, routingRuleId: 'rule-1' });
+  });
+
+  it('precedence: an intake priority wins over the rule (the evaluator is told it is explicit)', async () => {
+    routeTo({ applied: {} });
+    formMocks.getTicketFormForOrg.mockResolvedValueOnce({ id: 'f-1' });
+    formMocks.applyIntakeForm.mockReturnValueOnce({ categoryId: undefined, defaultPriority: 'low', subjectFromForm: 'From form', descriptionBlock: null, defaultTags: [], intakeSnapshot: {} });
+    await createTicket({ orgId: 'o-1', source: 'manual', formId: 'f-1', formResponses: {} }, actor);
+    const [, , facts, explicit] = routingMocks.evaluate.mock.calls[0]!;
+    expect((facts as { priority: string }).priority).toBe('low');
+    expect((explicit as { priority: boolean }).priority).toBe(true);
+    expect(insertedTicket()).toMatchObject({ priority: 'low' });
+  });
+
+  it("a rule's category is validated, stored and drives the category SLA", async () => {
+    routeTo({ applied: { categoryId: 'cat-9' } });
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]) // org
+      .mockResolvedValueOnce([{ id: 'cat-9', partnerId: 'p-1', responseSlaMinutes: 30, resolutionSlaMinutes: 240 }]); // category
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    expect(insertedTicket()).toMatchObject({ categoryId: 'cat-9', responseSlaMinutes: 30, resolutionSlaMinutes: 240 });
+  });
+
+  it("a rule's assignee is stored and the ticket starts at core open, like an explicit assignee", async () => {
+    routeTo({ applied: { assigneeId: 'u-9' } });
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    expect(insertedTicket()).toMatchObject({ assignedTo: 'u-9', status: 'open', statusId: 'sys-open' });
+  });
+
+  it("a rule's status overrides the derivation; a pending/on_hold core starts the SLA clock paused at created_at", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-12T20:00:00Z'));
+    try {
+      routeTo({ applied: { assigneeId: 'u-9', statusId: 'st-wait' }, appliedStatusCore: 'pending' });
+      await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+      expect(insertedTicket()).toMatchObject({
+        status: 'pending', statusId: 'st-wait', assignedTo: 'u-9',
+        slaPausedAt: new Date('2026-06-12T20:00:00Z'), createdAt: new Date('2026-06-12T20:00:00Z'),
+      });
+      valuesMock.mockClear();
+      routeTo({ applied: { statusId: 'st-open' }, appliedStatusCore: 'open' });
+      await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+      expect(insertedTicket()).toMatchObject({ status: 'open', statusId: 'st-open', slaPausedAt: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a rule's tags are added to the intake form's default tags", async () => {
+    routeTo({ applied: { tags: ['vip', 'printer'] } });
+    formMocks.getTicketFormForOrg.mockResolvedValueOnce({ id: 'f-1' });
+    formMocks.applyIntakeForm.mockReturnValueOnce({ categoryId: undefined, defaultPriority: undefined, subjectFromForm: 'From form', descriptionBlock: null, defaultTags: ['printer', 'hw'], intakeSnapshot: {} });
+    await createTicket({ orgId: 'o-1', source: 'manual', formId: 'f-1', formResponses: {} }, actor);
+    expect(insertedTicket().tags).toEqual(['printer', 'hw', 'vip']);
+  });
+
+  it('the ticket.created outbox row carries the FINAL assignee; no ticket.assigned row is written', async () => {
+    routeTo({ applied: { assigneeId: 'u-9' } });
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    const outbox = valuesOf((v) => typeof v.eventType === 'string');
+    expect(outbox.map((v) => v.eventType)).toEqual(['ticket.created']);
+    expect(outbox[0]!.payload).toMatchObject({ assigneeId: 'u-9' });
+  });
+
+  it('writes one internal system comment naming the rule and its applied and skipped actions, and audits them', async () => {
+    routeTo({
+      applied: { priority: 'high', tags: ['vip'] },
+      skipped: [{ action: 'set_assignee', reason: 'assignee_ineligible' }],
+    });
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor);
+    const notes = valuesOf((v) => v.commentType === 'system');
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({ ticketId: 't-1', isPublic: false, authorType: 'internal', originPrincipalKind: 'system' });
+    expect(notes[0]!.content).toContain('"Printers"');
+    expect(notes[0]!.content).toContain('priority (high)');
+    expect(notes[0]!.content).toContain('tags (vip)');
+    expect(notes[0]!.content).toMatch(/Skipped: assignee — /);
+    expect(auditMock.mock.calls[0]![0].details).toMatchObject({
+      routingRuleId: 'rule-1',
+      routingActions: { applied: { priority: 'high', tags: ['vip'] }, skipped: [{ action: 'set_assignee', reason: 'assignee_ineligible' }] },
+    });
+  });
+
+  it('an explicit ineligible assignee still errors (the rule never rescues it)', async () => {
+    routeTo({ applied: {} });
+    assigneeEligibleMock.mockResolvedValueOnce(false);
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])
+      .mockResolvedValueOnce([{ id: 'u-2', partnerId: 'p-1', status: 'active', email: 'u2@example.com' }]);
+    await expect(createTicket({ orgId: 'o-1', subject: 'x', source: 'manual', assigneeId: 'u-2' }, actor))
+      .rejects.toMatchObject({ code: 'ASSIGNEE_NOT_ELIGIBLE' });
+    expect(routingMocks.evaluate).not.toHaveBeenCalled();
+  });
+
+  // Precedence pinned at the insert, not only via the evaluator's explicit
+  // flags: even an outcome that (wrongly) carried a value for a field the
+  // caller set must lose to the caller.
+  it('precedence at the insert: explicit priority, category and assignee beat a conflicting rule outcome', async () => {
+    routeTo({ applied: { priority: 'urgent', categoryId: 'cat-rule', assigneeId: 'u-rule' } });
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }]) // org
+      .mockResolvedValueOnce([{ id: 'u-2', partnerId: 'p-1', status: 'active', email: 'u2@example.com' }]) // explicit assignee
+      .mockResolvedValueOnce([{ id: 'cat-mine', partnerId: 'p-1', responseSlaMinutes: null, resolutionSlaMinutes: null }]); // explicit category
+    await createTicket({ orgId: 'o-1', subject: 'x', source: 'manual', priority: 'low', categoryId: 'cat-mine', assigneeId: 'u-2' }, actor);
+    expect(insertedTicket()).toMatchObject({ priority: 'low', categoryId: 'cat-mine', assignedTo: 'u-2' });
+  });
+
+  it('precedence at the insert: an intake form priority and category beat a conflicting rule outcome', async () => {
+    routeTo({ applied: { priority: 'urgent', categoryId: 'cat-rule' } });
+    formMocks.getTicketFormForOrg.mockResolvedValueOnce({ id: 'f-1' });
+    formMocks.applyIntakeForm.mockReturnValueOnce({ categoryId: 'cat-form', defaultPriority: 'low', subjectFromForm: 'From form', descriptionBlock: null, defaultTags: [], intakeSnapshot: {} });
+    dbMocks.selectResult
+      .mockResolvedValueOnce([{ id: 'o-1', partnerId: 'p-1' }])
+      .mockResolvedValueOnce([{ id: 'cat-form', partnerId: 'p-1', responseSlaMinutes: null, resolutionSlaMinutes: null }]);
+    await createTicket({ orgId: 'o-1', source: 'manual', formId: 'f-1', formResponses: {} }, actor);
+    expect(insertedTicket()).toMatchObject({ priority: 'low', categoryId: 'cat-form' });
+  });
+
+  // Fail-closed by design: createTicket runs inside the caller's transaction,
+  // and a failed statement there aborts it anyway, so a routing read error is
+  // not swallowed into an unrouted create.
+  it('an unexpected routing error fails the create (no silent unrouted ticket)', async () => {
+    routingMocks.evaluate.mockRejectedValueOnce(new Error('connection reset'));
+    await expect(createTicket({ orgId: 'o-1', subject: 'x', source: 'manual' }, actor)).rejects.toThrow('connection reset');
+    expect(valuesMock).not.toHaveBeenCalled();
+  });
+});

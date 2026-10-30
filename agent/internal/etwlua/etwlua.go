@@ -103,6 +103,12 @@ type Event struct {
 	// It is used to route PAM locally and must not be sent to the server.
 	SubjectSessionID uint32 `json:"-"`
 
+	// Consent identifies the consent.exe process showing this prompt, when the
+	// interception attributed the request to one (zero otherwise). Local-only,
+	// like SubjectSessionID: it lets a server-approved launch dismiss exactly
+	// this prompt afterwards without touching any other UAC prompt (#8995).
+	Consent ConsentInstance `json:"-"`
+
 	// TargetExecutablePath is the absolute path of the binary about to be
 	// elevated. Required.
 	TargetExecutablePath string `json:"target_executable_path"`
@@ -136,6 +142,11 @@ type Event struct {
 
 	// ObservedAt is when the agent saw the event (UTC, RFC3339 in JSON).
 	ObservedAt time.Time `json:"observed_at"`
+
+	// FirstQuestionRenderer (#10190 W07) is the renderer the agent expects
+	// to ask the first question with if the server answers pending
+	// ("assist" | "native"), for the ingest audit. Set at submit time.
+	FirstQuestionRenderer string `json:"first_question_renderer,omitempty"`
 }
 
 // ElevationStatus is the server's ingest decision for a uac_intercept request.
@@ -148,14 +159,30 @@ const (
 	ElevationIgnored      ElevationStatus = "ignored"
 )
 
+// ConsentInstance identifies one consent.exe process by PID plus creation time,
+// so a reused PID can never be mistaken for the original prompt.
+type ConsentInstance struct {
+	PID       uint32
+	CreatedAt time.Time
+}
+
+// IsZero reports whether no consent.exe was identified.
+func (c ConsentInstance) IsZero() bool { return c.PID == 0 || c.CreatedAt.IsZero() }
+
 // ElevationOutcome is the server's synchronous ingest decision for a posted
 // uac_intercept elevation request, parsed from the POST response body
-// {"id":"<uuid>","status":"<status>"}. Status is one of "pending",
-// "auto_approved", "denied", or "ignored". RequestID is empty when the
-// server suppressed the request (status "ignored", id null).
+// {"id":"<uuid>","status":"<status>","supportName"?:"<name>"}. Status is one
+// of "pending", "auto_approved", "denied", or "ignored". RequestID is empty
+// when the server suppressed the request (status "ignored", id null).
+// SupportName is the MSP's display name for the end-user notices (#8928),
+// trimmed and capped at 120 runes; empty when the server sent none.
 type ElevationOutcome struct {
-	RequestID string
-	Status    ElevationStatus
+	RequestID   string
+	Status      ElevationStatus
+	SupportName string
+	// PendingExpiresAt (#10190 W07) is when the server expires a pending
+	// request (the elevation waiting card's deadline); zero when not sent.
+	PendingExpiresAt time.Time
 }
 
 // Subscriber abstracts the ETW event source. Real Windows builds use
@@ -198,6 +225,12 @@ type HeartbeatPoster interface {
 // time is correct.
 type PamRunner interface {
 	RunPamFlow(ctx context.Context, ev Event, outcome ElevationOutcome)
+	// NotifyElevationSubmitFailed tells the requesting user that a LIVE
+	// submit failed, while their UAC prompt is still up (#8928 D3). It is
+	// called only from handleEvent's submit-error branch, never for events
+	// replayed by Queue.Drain: a drained event is a stale prompt. It must not
+	// block; implementations rate-limit their own notices.
+	NotifyElevationSubmitFailed(ev Event)
 }
 
 // ErrNotPrivileged is returned by Start when the process is not running as
@@ -327,6 +360,12 @@ func handleEvent(ctx context.Context, ev Event, limiter *ipc.RateLimiter, hb Hea
 				log.Error("etwlua: enqueue failed; event dropped",
 					"error", qerr.Error())
 			}
+		}
+		// The user is looking at this prompt right now: tell them the request
+		// did not reach IT. Live failures only — Queue.Drain has no PamRunner
+		// and so can never notify for a replayed event.
+		if pam != nil {
+			pam.NotifyElevationSubmitFailed(ev)
 		}
 		return
 	}

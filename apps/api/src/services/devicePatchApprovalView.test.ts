@@ -18,7 +18,7 @@ vi.mock('../db', () => ({
 vi.mock('../db/schema', () => ({
   devicePatches: {
     id: 'id', patchId: 'patchId', deviceId: 'deviceId', orgId: 'orgId', status: 'status',
-    createdAt: 'createdAt', availableVersion: 'availableVersion',
+    createdAt: 'createdAt', availableVersion: 'availableVersion', scope: 'scope',
   },
   patches: {
     id: 'id', externalId: 'externalId', title: 'title', category: 'category',
@@ -141,6 +141,27 @@ describe('loadDevicePatchApprovalView (#7625)', () => {
     expect(view.byPatchId.get(P3)).toEqual({ state: 'excluded', reason: 'blocked_by_source', holdUntil: null });
   });
 
+  it('shows a feature release the ring blocks as excluded (blocked_by_feature_update_policy)', async () => {
+    mockRingPolicy({ enabled: true, severities: ['critical'], deferralDays: 0 });
+    mockEvaluatorReads(
+      [row({ patchId: P1, title: 'Windows 11, version 25H2', category: 'feature', severity: 'unknown' })],
+      [{ patchId: P1, status: 'approved', ringId: null }],
+    );
+
+    const view = await loadDevicePatchApprovalView(DEV, ORG);
+
+    expect(view.byPatchId.get(P1)).toEqual({ state: 'excluded', reason: 'blocked_by_feature_update_policy', holdUntil: null });
+  });
+
+  it('shows a per-user install the ring would auto-approve as excluded (unsupported_user_scope, #10249)', async () => {
+    mockRingPolicy({ enabled: true, severities: ['critical'], deferralDays: 0 });
+    mockEvaluatorReads([row({ patchId: P1, source: 'third_party', packageId: 'Zoom.Zoom', scope: 'user' })], []);
+
+    const view = await loadDevicePatchApprovalView(DEV, ORG);
+
+    expect(view.byPatchId.get(P1)).toEqual({ state: 'excluded', reason: 'unsupported_user_scope', holdUntil: null });
+  });
+
   it('with no patch policy, nothing auto-approves and the ring is null', async () => {
     vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue(null);
     mockEvaluatorReads([row({ patchId: P4 })]);
@@ -151,14 +172,33 @@ describe('loadDevicePatchApprovalView (#7625)', () => {
     expect(view.byPatchId.get(P4)).toEqual({ state: 'needs_approval', reason: 'no_ring_resolved', holdUntil: null });
   });
 
-  it("names no ring and auto-approves nothing when the linked ring belongs to another partner", async () => {
+  it("names no ring and excludes everything (ring_reference_invalid) when the linked ring belongs to another partner (#8186)", async () => {
     mockRingPolicy({ enabled: true, severities: ['critical'], deferralDays: 0 }, 0, '99999999-9999-9999-9999-999999999999');
     mockEvaluatorReads([row({ patchId: P1, severity: 'critical' })]);
 
     const view = await loadDevicePatchApprovalView(DEV, ORG);
 
     expect(view.evaluation.ring).toBeNull();
-    expect(view.byPatchId.get(P1)).toEqual({ state: 'needs_approval', reason: 'no_ring_resolved', holdUntil: null });
+    expect(view.byPatchId.get(P1)).toEqual({ state: 'excluded', reason: 'ring_reference_invalid', holdUntil: null });
+  });
+
+  it('reports every patch as excluded (ring_reference_invalid) when the policy links an unresolvable ring (#8186)', async () => {
+    vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
+    vi.mocked(loadPolicyLocalPatchConfig).mockResolvedValue({
+      configPolicyId: 'cp-1', configPolicyName: 'Workstations', orgId: ORG, featureLinkId: 'fl-1',
+      featurePolicyId: RING, sourcePolicyId: 'cp-1', inherited: false,
+      settings: { sources: ['os'], autoApprove: false, autoApproveSeverities: [], autoApproveDeferralDays: 0, apps: [] },
+      ring: {
+        classification: 'missing_target', valid: false, ringId: null, ringName: null,
+        categoryRules: [], categories: [], excludeCategories: [], autoApprove: {}, appRules: [],
+      },
+    } as never);
+    mockEvaluatorReads([row({ patchId: P1 })], [{ patchId: P1, status: 'approved', ringId: null }]);
+
+    const view = await loadDevicePatchApprovalView(DEV, ORG);
+
+    expect(view.evaluation).toEqual({ available: true, ring: null });
+    expect(view.byPatchId.get(P1)).toEqual({ state: 'excluded', reason: 'ring_reference_invalid', holdUntil: null });
   });
 
   it('mirrors the scheduled job on superseded patches (it does not exclude them)', async () => {

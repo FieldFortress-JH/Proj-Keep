@@ -192,4 +192,83 @@ describe('OfferingDrawer', () => {
     render(<OfferingDrawer offering={row({ id: OFF, connectionId: CONN, funding: 'partner_key' })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
     expect(screen.queryByTestId('ai-offering-verify-hint')).toBeNull();
   });
+  describe('remove model (#8510)', () => {
+    const manualRow = (over: Partial<AiOfferingDto> = {}) =>
+      row({ id: OFF, source: 'manual', connectionId: CONN, funding: 'partner_key', ...over });
+
+    it('offers Remove only for a hand-added model', () => {
+      const { unmount } = render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.getByTestId('ai-offering-remove')).toBeTruthy();
+      unmount();
+      render(<OfferingDrawer offering={manualRow({ source: 'discovered' })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+    });
+
+    it('hides Remove on an env-managed connection (the API refuses it)', () => {
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} envManaged onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+    });
+
+    it('confirms, DELETEs the offering, then refreshes and closes', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes({ deleted: true, id: OFF }));
+      const onSaved = vi.fn();
+      const onClose = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      expect(fetchWithAuth).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(fetchWithAuth.mock.calls[0][0]).toBe(`/ai/models/offerings/${OFF}`);
+      expect(fetchWithAuth.mock.calls[0][1].method).toBe('DELETE');
+      expect(onSaved).toHaveBeenCalled();
+    });
+
+    it('keeps the drawer open and shows the server reason when the model is still in use', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes(
+        { error: 'This model is still used by a feature, a fallback list or an agent. Remove it from those first.', code: 'offering_in_use' },
+        409,
+      ));
+      const onClose = vi.fn();
+      const onSaved = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'error', message: expect.stringContaining('still used'),
+      })));
+      expect(onClose).not.toHaveBeenCalled();
+      expect(onSaved).not.toHaveBeenCalled();
+    });
+
+    it('reloads and closes when the model was already removed elsewhere (404)', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes({ error: 'Model not found.', code: 'not_found' }, 404));
+      const onSaved = vi.fn();
+      const onClose = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(onSaved).toHaveBeenCalled();
+    });
+
+    it('hides Remove for platform and catalog models', () => {
+      for (const source of ['platform', 'catalog'] as const) {
+        const { unmount } = render(<OfferingDrawer offering={manualRow({ source })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+        expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+        unmount();
+      }
+    });
+  });
+
+  // The Drawer primitive adds no body padding or scroll: the caller owns both,
+  // and the footer must sit outside the scroll area so Save is never clipped.
+  it('pads and scrolls its body, with the actions in a footer outside it', () => {
+    render(<OfferingDrawer offering={row()} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+    const body = screen.getByTestId('ai-offering-drawer-body');
+    expect(body.className).toMatch(/\boverflow-y-auto\b/);
+    expect(body.className).toMatch(/\bpx-5\b/);
+    const footer = screen.getByTestId('ai-offering-drawer-footer');
+    expect(body.contains(footer)).toBe(false);
+    expect(footer.contains(screen.getByTestId('ai-offering-save'))).toBe(true);
+  });
 });

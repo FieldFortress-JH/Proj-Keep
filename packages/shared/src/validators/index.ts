@@ -1,5 +1,6 @@
 import { CONFIG_FEATURE_TYPES } from '../constants/configFeatureTypes';
 import { z } from 'zod';
+import { applicationProvidersSchema } from './eventLogProviders';
 import {
   ACTOR_TYPES,
   AUDIT_RESULTS,
@@ -28,15 +29,21 @@ export * from './remoteAccessLauncherScheme';
 export * from './httpUrl';
 export * from './currency';
 export * from './remoteAccessInlineSettings';
+export * from './ringFeatureUpdates';
 export * from './warrantyInlineSettings';
+export * from './systemProtectionInlineSettings';
+export * from './securityAgents';
+export * from './securityScanSweep';
 export * from './safeRelativePath';
 export * from './authenticator';
 export * from './catalog';
 export * from './invoices';
 export * from './contracts';
+export * from './relatedContracts';
 export * from './workTypes';
 export * from './mlFeedback';
 export * from './quotes';
+export * from './agreementRequests';
 export * from './contractTemplates';
 export * from './scriptProposals';
 export * from './maintenanceWindow';
@@ -46,13 +53,16 @@ export * from './aiApprovalSettings';
 export * from './softwareDetection';
 export * from './softwareExitCodes';
 export * from './softwareDownloadPolicy';
+export * from './softwareVersionInstallSpec';
 export * from './systemCleanup';
 export * from './psa';
 export * from './deviceRoles';
 export * from './deviceFunctions';
 export * from './customFieldImport';
 export * from './alertRuleConditions';
+export * from './eventLogProviders';
 export * from './complianceInlineSettings';
+export * from './mcpDomains';
 
 // ============================================
 // Device Roles
@@ -429,6 +439,14 @@ export const vpnProviderSchema = z.enum([
   'zerotier',
   'openvpn',
   'cloudflare-warp',
+  // Enterprise VPN / SSE clients (#8763). Closed enum: an API older than the
+  // agent drops entries with a provider it doesn't know (per-entry salvage in
+  // routes/agents/inventory.ts), so ship the API before promoting the agent.
+  'zscaler',
+  'globalprotect',
+  'cisco-secure-client',
+  'forticlient',
+  'netskope',
   'generic'
 ]);
 
@@ -599,12 +617,18 @@ const patchSourceValueSchema = z.enum([
  */
 const PROVIDERLESS_PATCH_SOURCES = new Set<string>(['firmware', 'drivers']);
 
+// Length in UTF-16 code units (an astral char counts twice). zod <=4.5 measured
+// `.max()` this way; zod >=4.6 counts code points. The ring app-rules backfill
+// migration (2026-12-26-230000) emulates the UTF-16 rule in SQL, so it is
+// pinned explicitly rather than left to the zod version.
+const utf16Max = (max: number) => (v: string) => v.length <= max;
+
 export const policyAppRuleSchema = z.object({
   source: z.enum(['third_party', 'custom']),
-  packageId: z.string().min(1).max(256),
-  displayName: z.string().max(255).optional(),
+  packageId: z.string().min(1).refine(utf16Max(256), { message: 'Too long: expected <=256 characters' }),
+  displayName: z.string().refine(utf16Max(255), { message: 'Too long: expected <=255 characters' }).optional(),
   action: z.enum(['block', 'pin']),
-  pinnedVersion: z.string().min(1).max(64).optional(),
+  pinnedVersion: z.string().min(1).refine(utf16Max(64), { message: 'Too long: expected <=64 characters' }).optional(),
 }).superRefine((data, ctx) => {
   if (data.action === 'pin' && !data.pinnedVersion) {
     ctx.addIssue({
@@ -633,8 +657,8 @@ export function canonicalAppRuleKey(source: string, packageId: string): string {
 
 /**
  * Update Ring per-app block/pin rules — `patch_policies.app_rules` (#8184).
- * Same element type as the policy-level `apps` list, max 200, unique by
- * `canonicalAppRuleKey`.
+ * Element type `policyAppRuleSchema` (the retired policy-level `apps` list
+ * used the same one), max 200, unique by `canonicalAppRuleKey`.
  */
 export const ringAppRulesSchema = z.array(policyAppRuleSchema).max(200).superRefine((rules, ctx) => {
   const seen = new Set<string>();
@@ -761,12 +785,75 @@ export function mergeRingAutoApproveWrite(
   };
 }
 
+// #8030: restart-prompt text limits. Mirrored by the varchar(n) lengths on
+// config_policy_patch_settings (lengths only — the content rules below are not
+// DB-enforced, which is why the API load and dispatch paths re-validate per
+// field) and by the agent's SanitizeRebootPromptText, which drops (never
+// truncates) a field that fails and falls back to the built-in text.
+export const REBOOT_PROMPT_TITLE_MAX = 100;
+export const REBOOT_PROMPT_BODY_MAX = 500;
+export const REBOOT_PROMPT_BUTTON_MAX = 40;
+/** The one placeholder the agent substitutes, with the time left until restart. */
+export const REBOOT_PROMPT_COUNTDOWN_PLACEHOLDER = '{{countdown}}';
+
+/**
+ * One optional piece of restart-prompt text. Blank, whitespace-only, null and
+ * absent all canonicalize to null — "use the built-in text" — so the stored row,
+ * the partner export and the revision hash never disagree about an unset field.
+ *
+ * Plain text only. The prompt is rendered by MessageBox/toast XML on Windows,
+ * AppleScript on macOS and zenity/notify-send on Linux; notify-send has no
+ * reliable way to switch markup off, so `<` and `>` are refused outright rather
+ * than escaped differently per OS. Control characters are refused too (newline
+ * and tab are allowed in the body, which is multi-line). `{{...}}` is refused
+ * unless it is exactly {{countdown}}, so a typo reaches the operator as a
+ * validation error instead of reaching an end user verbatim.
+ */
+function restartPromptTextSchema(max: number, multiline: boolean) {
+  return z
+    .string()
+    .nullish()
+    .transform((value) => {
+      const trimmed = value?.trim() ?? '';
+      return trimmed === '' ? null : trimmed;
+    })
+    .pipe(
+      z
+        .string()
+        .max(max)
+        .refine((value) => !/[<>]/.test(value), {
+          message: 'Restart-prompt text is plain text: "<" and ">" are not allowed.',
+        })
+        .refine(
+          (value) => ![...value].some((ch) => {
+            const code = ch.codePointAt(0)!;
+            if (multiline && (ch === '\n' || ch === '\t')) return false;
+            return code < 0x20 || code === 0x7f;
+          }),
+          { message: 'Restart-prompt text must not contain control characters.' },
+        )
+        .refine(
+          (value) => value.replaceAll(REBOOT_PROMPT_COUNTDOWN_PLACEHOLDER, '').match(/\{\{|\}\}/) === null,
+          { message: 'The only supported placeholder is {{countdown}}.' },
+        )
+        .nullable(),
+    );
+}
+
+/** Per-field validators, for re-checking stored text at dispatch time. */
+export const rebootPromptTextSchemas = {
+  title: restartPromptTextSchema(REBOOT_PROMPT_TITLE_MAX, false),
+  body: restartPromptTextSchema(REBOOT_PROMPT_BODY_MAX, true),
+  button: restartPromptTextSchema(REBOOT_PROMPT_BUTTON_MAX, false),
+} as const;
+
+// #8188 (#1317 W04): auto-approval and per-app block/pin rules are owned by
+// the Update Ring (patch_policies.auto_approve / app_rules). The retired
+// policy-level keys (autoApprove, autoApproveSeverities,
+// autoApproveDeferralDays, apps) are no longer defined here, so a payload that
+// still carries them has them stripped rather than validated or stored.
 export const patchInlineSettingsSchema = z.object({
   sources: z.array(patchSourceValueSchema).min(1).default(['os']),
-  autoApprove: z.boolean().default(false),
-  autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).default([]),
-  autoApproveDeferralDays: z.number().int().min(0).max(60).default(0),
-  apps: z.array(policyAppRuleSchema).max(200).default([]),
   scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).default('weekly'),
   scheduleTime: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/).default('02:00'),
   scheduleDayOfWeek: z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']).default('sun'),
@@ -787,19 +874,17 @@ export const patchInlineSettingsSchema = z.object({
   rebootAllowDeferral: z.boolean().default(false),
   rebootMaxDeferrals: z.number().int().min(0).max(10).default(3),
   rebootDeferralMinutes: z.number().int().min(5).max(1440).default(60),
+  // #8030: optional replacement text for the end-user restart prompt, so an
+  // MSP can warn users in their own language. null keeps the agent's built-in
+  // English copy byte-for-byte. Plain text only: see restartPromptTextSchema.
+  rebootPromptTitle: rebootPromptTextSchemas.title,
+  rebootPromptBody: rebootPromptTextSchemas.body,
+  rebootPromptButton: rebootPromptTextSchemas.button,
   // #1872: enforce Breeze as the sole patch source on Windows endpoints. When
   // true the agent suppresses the native Windows Update automatic-install
   // channel (NoAutoUpdate=1); Breeze's own WUA-driven installs are unaffected.
   exclusiveWindowsUpdate: z.boolean().default(false),
 }).superRefine((data, ctx) => {
-  if (data.autoApprove && data.autoApproveSeverities.length === 0) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['autoApproveSeverities'],
-      message: 'Select at least one severity for auto-approval.',
-    });
-  }
-
   if (data.sources.length > 0 && data.sources.every((s) => PROVIDERLESS_PATCH_SOURCES.has(s))) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -836,22 +921,6 @@ export const patchInlineSettingsSchema = z.object({
       message: 'rebootDelayMinutes + rebootMaxDeferrals x rebootDeferralMinutes must not exceed 10080 minutes (7 days).',
     });
   }
-
-  const seen = new Set<string>();
-  for (const [i, app] of data.apps.entries()) {
-    // The approval evaluator matches 'third_party' and 'custom' as a single
-    // bucket, so canonicalize the source when deduping to mirror that.
-    const canonicalSource = app.source === 'custom' ? 'third_party' : app.source;
-    const key = `${canonicalSource}|${app.packageId.toLowerCase()}`;
-    if (seen.has(key)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['apps', i],
-        message: 'Duplicate app rule for the same source and package.',
-      });
-    }
-    seen.add(key);
-  }
 });
 
 export * from './hardwareHealth';
@@ -859,6 +928,7 @@ export * from './timeSync';
 export * from './workloads';
 
 export const eventLogInlineSettingsSchema = z.object({
+  applicationProviders: applicationProvidersSchema,
   retentionDays: z.number().int().min(7).max(365).default(30),
   maxEventsPerCycle: z.number().int().min(10).max(500).default(100),
   collectCategories: z.array(z.enum(['security', 'hardware', 'application', 'system'])).min(1).default(['security', 'hardware', 'application', 'system']),
@@ -994,6 +1064,8 @@ export * from './aiAgents';
 export * from './aiAgentGraduation';
 export * from './aiAgentSchedules';
 export * from './aiOperator';
+export * from './aiOperatorIdentity';
+export * from './aiOperatorOnboarding';
 export * from './orgNarrative';
 export * from './fleetDesign';
 export * from './fleetDesignApply';
@@ -1017,6 +1089,7 @@ export * from './scriptParameterDefinitions';
 // ============================================
 
 export * from './tickets';
+export * from './alertExternalRefs';
 export * from './ticketForms';
 export * from './queryParams';
 export * from './timeEntries';
@@ -1060,6 +1133,7 @@ export {
   type CreateBackupProfileInput,
   type UpdateBackupProfileInput,
 } from './backupTargets';
+export * from './backupDestinationPrefix';
 export {
   deliverableCadenceSchema,
   deliverableCompletionModeSchema,
@@ -1068,17 +1142,22 @@ export {
   listDeliverablesQuerySchema,
   reportRunEvidenceRefSchema,
   documentEvidenceRefSchema,
+  contractDocumentEvidenceRefSchema,
   evidenceRefSchema,
   addEvidenceSchema,
   deliverOccurrenceSchema,
   waiveOccurrenceSchema,
   rescheduleOccurrenceSchema,
+  bulkRescheduleOccurrencesSchema,
   listOccurrencesQuerySchema,
+  moveDeliverablesSchema,
+  type MoveDeliverablesInput,
   type CreateDeliverableInput,
   type UpdateDeliverableInput,
   type DeliverOccurrenceInput,
   type WaiveOccurrenceInput,
   type RescheduleOccurrenceInput,
+  type BulkRescheduleOccurrencesInput,
   type AddEvidenceInput,
   type EvidenceRef,
 } from './serviceDeliverables';
@@ -1100,6 +1179,10 @@ export {
   checklistTemplateItemReorderSchema,
   listChecklistTemplatesQuerySchema,
   applyChecklistTemplateSchema,
+  saveChecklistAsTemplateSchema,
+  duplicateChecklistTemplateSchema,
+  type SaveChecklistAsTemplateInput,
+  type DuplicateChecklistTemplateInput,
   type ChecklistTemplateOwnerScope,
   type CreateChecklistTemplateInput,
   type UpdateChecklistTemplateInput,
@@ -1118,6 +1201,7 @@ export {
   listTemplateSetsQuerySchema,
   applyTemplateSetSchema,
   MANAGED_EVIDENCE_REPORT_TYPES,
+  defaultPortalVisibleForCadence,
   type ManagedEvidenceReportType,
   type CreateTemplateItemInput,
   type UpdateTemplateItemInput,
@@ -1161,6 +1245,8 @@ export * from './topologyCollection';
 
 export * from './topologyConfiguration';
 
+export * from './topologyPresence';
+
 export * from './topologyDiagnostics';
 
 export { canonicalizeTopologyContext, canonicalizeTopologySection } from './topologyCollectionCanonical';
@@ -1169,6 +1255,9 @@ export { canonicalizeTopologyContext, canonicalizeTopologySection } from './topo
 export * from './topologyPhysical';
 export * from './topologyPhysicalNormalized';
 export * from './topologyUnifiNormalized';
+export * from './topologyUnifiV2';
+export * from './topologyUnifiV2Normalized';
+export { canonicalizeUnifiResourceV2 } from './topologyUnifiV2Canonical';
 export { canonicalizeAdjacencyReport, canonicalizeAdjacencyScope, canonicalizeUnifiResource } from './topologyPhysicalCanonical';
 export type { AdjacencyDigestIdentity, UnifiDigestIdentity } from './topologyPhysicalCanonical';
 
@@ -1315,6 +1404,8 @@ export const maintenanceInlineSettingsSchema = z
 
 export type MaintenanceInlineSettings = z.infer<typeof maintenanceInlineSettingsSchema>;
 export * from './callerVerification';
+export * from './endpointMessage';
+export * from './endpointChat';
 
 // Business reports (#3198 W02)
 export * from './businessReports';
@@ -1327,3 +1418,21 @@ export * from './aiModelOptions';
 export * from './aiModelChoice';
 export * from './aiModelRegistryApi';
 export * from './autopay';
+export * from './flows';
+export * from './businessCalendars';
+export * from './ticketRouting';
+export * from './trustCenter';
+export * from './trustCenterDeclarations';
+export * from './trustCenterAccess';
+export * from './trustCenterContent';
+export * from './trustCenterTemplate';
+export * from './trustCenterEmbed';
+export * from './launchPurchaseSelection';
+export * from './wispConcerns';
+export * from './wispNudgePreferences';
+export * from './wispSpecialists';
+export * from './wisp';
+export * from './flowRuns';
+export * from './flowBudgets';
+export * from './flowWebhooks';
+export * from './flowConversions';

@@ -23,7 +23,7 @@ var allCommandTypes = []string{
 	tools.CmdRegistryKeys, tools.CmdRegistryValues, tools.CmdRegistryGet,
 	tools.CmdRegistrySet, tools.CmdRegistryDelete,
 	tools.CmdRegistryKeyCreate, tools.CmdRegistryKeyDelete,
-	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdWakeOnLan,
+	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdForceReboot, tools.CmdWakeOnLan,
 	tools.CmdRefreshInventory,
 	tools.CmdCollectSoftware, tools.CmdSoftwareUninstall, tools.CmdSoftwareInstall, tools.CmdSoftwareUpdate,
 
@@ -85,6 +85,9 @@ var allCommandTypes = []string{
 	tools.CmdHypervDiscover, tools.CmdHypervBackup, tools.CmdHypervRestore,
 	tools.CmdHypervCheckpoint, tools.CmdHypervVMState,
 
+	// handlers_vault_forward.go init()
+	tools.CmdVaultSync, tools.CmdVaultStatus, tools.CmdVaultConfigure,
+
 	// handlers_systemstate_forward.go init()
 	tools.CmdSystemStateCollect, tools.CmdHardwareProfile,
 
@@ -93,7 +96,10 @@ var allCommandTypes = []string{
 	tools.CmdBMRRecover, tools.CmdBareMetalRebuild,
 
 	// handlers_user.go init()
-	CmdNotifyUser, CmdTrayUpdate,
+	CmdNotifyUser, CmdTrayUpdate, CmdRetractMessage,
+	CmdChatOpen, CmdChatMessage, CmdChatClose,
+	// caller_verify.go (#6354 W02)
+	cmdCallerVerify,
 
 	// handlers.go — log shipping
 	tools.CmdSetLogLevel,
@@ -142,6 +148,10 @@ var allCommandTypes = []string{
 	// handlers_actuate.go init() — PAM Track 5
 	tools.CmdActuateElevation,
 	tools.CmdPamApplyV2, tools.CmdPamCleanupV2,
+	tools.CmdPamReconcileV2,
+
+	// handlers_pam_notify.go init() — #8928 outcome notices
+	tools.CmdPamRequestNotify,
 
 	// handlers_encryption.go init()
 	tools.CmdEncryptionCollectKeys, tools.CmdEncryptionRotateKey,

@@ -60,6 +60,10 @@ export type StepUpOperation =
   // operator was shown, so a grant can never be replayed against a different
   // device, destination, or billing acknowledgement.
   | 'device_move_org'
+  // #8729 "Force reboot now": an immediate reboot that force-closes running
+  // apps and discards unsaved work. Bound by resourceDigest to { deviceId }, so
+  // a grant minted for one device can never force-reboot another. Single-use.
+  | 'device_force_reboot'
   // Parked-device assignment: moving a device out of the partner's holding
   // area into a customer org. Single: bound to { deviceId, targetOrgId,
   // targetSiteId }. Bulk: ONE grant bound to the whole sorted batch — a
@@ -132,7 +136,24 @@ export type StepUpOperation =
   // partner's (cap, schedule, fees, payment methods, reminders). Asked for only
   // when a saved value differs from the stored one; bound to the organization
   // AND to the exact values saved, like partner_payment_settings_update.
-  | 'org_payment_settings_update';
+  | 'org_payment_settings_update'
+  // Ticket migration windows (#8313): opening a window widens a keyless
+  // partner service principal into import mode across the chosen orgs. Bound
+  // to the exact { partnerId, principalId, sorted orgIds, endsAt,
+  // writesPerHour } the admin confirmed, so a grant can never open a wider,
+  // longer or faster window than the one shown.
+  | 'migration_window_open'
+  // Caller verification (#6354 W05): an administrative disable authorised by
+  // an interactive step-up instead of a caller challenge. Bound to the exact
+  // { orgId, Entra tenant, Entra OID, reason } the technician confirmed.
+  | 'caller_verification_administrative_disable'
+  // Wisp W02 (Wisp design §4.2): creating or refreshing (widening) a
+  // delegation grant. Bound by resourceDigest to the grantor (always the
+  // caller), the anchor partner, the scope org ('*' = partner-wide) and the
+  // server-computed ceiling hash the user was shown (GET /wisp/grants/preview),
+  // so a grant can never be spent on a different scope or a wider ceiling.
+  // TTL 600 s (OPERATION_TTL_SECONDS below).
+  | 'wisp_grant';
 
 export interface StepUpGrant {
   id: string;
@@ -177,6 +198,9 @@ const TTL_SECONDS = 300;
  */
 const OPERATION_TTL_SECONDS: Partial<Record<StepUpOperation, number>> = {
   approval_decide: 120,
+  // Wisp W02: the grant-creation modal shows the ceiling preview, then the
+  // factor prompt, then the confirm — a longer single-use window (spec §4.2).
+  wisp_grant: 600,
 };
 
 /** Redis TTL a grant of this operation is written with. */
@@ -195,6 +219,34 @@ function bindsMatch(record: GrantBind, bind: GrantBind): boolean {
     && (record.resourceDigest ?? '') === (bind.resourceDigest ?? '');
 }
 
+/**
+ * Canonical form of a uuid id inside a resource digest (#10119). Postgres
+ * renders a `uuid` column lowercase, but a client may send any case in a path
+ * segment or a request body, so the mint and the redeeming route would
+ * otherwise hash two different strings for the same device and the grant could
+ * never be spent: an unrecoverable 403 `STEP_UP_REQUIRED`.
+ *
+ * Only ever apply this to a field that is uuid-typed AT ITS SOURCE — a Zod
+ * `.uuid()` on the binding schema, or a uuid column. Case is not significant
+ * in a uuid, so folding it loses nothing. It IS significant in free text: a
+ * maintenance `reason`, a rollback version string, an Entra tenant or object id
+ * (`z.string().min(1).max(64)`, never uuid-validated) must be hashed as given,
+ * or two genuinely different bindings could collapse onto one digest.
+ */
+export function canonicalId(id: string): string {
+  return id.trim().toLowerCase();
+}
+
+/**
+ * The same, for an array of uuid ids. Folds BEFORE dedup and sort, which is the
+ * order that matters: `[...new Set(ids)].sort()` on raw input keeps two
+ * spellings of one device as two entries, and sorts uppercase ahead of
+ * lowercase, so the digest depends on how the caller typed the ids.
+ */
+export function canonicalIds(ids: readonly string[]): string[] {
+  return [...new Set(ids.map(canonicalId))].sort();
+}
+
 export function rollbackResourceDigest(input: {
   deviceId: string;
   currentVersion: string;
@@ -203,7 +255,7 @@ export function rollbackResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     currentVersion: input.currentVersion,
-    deviceId: input.deviceId,
+    deviceId: canonicalId(input.deviceId),
     reason: input.reason,
     targetVersion: input.targetVersion,
   });
@@ -231,10 +283,21 @@ export function maintenanceResourceDigest(input: {
   durationHours: number;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
-    deviceIds: [...new Set(input.deviceIds)].sort(),
+    deviceIds: canonicalIds(input.deviceIds),
     durationHours: input.durationHours,
     reason: input.reason.trim(),
   });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Canonical digest for a `device_force_reboot` grant (#8729): the device id
+ * alone, so a grant minted for one device can never force-reboot another.
+ * Lowercased so the mint and the route agree whatever case each was given
+ * the uuid in (#9380 review).
+ */
+export function forceRebootResourceDigest(input: { deviceId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ deviceId: canonicalId(input.deviceId) });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
@@ -257,9 +320,9 @@ export function moveOrgResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     acceptCurrencyMismatch: input.acceptCurrencyMismatch === true,
-    deviceId: input.deviceId,
-    targetOrgId: input.targetOrgId,
-    targetSiteId: input.targetSiteId,
+    deviceId: canonicalId(input.deviceId),
+    targetOrgId: canonicalId(input.targetOrgId),
+    targetSiteId: canonicalId(input.targetSiteId),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -274,9 +337,9 @@ export interface ParkedAssignResource {
 export function parkedAssignResourceDigest(input: ParkedAssignResource): `sha256:${string}` {
   const canonical = JSON.stringify({
     kind: 'parked_device_assign',
-    deviceId: input.deviceId,
-    targetOrgId: input.targetOrgId,
-    targetSiteId: input.targetSiteId,
+    deviceId: canonicalId(input.deviceId),
+    targetOrgId: canonicalId(input.targetOrgId),
+    targetSiteId: canonicalId(input.targetSiteId),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -288,7 +351,7 @@ export function parkedAssignResourceDigest(input: ParkedAssignResource): `sha256
  */
 export function parkedBulkAssignResourceDigest(items: readonly ParkedAssignResource[]): `sha256:${string}` {
   const sorted = [...items]
-    .map((item) => ({ deviceId: item.deviceId, targetOrgId: item.targetOrgId, targetSiteId: item.targetSiteId }))
+    .map((item) => ({ deviceId: canonicalId(item.deviceId), targetOrgId: canonicalId(item.targetOrgId), targetSiteId: canonicalId(item.targetSiteId) }))
     .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
   const canonical = JSON.stringify({ kind: 'parked_device_assign_bulk', items: sorted });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
@@ -296,7 +359,7 @@ export function parkedBulkAssignResourceDigest(items: readonly ParkedAssignResou
 
 /** Binding for turning ON deploy-key enrollment for one partner. */
 export function preAssignmentEnableResourceDigest(input: { partnerId: string }): `sha256:${string}` {
-  const canonical = JSON.stringify({ kind: 'pre_assignment_enable', partnerId: input.partnerId, enabled: true });
+  const canonical = JSON.stringify({ kind: 'pre_assignment_enable', partnerId: canonicalId(input.partnerId), enabled: true });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
@@ -350,7 +413,7 @@ export function scriptLanePolicyResourceDigest(input: {
   widening?: ScriptLaneWideningDelta;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
-    orgId: input.orgId,
+    orgId: canonicalId(input.orgId),
     unattendedEnabled: input.unattendedEnabled,
     reset: input.reset === true,
     widening: canonicalWidening(input.widening),
@@ -370,7 +433,7 @@ export function partnerScriptCeilingResourceDigest(input: {
   widening?: ScriptLaneWideningDelta;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
-    partnerId: input.partnerId,
+    partnerId: canonicalId(input.partnerId),
     unattendedAllowed: input.unattendedAllowed,
     widening: canonicalWidening(input.widening),
   });
@@ -385,8 +448,8 @@ export function topologyArmResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     action: input.action,
-    siteId: input.siteId.toLowerCase(),
-    subjectId: input.subjectId.toLowerCase(),
+    siteId: canonicalId(input.siteId),
+    subjectId: canonicalId(input.subjectId),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -403,8 +466,8 @@ export function unattestedRestoreResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     commandType: input.commandType,
-    snapshotDbId: input.snapshotDbId.toLowerCase(),
-    targetDeviceId: input.targetDeviceId.toLowerCase(),
+    snapshotDbId: canonicalId(input.snapshotDbId),
+    targetDeviceId: canonicalId(input.targetDeviceId),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -425,7 +488,7 @@ function canonicalValue(value: unknown): unknown {
 
 /** Charge-now step-up binding: one invoice. */
 export function autopayChargeNowResourceDigest(input: { invoiceId: string }): `sha256:${string}` {
-  const canonical = JSON.stringify({ kind: 'autopay_charge_now', invoiceId: input.invoiceId.toLowerCase() });
+  const canonical = JSON.stringify({ kind: 'autopay_charge_now', invoiceId: canonicalId(input.invoiceId) });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
@@ -440,7 +503,7 @@ export function partnerPaymentSettingsResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     kind: 'partner_payment_settings_update',
-    partnerId: input.partnerId.toLowerCase(),
+    partnerId: canonicalId(input.partnerId),
     settings: canonicalValue(input.settings),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
@@ -458,8 +521,31 @@ export function orgPaymentSettingsResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     kind: 'org_payment_settings_update',
-    orgId: input.orgId.toLowerCase(),
+    orgId: canonicalId(input.orgId),
     settings: canonicalValue(input.settings),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Migration window open binding (#8313): the partner, the principal, the
+ * deduplicated sorted org set, the end (normalised to ISO) and the throughput
+ * as requested (null when the admin left the default), independent of order.
+ */
+export function migrationWindowOpenResourceDigest(input: {
+  partnerId: string;
+  principalId: string;
+  orgIds: readonly string[];
+  endsAt: string;
+  writesPerHour?: number | null;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'migration_window_open',
+    partnerId: canonicalId(input.partnerId),
+    principalId: canonicalId(input.principalId),
+    orgIds: canonicalIds(input.orgIds),
+    endsAt: new Date(input.endsAt).toISOString(),
+    writesPerHour: input.writesPerHour ?? null,
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -476,14 +562,42 @@ export function autopayRequestRecipientResourceDigest(input: {
   const canonical = JSON.stringify({
     kind: 'autopay_request_recipient',
     mode: input.mode ?? 'request',
-    orgIds: [...new Set(input.orgIds.map(id => id.toLowerCase()))].sort(),
+    orgIds: canonicalIds(input.orgIds),
     recipientOverride: input.recipientOverride,
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
+export function callerVerificationAdministrativeDigest(input: {
+  orgId: string; entraTenantId: string; entraOid: string; reason: string;
+}): `sha256:${string}` {
+  const reasonHash = createHash('sha256').update(input.reason.trim()).digest('hex');
+  // Only `orgId` is folded: it is `z.string().uuid()`. `entraTenantId` and
+  // `entraOid` are `z.string().min(1).max(64)` and never uuid-validated, so they
+  // are hashed exactly as given (#10119).
+  const canonical = [canonicalId(input.orgId), input.entraTenantId, input.entraOid, reasonHash].join('|');
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Wisp W02 grant binding (w00 "Flags, env, permissions"): canonical
+ * `${grantorUserId}:${partnerId}:${orgId ?? '*'}:${requestedCeilingHash}`.
+ * The grantor is always the authenticated caller, never a body field.
+ */
+export function wispGrantResourceDigest(input: {
+  grantorUserId: string;
+  partnerId: string;
+  orgId: string | null;
+  requestedCeilingHash: string;
+}): `sha256:${string}` {
+  // `requestedCeilingHash` is a server-computed `^[a-f0-9]{64}$` digest, not an
+  // id, so it is left exactly as given (#10119).
+  const canonical = `${canonicalId(input.grantorUserId)}:${canonicalId(input.partnerId)}:${input.orgId === null ? '*' : canonicalId(input.orgId)}:${input.requestedCeilingHash}`;
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
 export function passkeyRemovalResourceDigest(passkeyId: string): `sha256:${string}` {
-  const canonical = JSON.stringify({ passkeyId });
+  const canonical = JSON.stringify({ passkeyId: canonicalId(passkeyId) });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 

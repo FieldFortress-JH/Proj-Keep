@@ -462,10 +462,9 @@ patchJobRoutes.get(
             },
             settings: {
               sources: effective.settings.sources,
-              autoApprove: effective.settings.autoApprove,
-              autoApproveSeverities: effective.settings.autoApproveSeverities ?? [],
-              autoApproveDeferralDays: effectivePolicyLocal?.settings.autoApproveDeferralDays ?? 0,
-              apps: effectivePolicyLocal?.settings.apps ?? [],
+              // The ring owns auto-approval and app rules (#8186, #8188); see
+              // approvalRing below.
+              apps: effectivePolicyLocal?.ring.appRules ?? [],
               scheduleFrequency: effective.settings.scheduleFrequency,
               scheduleTime: effective.settings.scheduleTime,
               scheduleDayOfWeek: effective.settings.scheduleDayOfWeek,

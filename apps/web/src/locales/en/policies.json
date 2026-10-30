@@ -158,7 +158,9 @@
       "of2": "of",
       "itsOwningOrganization": "its owning organization",
       "organizationPolicyTitle": "Organization policy — applies only to {{organization}}",
-      "summary": "{{filtered}} of {{total}} policies"
+      "summary": "{{filtered}} of {{total}} policies",
+      "partnerPolicy": "Partner",
+      "partnerPolicyAppliesOnlyWhereAssigned": "Partner policy — applies only where it is assigned. Assign it to all organizations to make it partner-wide."
     },
     "configurationPoliciesPage": {
       "failedToFetchConfigurationPolicies": "Failed to fetch configuration policies",
@@ -198,7 +200,9 @@
       "appliedToAllOrganizationsUncheckAllOrganizations": "Applied to all organizations. Uncheck “All organizations” to pick a subset.",
       "polite": "polite",
       "loading": "Loading…",
-      "loadMoreOrganizations": "Load more organizations"
+      "loadMoreOrganizations": "Load more organizations",
+      "appliedToAllOrgs": "Policy now applies to all organizations",
+      "removedFromAllOrgs": "Policy no longer applies to all organizations"
     },
     "featureTabs": {
       "automationTab": {
@@ -354,7 +358,11 @@
         "pathPrefix": "Path Prefix",
         "optional": "(optional)",
         "backupsBreeze": "backups/breeze/",
-        "keyPrefixForOrganizingObjectsInThe": "Key prefix for organizing objects in the bucket.",
+        "keyPrefixHelp": "Key prefix for this destination. New snapshots are stored under <prefix>/snapshots/. Existing snapshots stay where they are. Changing it makes the next backup a full backup.",
+        "keyPrefixInvalidTooLong": "Invalid key prefix: it must be at most {{max}} characters.",
+        "keyPrefixInvalidSegment": "Invalid key prefix: it must not contain empty, \".\" or \"..\" segments.",
+        "keyPrefixInvalidCharacters": "Invalid key prefix: use only letters, digits and ! _ . * ' ( ) - in each segment, separated by /.",
+        "keyPrefixInvalidReserved": "Invalid key prefix: it must not contain a \"snapshots\" segment.",
         "customEndpoint": "Custom Endpoint",
         "optional2": "(optional)",
         "httpsS3UsWest002Backblazeb2Com": "https://s3.us-west-002.backblazeb2.com",
@@ -666,7 +674,18 @@
         "maxEventsPerCycle2": "maxEventsPerCycle",
         "minimumLevel": "minimumLevel",
         "collectionIntervalMinutes2": "collectionIntervalMinutes",
-        "rateLimitPerHour2": "rateLimitPerHour"
+        "rateLimitPerHour2": "rateLimitPerHour",
+        "applicationProvidersHeading": "Application providers (Warning and Information)",
+        "applicationProvidersHelp": "Error and Critical Application events are collected from every provider; Warning and Information events only from the built-in providers ({{providers}}) and the providers listed here. Use the exact provider name shown in Event Viewer’s \"Source\" column or Get-WinEvent -ListProvider.",
+        "applicationProvidersScope": "Only the single winning Event Logs policy for a device applies. Provider lists are not combined across policies.",
+        "providerNameLabel": "Application event provider name",
+        "addProvider": "Add provider",
+        "removeProvider": "Remove",
+        "removeProviderNamed": "Remove {{provider}}",
+        "providerNameInvalid": "Use 1–{{max}} characters, starting with a letter or digit. Allowed: letters, digits, spaces, periods, underscores, dollar signs, parentheses and hyphens.",
+        "providerLimitReached": "You can list up to {{max}} additional providers. Remove one to add another.",
+        "providerAlreadyListed": "This provider is already listed.",
+        "providerLimit": "{{total}} of {{max}} additional providers"
       },
       "featureTabShell": {
         "override": "Override",
@@ -701,7 +720,11 @@
         "showOpenPortal": "showOpenPortal",
         "showDeviceInfo": "showDeviceInfo",
         "showRequestSupport": "showRequestSupport",
-        "portalUrl": "portalUrl"
+        "portalUrl": "portalUrl",
+        "endpointMessaging": "Endpoint messaging",
+        "endpointMessagingHelp": "Lets technicians send messages to the person at the device.",
+        "allowUserReply": "Allow replies from the user",
+        "allowUserReplyHelp": "Lets the person at the device reply in a chat a technician starts. When off, chats are one-way."
       },
       "inlineEntityPicker": {
         "search": "Search...",
@@ -735,7 +758,7 @@
         "muteAlertNotificationsDuringWindow": "No new alerts are created during the window.",
         "suppressAlerts2": "suppressAlerts",
         "suppressPatching": "Suppress patching",
-        "delayPatchInstallationsDuringWindow": "Delay patch installations during window.",
+        "delayPatchInstallationsDuringWindow": "Installs scheduled during the window are skipped and run at the next scheduled occurrence.",
         "suppressPatching2": "suppressPatching",
         "suppressAutomations": "Suppress automations",
         "pauseAutomationRunsDuringWindow": "Pause automation runs during window.",
@@ -744,15 +767,16 @@
         "pauseScriptExecutionDuringWindow": "Pause script execution during window.",
         "suppressScripts2": "suppressScripts",
         "rebootIfARebootIsPending": "Reboot if a reboot is pending",
-        "duringTheWindowRebootDevicesThatHave": "During the window, reboot devices that have a pending reboot. Windows warns the signed-in user ~5 minutes before rebooting; Linux schedules the reboot 15 minutes out with a warning to signed-in users. macOS is not supported.",
+        "duringTheWindowRebootDevicesThatHave": "During the window, reboot devices that have a pending reboot. The warning period comes from the device's patch policy reboot delay. macOS is not supported.",
         "rebootIfPending": "rebootIfPending",
-        "maintenanceRebootIfPendingToggle": "maintenance-reboot-if-pending-toggle",
         "notifyOnStart": "Notify on start",
         "sendNotificationWhenWindowOpens": "Send notification when window opens.",
         "notifyOnStart2": "notifyOnStart",
         "notifyOnEnd": "Notify on end",
         "sendNotificationWhenWindowCloses": "Send notification when window closes.",
-        "notifyOnEnd2": "notifyOnEnd"
+        "notifyOnEnd2": "notifyOnEnd",
+        "weeklyOpensEverySunday": "Weekly windows open every Sunday at the start time, in the selected timezone.",
+        "monthlyOpensOnTheFirst": "Monthly windows open on the 1st of each month at the start time, in the selected timezone."
       },
       "monitorsTab": {
         "agentCollectionTitle": "Agent collection",
@@ -769,6 +793,7 @@
         "overridesLabel": "Overrides:",
         "failedToLoadMonitors": "Failed to load monitors",
         "createMonitor": "Create monitor",
+        "notAttachable": "This monitor can't be attached to this policy. Partner-owned policies can only use partner-wide monitors.",
         "monitorDeleted": "Monitor deleted",
         "recommended": {
           "title": "Recommended monitors",
@@ -791,25 +816,6 @@
         "approvalRulesLiveInThePAMConsole": "Approval rules live in the PAM console",
         "thisPolicyOnlyControlsWhetherDevicesCapture": "This policy only controls whether devices capture elevation prompts. Verdicts (auto-approve, deny, require approval), the request queue, and audit history are managed in the",
         "privilegedAccessConsole": "Privileged Access console"
-      },
-      "patchAppRulesSection": {
-        "applicationRules": "Application Rules",
-        "blockSpecificApplicationsFromAutomatedPatchingOr": "Block specific applications from automated patching, or pin them to a maximum version.",
-        "blocked": "Blocked",
-        "pinned": "Pinned",
-        "maxVersion": "Max version",
-        "pinnedApplicationsNeedAVersion": "Pinned applications need a version.",
-        "addApplication": "Add application",
-        "searchCatalogAndDetectedApplications": "Search catalog and detected applications...",
-        "searching": "Searching...",
-        "catalog": "catalog",
-        "couldnTLoadApplicationsYouCanStill": "Couldn't load applications — you can still add by package ID below.",
-        "noMatches": "No matches.",
-        "orEnterAPackageIDManually": "Or enter a package ID manually",
-        "block": "block",
-        "pin": "pin",
-        "thirdParty": "third_party",
-        "removeRuleFor": "Remove rule for {{application}}"
       },
       "patchTab": {
         "daily": "Daily",
@@ -868,6 +874,13 @@
         "rebootMaxDeferralsDescription": "How many times one user may postpone a single restart before it proceeds.",
         "rebootDeferralMinutes": "Postpone by (minutes)",
         "rebootDeferralMinutesDescription": "How far each postponement pushes the restart out.",
+        "rebootPromptText": "Restart prompt text",
+        "rebootPromptTextDescription": "Optional. Replaces the wording of the restart warnings users see, for example to show them in your users' language. Leave a field blank to keep the built-in English text.",
+        "rebootPromptTitle": "Title",
+        "rebootPromptButton": "Restart button label",
+        "rebootPromptBody": "Message",
+        "rebootPromptBodyDescription": "Plain text. {{placeholder}} is replaced with the time left until the restart. Windows shows fixed Yes/No buttons, so there the button label is named in the message instead.",
+        "rebootPromptInvalid": "Restart prompt text must be plain text (no < or >, no line breaks in the title or button label) and may use no placeholder other than {{placeholder}}.",
         "windowsUpdateSource": "Windows Update Source",
         "manageWindowsUpdateExclusivelyThroughBreeze": "Manage Windows Update exclusively through Breeze",
         "suppressesTheEndpointSNativeWindowsUpdate": "Suppresses the endpoint's native Windows Update automatic-install channel so updates only flow through Breeze's approval rings — preventing unexpected reboots and patches outside your schedule. Windows-only; Breeze's own scan/approve/install path is unaffected. Reverts cleanly when disabled (a pre-existing admin Group Policy is left untouched).",
@@ -889,7 +902,25 @@
         "text2xl": "2xl",
         "saveChanges": "Save Changes",
         "createRing": "Create Ring",
-        "thirdPartyRingHint": "Auto-approval rules for third-party updates are configured on the linked Update Ring."
+        "thirdPartyRingHint": "Auto-approval rules for third-party updates are configured on the linked Update Ring.",
+        "ringOwnsApprovalHint": "Auto-approval and application rules are set on the linked Update Ring.",
+        "noRingManualApprovalHint": "No ring linked — patches install only after manual approval.",
+        "unavailableRingOption": "Unavailable ring",
+        "ringInvalidTitle": "The linked Update Ring is no longer available.",
+        "ringInvalidBody": "Patches for this policy are held until you choose a ring and save.",
+        "ringDetailsNoHold": "Rollout order {{order}} · no hold before approval",
+        "ringDetailsWithHold_one": "Rollout order {{order}} · {{count}}-day hold before approval",
+        "ringDetailsWithHold_other": "Rollout order {{order}} · {{count}}-day hold before approval",
+        "rebootPreviewHeading": "Preview",
+        "rebootPreviewDescription": "What the person at the computer sees if a restart is scheduled now. The times are examples.",
+        "rebootPreviewDefaultMarker": "Default",
+        "rebootPreviewDefaultTitle": "Restart to finish installing updates",
+        "rebootPreviewDefaultBody": "Your IT support team needs to restart this computer to finish installing updates.",
+        "rebootPreviewConsequence": "If you do nothing, this computer restarts at {{time}}. Save your work before then.",
+        "rebootPreviewRestartNow": "Restart now",
+        "rebootPreviewPostponeUntil": "Postpone until {{time}}",
+        "rebootPreviewDeadline": "Postponing never moves the restart later than {{time}}.",
+        "rebootPreviewOk": "OK"
       },
       "peripheralControlTab": {
         "linkPeripheralPolicy": "Link Peripheral Policy",
@@ -976,6 +1007,9 @@
         "showIndicatorHelp": "Show the on-screen banner while a technician is connected.",
         "notifyOnEnd": "Session-ended notice",
         "notifyOnEndHelp": "Notify the end user when the session ends.",
+        "allowUserEnd": "Let the user end the session",
+        "allowUserEndHelp": "The person at the device can end the session from the on-screen indicator, after a confirmation. The technician sees “Ended by the user”.",
+        "allowUserEndNeedsIndicator": "Turn on the active-session indicator to let users end a session.",
         "identityLevel": "Technician identity",
         "identityLevelHelp": "How much of the technician's identity the end user sees. The MSP name is always shown.",
         "identityNameEmail": "Name and email",
@@ -1016,7 +1050,25 @@
         "fullScan": "Full scan",
         "maxFileSizeMb": "Max file size (MB)",
         "scanTimeoutMinutes": "Scan timeout (minutes)",
-        "scanRunsServerSideDescription": "Breeze dispatches this scan from the server — the device does not need a local schedule."
+        "scanRunsServerSideDescription": "Breeze dispatches this scan from the server — the device does not need a local schedule.",
+        "ruleSets": {
+          "title": "Detection rule sets",
+          "description": "Rule sets this policy's IOC scans use.",
+          "manageLink": "Manage detection rules",
+          "loading": "Loading rule sets…",
+          "loadError": "Rule sets could not be loaded. The policy keeps its current rule sets; you can still save the other settings.",
+          "none": "No rule sets are available for this policy.",
+          "legacyNote": "No rule sets: scans use the built-in legacy signatures only.",
+          "cap": "A policy can use at most {{max}} rule sets.",
+          "unavailable": "Unavailable rule set",
+          "blocking": "This policy cannot use the unavailable rule sets (deleted, moved, or owned by another organization). Remove them before saving.",
+          "overrideDraft": "The inherited settings list rule sets this policy cannot use. Remove the unavailable rule sets, then Save.",
+          "errors": {
+            "tooMany": "A policy can use at most {{max}} rule sets.",
+            "invalidIds": "The rule set list is not valid. Reload the page and try again.",
+            "notAttachable": "This policy cannot use some of the selected rule sets. They are highlighted below."
+          }
+        }
       },
       "sensitiveDataTab": {
         "credentials": "Credentials",
@@ -1109,14 +1161,56 @@
         "thisPolicyOnlyControlsWhetherDevicesAre": "This policy only controls whether devices are scanned. Detected CVEs, risk scores, and remediation actions are managed in the",
         "vulnerabilitiesConsole": "Vulnerabilities console"
       },
+      "systemProtectionTab": {
+        "title": "System Protection",
+        "description": "Attempt a Windows System Restore checkpoint before patching, scripts, and software installs",
+        "beforePatching": "Before patch installs",
+        "beforePatchingHelp": "Attempt a checkpoint before installing operating system updates.",
+        "beforeScripts": "Before scripts",
+        "beforeScriptsHelp": "Attempt a checkpoint before running a script on the device.",
+        "beforeSoftwareInstall": "Before software installs",
+        "beforeSoftwareInstallHelp": "Attempt a checkpoint before installing or updating software.",
+        "labelPrefix": "Checkpoint label prefix",
+        "labelPrefixHelp": "Shown at the start of each restore point's description in Windows. Up to 64 characters.",
+        "platformDefaultNote": "No policy is assigned. Platform default: a checkpoint is attempted before patch installs only.",
+        "legacyAgentWarning": "Turning this off only takes effect on agents that report System Restore support. Older agents will continue to attempt a checkpoint before patch installs.",
+        "aboutTitle": "About System Restore",
+        "aboutBody": "Applies to Windows devices only. System Restore covers system files, the registry, installed programs and settings. It is not a backup and does not cover personal files. Windows limits restore-point creation to once every 24 hours by default, and a created point can later be removed by Windows or become unusable."
+      },
+      "securityAgentsTab": {
+        "title": "Security Agents",
+        "description": "Deploy and keep managed security agents installed on devices",
+        "deployVendor": "Deploy {{vendor}}",
+        "comingSoon": "Coming soon",
+        "platformWindows": "Windows: installed automatically.",
+        "platformMacos": "macOS: requires MDM approval, so Breeze does not install it automatically. These devices show as not applicable.",
+        "platformLinux": "Linux: not supported.",
+        "keysNotice": "Installs use the per-customer keys from the vendor's integration (Huntress organization keys, SentinelOne site tokens). Organizations that are not mapped in that integration are skipped and shown as not applicable, with no failed deployments. Turning a vendor off stops enforcement but never uninstalls the agent.",
+        "closerWarning": "A configuration policy assigned closer to a device (site, group or device, or an inheriting child policy) that has its own Security Agents settings replaces these settings entirely for those devices. A vendor left out there is not enforced.",
+        "partnerWideBadge": "Applies to all organizations",
+        "noneEnabledNote": "No vendor is enabled: devices reached by this policy are opted out of every security agent.",
+        "catalogMissing": "{{vendors}} is not set up for this partner yet. Connect the integration first, then save again.",
+        "catalogMissingLink": "Connect the integration",
+        "executeRequired": "Turning on installs requires permission to run commands on devices, with MFA. Ask an administrator who has that permission to save this setting.",
+        "binaryMissing": "{{vendors}} cannot be turned on until the built-in package has a deployable installer: a Windows MSI as its latest version, with install arguments that include SITE_TOKEN={s1_site_token}. Fix it in the package's Versions tab, then save again.",
+        "binaryMissingLink": "Open the Versions tab",
+        "platformMacosUnsupported": "macOS: not supported.",
+        "sentinelOneMsiNote": "Add the SentinelOne MSI to the built-in SentinelOne package's Versions tab first, with install arguments that include SITE_TOKEN={s1_site_token}. Breeze does not provide the installer, and SentinelOne cannot be turned on until it is there.",
+        "catalogMissingBuiltin": "{{vendors}} is not in this partner's software catalog yet. Add it from Software → Catalog → Built-in packages, then save again.",
+        "catalogMissingBuiltinLink": "Open Built-in packages",
+        "dnsBuiltinNote": "Add {{vendor}} to this partner's software catalog from Software → Catalog → Built-in packages first; it cannot be turned on until it is there.",
+        "dnsVariableNote": "Each organization needs the {{variable}} tenant variable, set as a normal (not secret) variable. Organizations without it are skipped and shown as not applicable.",
+        "dnsVariableLink": "Open Variables",
+        "dnsCoverageNote": "Breeze does not sync the {{vendor}} console, so coverage shows only whether each device can receive the client (pending or not applicable). Install and service state (missing, not running) appear in the generated software policy's compliance."
+      },
       "warrantyTab": {
         "warrantyAlertingIsOptInDevicesWith": "Warranty alerting is opt-in: devices with no warranty policy assigned never alert. Thresholds below apply to fixed-term coverage only — active AppleCare subscriptions renew rather than expire, so their expiry alerts are always suppressed.",
         "enableWarrantyExpiryAlerts": "Enable warranty expiry alerts",
         "generateAlertsWhenFixedTermDeviceWarranties": "Generate alerts when fixed-term device warranties are approaching expiry.",
         "warningThresholdDays": "Warning threshold (days)",
-        "generateAWarningAlertWhenWarrantyExpires": "Generate a warning alert when warranty expires within this many days.",
-        "criticalThresholdDays": "Critical threshold (days)",
-        "generateACriticalAlertWhenWarrantyExpires": "Generate a critical alert when warranty expires within this many days.",
+        "warnThresholdHelp": "Alert at info severity when warranty expires within this many days.",
+        "urgentThresholdDays": "Urgent threshold (days)",
+        "urgentThresholdHelp": "Alert at low severity when warranty expires within this many days. An expired warranty alerts at medium.",
         "enabled": "enabled",
         "warnDays": "warnDays",
         "criticalDays": "criticalDays",
@@ -1136,6 +1230,20 @@
         "title": "Devices in this policy will alert twice",
         "body": "These conditions exist both as an attached monitor and as a legacy rule or watch: {{names}}"
       }
+    },
+    "partnerGroupAssignment": {
+      "title": "Device groups (all orgs)",
+      "description": "Target a partner-wide device group. A group assignment applies at device-group level, so it takes precedence over organization- and site-level assignments of other policies.",
+      "selectGroup": "Select a device group",
+      "assign": "Assign",
+      "remove": "Remove",
+      "assigned": "Device group assigned",
+      "removed": "Device group assignment removed",
+      "failedToLoad": "Failed to load device groups",
+      "failedToAssign": "Failed to assign device group",
+      "failedToRemove": "Failed to remove device group assignment",
+      "empty": "No partner-wide device groups yet. Create one under Device Groups → All orgs.",
+      "loading": "Loading device groups…"
     }
   },
   "software": {
@@ -1195,7 +1303,7 @@
       "uploadFile": "Upload file",
       "source2": "source",
       "downloadUrl": "downloadUrl",
-      "noFileSelectedMsiExeDmgDeb": "No file selected (.msi, .exe, .dmg, .deb, .pkg)",
+      "noFileSelectedMsiExeDmgDeb": "No file selected (.msi, .exe, .dmg, .deb, .pkg, .zip)",
       "supportedOs": "supportedOs",
       "pkgInstall": "pkg-install",
       "silentInstallArgs2": "silentInstallArgs",
@@ -1251,7 +1359,19 @@
       "thisOrganizationOnly": "This organization only",
       "partnerWideUrlOnly": "Partner-wide packages use a download URL — file upload is not available for them yet.",
       "selectedFileRemoved": "The selected file was removed — partner-wide packages use a download URL.",
-      "scopeLockedAfterCreate": "The package was already created with this scope — ownership cannot change after creation."
+      "scopeLockedAfterCreate": "The package was already created with this scope — ownership cannot change after creation.",
+      "installScripts": "Install scripts",
+      "installScriptsHelp": "Required for zip packages, optional otherwise. Scripts run as SYSTEM on Windows or root on macOS and Linux, time out after 10 minutes, need the devices.execute permission and exactly one target OS.",
+      "availableTokens": "Available tokens:",
+      "preInstallScript": "Pre-install script",
+      "postInstallScript": "Post-install script",
+      "preInstallScriptPlaceholder": "Runs before the installer (PowerShell on Windows, bash on macOS and Linux)",
+      "postInstallScriptPlaceholder": "Runs after the installer or after the zip is extracted",
+      "silentArgsNotUsedForType": "Silent install arguments are not used for pkg, dmg, deb or zip installers.",
+      "issueZipRequiresPostInstallScript": "Zip packages need a post-install script: the agent only extracts the archive.",
+      "issueScriptsRequireSingleOs": "Install scripts need exactly one target OS.",
+      "issueScriptTooLarge": "Each install script must be 64 KiB or smaller.",
+      "issueArgsUnsupportedForFileType": "Silent install arguments are not supported for this installer type."
     },
     "builtinPackageDetail": {
       "managedBuiltIn": "Managed built-in",
@@ -1297,9 +1417,8 @@
       "noSoftwarePoliciesFoundCreateOneTo": "No software policies found. Create one to get started.",
       "recentViolations": "Recent Violations",
       "noCurrentSoftwareViolations": "No current software violations.",
-      "violationS": "violation(s)",
-      "remediation": "Remediation:",
-      "checked": "Checked:",
+      "remediation": "Remediation: {{value}}",
+      "checked": "Checked: {{date}}",
       "deactivatePolicy": "Deactivate Policy",
       "areYouSureYouWantToDeactivate": "Are you sure you want to deactivate",
       "thePolicyWillBeMarkedInactiveAnd": "? The policy will be marked inactive and compliance data will be cleared.",
@@ -1327,14 +1446,33 @@
       "installSkippedNoCatalog": "A required rule has no linked catalog item, so there's nothing to install. Add a catalog link in the policy editor to fix this.",
       "installSkippedCapOrPlatform": "Not a failure — either the per-pass install cap was reached or this device's platform has no install method for the software. May be attempted again next pass.",
       "installAttempts": "{{count}} attempt(s)",
-      "installLastAttempt": "Last install attempt: "
+      "installLastAttempt": "Last install attempt: ",
+      "managedByConfigPolicy": "Managed by configuration policy",
+      "managedByConfigPolicyHint": "This policy is generated from a configuration policy and is read-only here. Change it in Configuration Policies.",
+      "securityAgentCoverage": "Security agent coverage",
+      "coverageDevice": "Device",
+      "coverageVendor": "Vendor",
+      "coverageReason": "Reason",
+      "vendorOnlyAgent": "Vendor-only agent",
+      "coverageRowsNote": "Showing {{shown}} of {{total}}",
+      "violationCount": "{{count}} violation",
+      "violationCount_one": "{{count}} violation",
+      "violationCount_other": "{{count}} violations",
+      "violationTypes": {
+        "unauthorized": "Unauthorized",
+        "missing": "Missing",
+        "outdated": "Outdated",
+        "not_running": "Not running",
+        "service_unverified": "Service unverified",
+        "serviceTitle": "Service: {{name}}"
+      }
     },
     "deploymentList": {
       "running": "Running",
       "completed": "Completed",
       "failed": "Failed",
       "paused": "Paused",
-      "canceled": "Canceled",
+      "canceled": "Cancelled",
       "deployments": "Deployments",
       "monitorProgressAndManageDeploymentWorkflows": "Monitor progress and manage deployment workflows.",
       "allStatuses": "All statuses",
@@ -1342,7 +1480,7 @@
       "completed2": "Completed",
       "failed2": "Failed",
       "paused2": "Paused",
-      "canceled2": "Canceled",
+      "canceled2": "Cancelled",
       "allTypes": "All types",
       "manual": "Manual",
       "scheduled": "Scheduled",
@@ -1390,6 +1528,8 @@
       "error": "Error",
       "deploymentComplete": "Deployment complete",
       "inProgress": "In progress",
+      "completedWithErrors": "Completed with errors",
+      "scheduledFor": "Scheduled for {{time}}",
       "autoRefreshing": "Auto-refreshing every 5 seconds",
       "queuedOffline": "Queued — device offline",
       "cancelled": "Cancelled",
@@ -1411,7 +1551,8 @@
       "devicesFinished": "{{finished}} of {{total}} devices finished",
       "setupNeeded": "Setup needed",
       "managerUnavailableSummary_one": "{{count}} device is missing its package manager. This is a one-time device setup task — install winget (Windows) or Homebrew (macOS) there; until then every package-manager deployment to it will fail.",
-      "managerUnavailableSummary_other": "{{count}} devices are missing their package manager. This is a one-time device setup task — install winget (Windows) or Homebrew (macOS) on them; until then every package-manager deployment to them will fail."
+      "managerUnavailableSummary_other": "{{count}} devices are missing their package manager. This is a one-time device setup task — install winget (Windows) or Homebrew (macOS) on them; until then every package-manager deployment to them will fail.",
+      "deviceOutputTail": "Device output (last lines)"
     },
     "deploymentWizard": {
       "selectSoftware": "Select Software",
@@ -1541,20 +1682,25 @@
       "registry": "registry",
       "fileExists": "file_exists",
       "msiProductCode": "msi_product_code",
-      "fileVersion": "file_version"
+      "fileVersion": "file_version",
+      "serviceRunning": "Service running",
+      "readOnlyHint": "Created via the API. Not editable here; it is kept unchanged when you save.",
+      "serviceName": "Service name",
+      "serviceNamePlaceholder": "e.g. ctrld",
+      "serviceNameHint": "Windows service name, macOS launchd label or Linux systemd unit. Checked before and after install.",
+      "serviceNameInvalid": "Enter a service name without control characters or a leading \"-\" (256 bytes at most)."
     },
     "deviceDrawer": {
       "failedToFetchDevices": "Failed to fetch devices",
-      "devicesWith": "Devices with",
-      "by": "by",
+      "devicesWith": "Devices with {{name}}",
+      "by": "by {{vendor}}",
       "noDevicesFoundWithThisSoftware": "No devices found with this software.",
       "hostname": "Hostname",
       "oS": "OS",
       "version": "Version",
       "lastSeen": "Last Seen",
-      "device": "device",
-      "total": "total",
-      "s": "s"
+      "deviceTotal_one": "{{count}} device total",
+      "deviceTotal_other": "{{count}} devices total"
     },
     "policyForm": {
       "dryRunUnassigned": "0 devices — usually because this policy is not assigned to any device yet, but a fully compliant fleet or an empty site allowlist also reads as 0",
@@ -1659,7 +1805,10 @@
       "catalogTab": "Catalog",
       "summaryCompleted7d": "Completed (7d)",
       "summaryFailed7d": "Failed (7d)",
-      "categoryFilterLabel": "Category"
+      "categoryFilterLabel": "Category",
+      "requiredVariables": "Required variables",
+      "uninstallCommand": "Uninstall command",
+      "managedByBreezeHint": "Managed by Breeze. This package cannot be edited, deleted or given new versions here."
     },
     "softwareInventory": {
       "allowed": "Allowed",
@@ -1801,7 +1950,10 @@
       "uploadsRequireS3Storage": "File uploads require S3 object storage to be configured on the server.",
       "editingVersion": "Editing version",
       "failedToUpdateVersion": "Failed to update version",
-      "replaceFileAddNewVersion": "To replace the installer file, add a new version instead."
+      "replaceFileAddNewVersion": "To replace the installer file, add a new version instead.",
+      "inactiveStoredScripts": "Stored install scripts are not active; re-create the version to activate them.",
+      "addZipFromAddPackage": "Add zip packages from Add Package.",
+      "builtinVersionsReadOnly": "Managed by Breeze. Versions of built-in packages cannot be added or changed here."
     },
     "variableInput": {
       "insertADeployTimeVariable": "Insert a deploy-time variable",
@@ -1835,6 +1987,30 @@
       "queuedNone": "Nothing was queued: the previewed devices no longer need remediation or already have it pending.",
       "queuedPartial": "Remediation queued for {{queued}} of {{requested}} previewed device(s); the rest no longer need it or already have it pending.",
       "previewFailedWithReason": "Could not load the remediation preview: {{reason}}"
+    },
+    "builtinPackagesPanel": {
+      "title": "Built-in packages",
+      "description": "DNS filtering clients pinned and verified by Breeze. Add one to your catalog, set its variable for each organization, then deploy it like any other package.",
+      "colPackage": "Package",
+      "colPlatform": "Platform",
+      "colPinnedVersion": "Pinned version",
+      "colRequiredVariables": "Required variables",
+      "colUninstallCommand": "Uninstall command",
+      "colStatus": "Status",
+      "addToCatalog": "Add to catalog",
+      "adding": "Adding…",
+      "inCatalog": "In catalog",
+      "archived": "Archived",
+      "restoreToCatalog": "Restore",
+      "addedToCatalog": "{{name}} added to the catalog",
+      "couldNotAddToCatalog": "Could not add {{name}} to the catalog",
+      "couldNotLoadBuiltinPackages": "Could not load built-in packages",
+      "loadingBuiltinPackages": "Loading built-in packages…",
+      "setVariablesPerOrganization": "Set per organization in Settings → Variables",
+      "copyUninstallCommand": "Copy uninstall command",
+      "uninstallCommandCopied": "Uninstall command copied",
+      "breezeDoesNotUninstall": "Breeze does not uninstall these clients. Run the command on the device to remove one.",
+      "copyFailed": "Copy failed. Select the command and copy it manually."
     }
   }
 }

@@ -18,6 +18,58 @@ export interface WhatsNewEntry {
  */
 export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
   {
+    version: '0.125.0',
+    date: '2026-10-27',
+    title: 'Agreements clients sign without a quote, ticket merge and routing, and update rings that decide Windows feature updates',
+    highlights: [
+      'Send any agreement for signature from Agreements, an organization’s Billing tab or a contract. Clients sign on a public page or in the portal’s new Agreements page, everyone gets the signed copy with a signature certificate, and you can remind, void or let it expire automatically.',
+      'Merge duplicate tickets into one, give SLAs business hours and holidays (a partner default with an organization override), and add routing rules that set the category, priority, status or assignee on new tickets.',
+      'Update rings now decide Windows feature updates: block them (the default), allow the newest release, or pin devices to one such as Windows 11 25H2. Needs this release’s agent.',
+      'Software versions can run pre- and post-install scripts and ship as zip packages, and Control D and NextDNS can be added from Software → Catalog → Built-in packages. A new Detection Rules page under Security manages YARA rule sets, and Sweep now runs them across many devices at once.',
+      'AI conversations move between the side panel and the full-page Breeze AI chat with their history, and dashboard numbers now open the filtered lists they count. Breeze Assist no longer crash-loops on an old WebView2 runtime, and the remote-support consent prompt now defaults to Deny.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.124.0',
+    date: '2026-10-19',
+    title: 'A fuller Trust Center, connection health alerts, and Huntress and SentinelOne deployed from policy',
+    highlights: [
+      'Trust Center pages gain declared controls with yearly expiry, documents customers can request, framework views, subprocessors and an FAQ. A partner-wide template, a signed attestation, a website embed and questionnaire export round them out, and customers can edit the draft from the portal while you keep publishing.',
+      'A Connection Health panel on Integrations lists every broken integration with a fix link, including failing webhooks and stalled syncs. Admins who can fix an incident get one daily digest email. Notices to customer admins are opt-in.',
+      'Turn on Huntress or SentinelOne in a configuration policy’s Security Agents tab to deploy it with each organization’s own keys, then track per-device coverage and gaps. With this release’s agent, Windows devices also take a System Restore checkpoint before patches, scripts and software installs.',
+      'A new AI data & privacy setting controls whether AI can read device files (user profile folders are excluded by default) and how long AI tool outputs are kept. Microsoft 365 password resets and account disables now need a verified caller, and eight more M365 identity actions are available through AI with approval.',
+      'Getting around is faster: the header switcher goes Customer › Page with live counts, and organization, site, device and ticket names link everywhere. A Recent list sits in the sidebar and on the dashboard, and a new Attention column on the devices list shows open alerts and tickets.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.123.0',
+    date: '2026-10-17',
+    title: 'Agents that get past ISP security filters, ticket types, and customer work approval',
+    highlights: [
+      'With this release’s agent, devices on home networks behind ISP “security” filters such as Comcast xFi Advanced Security and Spectrum Security Shield can connect to hosted Breeze. The agent switches to Encrypted Client Hello only after it detects the filter, and connects as before everywhere else.',
+      'Tickets now have a type (Incident, Service Request, Problem or Change), each with its own Service Desk entry, and a Related tickets panel links tickets to each other, such as incidents to the problem behind them.',
+      'Optional customer work approval: over-budget or after-hours time is held until the customer approves it in the portal, or you record their decision, and held time is never invoiced. Set a budget on the ticket and turn approval on in the time capture settings.',
+      'The remote viewer adds a keyboard mode (Type what I see, or Physical keys with this release’s agent) with IME and dead-key typing, plus view-only, block local input, screenshots, Fit or 100% scaling and a connection stats overlay.',
+      'Dynamic groups now update when a device’s tags or custom fields change, and the group rule builder offers custom fields.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.122.0',
+    date: '2026-10-11',
+    title: 'Larger remote clipboard transfers, AI that researches fixes, and a clearer network map',
+    highlights: [
+      'With this release’s agent, the remote desktop clipboard handles large text, and a status chip shows which directions policy allows. Each session writes one audit entry for its clipboard activity.',
+      'AI suggested fixes can research a problem, propose fixes for you to review and remember the fixes that worked, so later triage checks them first.',
+      'The AI assistant can ask to read files in chosen folders on one device, read-only and only after an administrator approves. Passwords, keys and other credentials are never shared.',
+      'The network topology page opens on summary cards and role sections, and each device page shows who is already connected to it remotely.',
+      'Groundwork for customer-portal hardware and performance views: per-client toggles open read-only portal APIs for hardware health, hardware inventory and performance metrics. Portal pages come in a later release.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
     version: '0.121.0',
     date: '2026-10-02',
     title: 'Pick your AI model, bring your own endpoint, and bill clients for AI usage',

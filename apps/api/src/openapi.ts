@@ -349,10 +349,10 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           email: { type: 'string', format: 'email' },
           name: { type: 'string', minLength: 1, maxLength: 255 },
           roleId: { type: 'string', format: 'uuid' },
-          orgAccess: { type: 'string', enum: ['all', 'selected', 'none'] },
-          orgIds: { type: 'array', items: { type: 'string', format: 'uuid' } },
-          siteIds: { type: 'array', items: { type: 'string', format: 'uuid' } },
-          deviceGroupIds: { type: 'array', items: { type: 'string', format: 'uuid' } }
+          orgAccess: { type: 'string', enum: ['all', 'selected', 'none'], description: 'Partner scope only; 400 in organization scope.' },
+          orgIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Partner scope only, with orgAccess=selected; 400 in organization scope.' },
+          siteIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Organization scope only; 400 in partner scope.' },
+          deviceGroupIds: { type: 'array', items: { type: 'string', format: 'uuid' }, description: 'Not supported yet: any value is rejected with 400.' }
         },
         required: ['email', 'name', 'roleId']
       },
@@ -375,7 +375,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           name: { type: 'string' },
           slug: { type: 'string' },
           type: { type: 'string', enum: ['msp', 'enterprise', 'internal'] },
-          plan: { type: 'string', enum: ['free', 'pro', 'enterprise', 'unlimited'] },
+          plan: { type: 'string', enum: ['free', 'starter', 'community', 'pro', 'enterprise', 'unlimited'] },
           maxOrganizations: { type: 'integer', nullable: true },
           maxDevices: { type: 'integer', nullable: true },
           billingEmail: { type: 'string', format: 'email', nullable: true },
@@ -651,6 +651,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           triggeredAt: { type: 'string', format: 'date-time' },
           acknowledgedAt: { type: 'string', format: 'date-time', nullable: true },
           acknowledgedBy: { type: 'string', format: 'uuid', nullable: true },
+          acknowledgedByPrincipalId: { type: 'string', format: 'uuid', nullable: true, description: 'Partner API service principal that acknowledged the alert, or null.' },
           acknowledgedByName: {
             type: 'string',
             nullable: true,
@@ -658,6 +659,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           },
           resolvedAt: { type: 'string', format: 'date-time', nullable: true },
           resolvedBy: { type: 'string', format: 'uuid', nullable: true },
+          resolvedByPrincipalId: { type: 'string', format: 'uuid', nullable: true, description: 'Partner API service principal that resolved the alert, or null.' },
           resolvedByName: {
             type: 'string',
             nullable: true,
@@ -2133,7 +2135,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
                   name: { type: 'string', minLength: 1 },
                   slug: { type: 'string', minLength: 1, maxLength: 100 },
                   type: { type: 'string', enum: ['msp', 'enterprise', 'internal'] },
-                  plan: { type: 'string', enum: ['free', 'pro', 'enterprise', 'unlimited'] },
+                  plan: { type: 'string', enum: ['free', 'starter', 'community', 'pro', 'enterprise', 'unlimited'] },
                   maxOrganizations: { type: 'integer', nullable: true },
                   maxDevices: { type: 'integer', nullable: true },
                   billingEmail: { type: 'string', format: 'email' }
@@ -2586,6 +2588,56 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         }
       }
     },
+    '/devices/{id}/force-reboot': {
+      post: {
+        operationId: 'forceRebootDevice',
+        tags: ['Devices'],
+        summary: 'Force reboot a device now (closes running apps)',
+        description: 'Queue a `force_reboot` command: an immediate reboot that force-closes running applications, discarding unsaved work. On Windows the agent runs `shutdown /r /f /t 0`; on macOS and Linux it runs `shutdown -r +0`, where force changes nothing. Plain reboot is unchanged and stays on POST /devices/{id}/commands. This route is the only way to queue `force_reboot`. Requires devices:execute, an interactive user session (API keys, MCP grants and AI agents are refused), an MFA-assured session, and, while two-factor authentication is enabled on the deployment, a single-use step-up grant minted by POST /auth/mfa/step-up for operation `device_force_reboot` bound to { deviceId }. The device must be online now and run an agent that knows `force_reboot`. The command still waits behind in-flight work like any reboot, and expires if it is not claimed within the live-only window (15 minutes by default).',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  stepUpGrant: { type: 'string', format: 'uuid', description: 'Step-up grant id from POST /auth/mfa/step-up (operation device_force_reboot, resource { deviceId }). Required when two-factor authentication is enabled.' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Force reboot queued',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    deviceId: { type: 'string', format: 'uuid' },
+                    type: { type: 'string', enum: ['force_reboot'] },
+                    status: { type: 'string' },
+                    createdAt: { type: 'string', format: 'date-time' },
+                    delivery: { type: 'string', description: 'How the command was handed over (e.g. delivered, queued_live)' },
+                    deliverBy: { type: 'string', format: 'date-time', nullable: true, description: 'The command expires if not claimed by this time' },
+                    argv: { type: 'array', items: { type: 'string' }, description: 'The exact command the agent runs on this OS' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid body, decommissioned device, or unsupported OS' },
+          '403': { description: '`Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; `STEP_UP_REQUIRED` when the step-up grant is missing, stale, bound to another device or already consumed; site access denied; or a partner trust denial' },
+          '404': { description: 'Device not found' },
+          '409': { description: '`DEVICE_OFFLINE` (the device is not online now; a force reboot is never queued for later), `AGENT_UPGRADE_REQUIRED` (the agent predates force_reboot; the body carries agentVersion and minAgentVersion), or the device is pending assignment' },
+          '503': { description: 'Step-up binding could not be established (auth state or session id unavailable); retry' },
+        },
+      },
+    },
     '/devices/{id}/move-org': {
       post: {
         operationId: 'moveDeviceOrg',
@@ -2628,7 +2680,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           '400': { description: 'Invalid input (e.g. target site not in target org, target org equals source)' },
           '403': { description: 'Access denied: target org or cross-partner move without system scope; `Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; `STEP_UP_REQUIRED` when the step-up grant is missing, stale, mismatched or already consumed' },
           '404': { description: 'Device or target organization not found' },
-          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, `HOUR_BLOCK_DRAWN_TIME` (a ticket carries time drawn from a block of prepaid hours), or `PAM_DEVICE_MOVE_BLOCKED`' },
+          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, `HOUR_BLOCK_DRAWN_TIME` (a ticket carries time drawn from a block of prepaid hours), `APPROVAL_REQUEST_PENDING` (a ticket has a pending customer approval request), `PAM_DEVICE_MOVE_ACTIVE` (PAM ownership transfer is enabled and an elevation session on the device has not finished cleanup; retry once it closes), or `PAM_DEVICE_MOVE_BLOCKED` (the device has PAM history and transfer is not enabled)' },
           '503': { description: 'Step-up binding could not be established (auth state or session id unavailable); retry' },
         },
       },
@@ -3624,6 +3676,38 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         }
       }
     },
+    '/alerts/{id}/external-tickets': {
+      get: {
+        operationId: 'listAlertExternalTickets',
+        tags: ['Alerts'],
+        summary: 'List external ticket references and PSA mappings for an alert',
+        description: 'Requires alerts.read and access to the alert organization and site. Partner-level viewers see every integration principal reference and PSA mappings from connections owned by their partner or the alert organization. Org-scoped users see only mappings from PSA connections owned by the alert organization with no partner owner; partner-principal references and partner-owned PSA mappings are excluded.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        responses: {
+          '200': {
+            description: 'External tickets in deterministic source and creation order',
+            content: { 'application/json': { schema: {
+              type: 'object', required: ['data'], additionalProperties: false,
+              properties: { data: { type: 'array', items: {
+                type: 'object', additionalProperties: false,
+                required: ['source', 'partnerServicePrincipalId', 'externalId', 'externalUrl', 'externalNumber', 'state', 'createdAt', 'updatedAt'],
+                properties: {
+                  source: { type: 'string', enum: ['partner_api', 'psa'] },
+                  partnerServicePrincipalId: { type: 'string', format: 'uuid', nullable: true },
+                  externalId: { type: 'string' },
+                  externalUrl: { type: 'string', nullable: true },
+                  externalNumber: { type: 'string', nullable: true },
+                  state: { type: 'string', nullable: true },
+                  createdAt: { type: 'string', format: 'date-time' },
+                  updatedAt: { type: 'string', format: 'date-time', nullable: true },
+                },
+              } } },
+            } } },
+          },
+          '404': { description: 'Alert not found or outside the caller’s reach' },
+        },
+      },
+    },
     '/alerts/{id}/acknowledge': {
       post: {
         operationId: 'acknowledgeAlert',
@@ -3719,6 +3803,25 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         responses: {
           '200': {
             description: 'Alert suppressed',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Alert' }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/alerts/{id}/unsuppress': {
+      post: {
+        operationId: 'unsuppressAlert',
+        tags: ['Alerts'],
+        summary: 'Lift an alert mute',
+        description: 'Restores a suppressed alert to acknowledged (if it was acknowledged before the mute) or active, and clears the mute deadline. Returns 409 if the alert is not suppressed.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        responses: {
+          '200': {
+            description: 'Alert restored',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Alert' }
@@ -4726,6 +4829,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         operationId: 'addIceCandidate',
         tags: ['Remote'],
         summary: 'Add ICE candidate',
+        description: 'Trickles a viewer ICE candidate gathered after the offer: stored against the session\'s current start and relayed to the agent hosting it.',
         parameters: [{ $ref: '#/components/parameters/idParam' }],
         responses: {
           '200': {

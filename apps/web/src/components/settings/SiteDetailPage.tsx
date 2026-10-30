@@ -1,3 +1,4 @@
+import { useRecordPageContext } from '@/hooks/useRecordPageContext';
 import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHashTab } from '@/lib/useHashState';
+import { siteDevicesHref } from '../contracts/deviceCoverageLinks';
 import Breadcrumbs from '../layout/Breadcrumbs';
 import { fetchWithAuth } from '../../stores/auth';
 import { runAction, ActionError } from '@/lib/runAction';
@@ -22,6 +24,10 @@ import { formatTime as formatUserTime } from '@/lib/dateTimeFormat';
 import TimezoneSelect from '@/components/shared/TimezoneSelect';
 import { useStableT } from '@/lib/i18n/useStableT';
 import { usePageItemName } from '../layout/usePageItemName';
+import { usePermissions } from '@/lib/permissions';
+import { ENABLE_ENDPOINT_MESSAGING } from '@/lib/featureFlags';
+import SendMessageDialog from '../endpointMessages/SendMessageDialog';
+import ContactResponsibilitiesCard from '../shared/ContactResponsibilitiesCard';
 
 // --- Types ---
 
@@ -107,6 +113,8 @@ const formatTime = (date: Date) =>
 
 export default function SiteDetailPage({ siteId }: { siteId: string }) {
   const { t } = useTranslation('settings');
+  const { can } = usePermissions();
+  const canSendMessage = ENABLE_ENDPOINT_MESSAGING && can('endpoint_messages', 'send'); // #8968: hidden until the build enables messaging
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // SSR-safe hash tab (#2421): starts at the default, adopts the hash post-mount.
   const [activeTab, setActiveTab] = useHashTab<TabKey>(VALID_TABS, 'details');
@@ -118,7 +126,9 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
 
   const [site, setSite] = useState<SiteDetails | null>(null);
   usePageItemName(site?.name);
+  useRecordPageContext(site ? { kind: 'site', id: site.id, orgId: site.orgId, label: site.name } : null);
   const [org, setOrg] = useState<OrgInfo | null>(null);
+  const [sendMessageOpen, setSendMessageOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
 
@@ -174,7 +184,7 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       setSite(data);
       populateForm(data);
 
-      // Fetch org name for breadcrumbs — isolated so failure doesn't crash page load
+      // Fetch the org name for the header's org link — isolated so failure doesn't crash page load
       if (data.orgId) {
         try {
           const orgRes = await fetchWithAuth(`/orgs/organizations/${data.orgId}`);
@@ -183,7 +193,7 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
             setOrg({ id: orgData.id, name: orgData.name });
           }
         } catch (orgErr) {
-          console.warn('Failed to fetch org for breadcrumbs:', orgErr);
+          console.warn('Failed to fetch org for the site header:', orgErr);
         }
       }
     } catch (err) {
@@ -363,10 +373,10 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
         <p className="text-sm text-destructive">{error}</p>
         <a
-          href="/organizations"
+          href="/settings/sites"
           className="mt-4 inline-block rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
-          {t('siteDetailPage.backToOrganizations')}
+          {t('siteDetailPage.backToSites')}
         </a>
       </div>
     );
@@ -377,16 +387,19 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
         <p className="text-sm text-destructive">{t('siteDetailPage.errors.notFound')}</p>
         <a
-          href="/organizations"
+          href="/settings/sites"
           className="mt-4 inline-block rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
-          {t('siteDetailPage.backToOrganizations')}
+          {t('siteDetailPage.backToSites')}
         </a>
       </div>
     );
   }
 
   const badge = statusBadge[site.status] ?? statusBadge.active;
+  // Null for a non-uuid org/site: render no link rather than a broader one that
+  // would claim devices the count above does not describe (R2).
+  const viewAllHref = siteDevicesHref(site.orgId, site.id);
 
   const statusLabel = saveState.hasUnsavedChanges
     ? t('siteDetailPage.saveStatus.unsaved')
@@ -398,8 +411,7 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       <Breadcrumbs
         items={[
           { label: t('siteDetailPage.breadcrumbs.settings'), href: '/settings' },
-          { label: t('siteDetailPage.breadcrumbs.organizations'), href: '/organizations' },
-          ...(org ? [{ label: org.name, href: `/organizations/${org.id}` }] : []),
+          { label: t('siteDetailPage.breadcrumbs.sites'), href: '/settings/sites' },
           { label: site.name },
         ]}
       />
@@ -408,9 +420,9 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-center gap-4">
           <a
-            href={org ? `/organizations/${org.id}` : '/organizations'}
+            href="/settings/sites"
             className="inline-flex h-8 w-8 items-center justify-center rounded-md border hover:bg-muted"
-            aria-label={t('siteDetailPage.backToOrganizations')}
+            aria-label={t('siteDetailPage.backToSites')}
           >
             <ArrowLeft className="h-4 w-4" />
           </a>
@@ -429,11 +441,29 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
             {org && (
               <p className="mt-1 text-sm text-muted-foreground">
                 <Building2 className="mr-1 inline h-3.5 w-3.5" />
-                {org.name}
+                {/* The breadcrumb now leads to Sites (#9794); the org record
+                    stays one click away from here. */}
+                <a
+                  href={`/organizations/${org.id}`}
+                  data-testid="site-detail-org-link"
+                  className="rounded-sm hover:text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {org.name}
+                </a>
               </p>
             )}
           </div>
         </div>
+        {canSendMessage && (
+          <button
+            type="button"
+            data-testid="site-send-message"
+            onClick={() => setSendMessageOpen(true)}
+            className="inline-flex items-center rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent"
+          >
+            {t('siteDetailPage.actions.sendMessage')}
+          </button>
+        )}
         {activeTab === 'details' && (
           <div className="flex items-center gap-2 rounded-full border bg-card px-4 py-2 text-sm">
             {saveState.hasUnsavedChanges ? (
@@ -445,6 +475,8 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
           </div>
         )}
       </header>
+
+      <SendMessageDialog open={sendMessageOpen} onClose={() => setSendMessageOpen(false)} targets={{ siteIds: [site.id] }} />
 
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -485,6 +517,7 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
           {/* Details Tab */}
           {activeTab === 'details' && (
             <div className="space-y-6">
+              {site && <ContactResponsibilitiesCard orgId={site.orgId} siteId={site.id} />}
               <section className="rounded-lg border bg-card p-6 shadow-xs">
                 <h2 className="text-lg font-semibold">{t('siteDetailPage.details.title')}</h2>
                 <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -755,16 +788,21 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
           {activeTab === 'devices' && (
             <div className="rounded-lg border bg-card p-6 shadow-xs">
               <h3 className="text-base font-semibold">{t('siteDetailPage.devices.title')}</h3>
-              <p className="mt-2 text-3xl font-bold">{site.deviceCount ?? 0}</p>
+              <p className="mt-2 text-3xl font-bold" data-testid="site-detail-device-count">
+                {site.deviceCount ?? 0}
+              </p>
               <p className="mt-1 text-sm text-muted-foreground">
                 {t('siteDetailPage.devices.assigned')}
               </p>
-              <a
-                href="/devices"
-                className="mt-4 inline-flex items-center gap-1.5 text-sm text-primary hover:underline"
-              >
-                {t('siteDetailPage.devices.viewAll')}
-              </a>
+              {viewAllHref && (
+                <a
+                  href={viewAllHref}
+                  data-testid="site-detail-devices-view-all-link"
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-sm text-sm text-primary underline underline-offset-2 hover:decoration-current focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+                >
+                  {t('siteDetailPage.devices.viewAll')}
+                </a>
+              )}
             </div>
           )}
         </main>

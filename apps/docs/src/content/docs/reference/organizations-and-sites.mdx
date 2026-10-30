@@ -87,8 +87,6 @@ Partner-scoped users can update their own partner's settings via the `/partners/
 | `dateFormat` | `enum` | `MM/DD/YYYY`, `DD/MM/YYYY`, or `YYYY-MM-DD`. |
 | `timeFormat` | `enum` | `12h` or `24h`. |
 | `language` | `string` | Language code. Currently only `en` is supported. |
-| `businessHours.preset` | `enum` | `24/7`, `business`, `extended`, or `custom`. |
-| `businessHours.custom` | `object` | Per-day schedule when preset is `custom`. Each day has `start`, `end` (time strings), and optional `closed` boolean. |
 | `contact.name` | `string` | Primary contact name. |
 | `contact.email` | `string` | Primary contact email. |
 | `contact.phone` | `string` | Primary contact phone. |
@@ -247,10 +245,10 @@ land on it.
 
 | Tab | Contents |
 |---|---|
-| **Overview** | Summary tiles for the customer: fleet, open work, and billing position. |
+| **Overview** | Summary tiles for the customer, leading with fleet health, then open work and billing position; the billing address and the customer's sites sit alongside (v0.124.0+). |
 | **Contacts** | The organisation's [contacts](#contacts), managed in place. |
 | **Sites** | The organisation's [sites](#sites). |
-| **Devices** | The full device list, pinned to this customer. |
+| **Devices** | The full device list, pinned to this customer, with its own search and filters. |
 | **Tickets** | The ticket queue, pinned to this customer. |
 | **Billing** | Contracts, Invoices and Quotes, each pinned to this customer. |
 | **Activity** | The audit trail for this organisation. |
@@ -260,6 +258,13 @@ to the organisation you are looking at: filters and searches are scoped to it, t
 Organisation column drops out as redundant, and a **New** action pre-selects the
 customer. Pinning wins over whatever the global organisation switcher is set to,
 so opening a customer's record never depends on remembering to switch scope first.
+
+From v0.124.0 the organisation switcher in the header is a two-column
+**Customer › Page** picker: choose the customer, then the page to open, with live
+counts next to each customer -- devices online and offline, open tickets and
+critical alerts. A **Recent** list in the sidebar and on the dashboard takes you
+back to the records you opened last, and organisation, site, device and ticket
+names link to their record wherever they appear.
 
 Which tabs appear depends on the partner's
 [Service Management mode](/reference/partner-management/#service-management-mode):
@@ -325,11 +330,19 @@ Preview first. The preview reports how many rows would move and which would be d
 
 Merging carries the same partner-scope, `organizations:write` and MFA requirements as archiving. In the dashboard you must also type the organisation's name to confirm.
 
+From v0.124.0 a merge also expires every live, not-yet-actuated PAM elevation request on the merged organisation's devices, each with an audit entry -- see [Moving a device or merging its organisation](/features/pam/#moving-a-device-or-merging-its-organisation). A nightly job later deletes PAM evidence older than 400 days from the retired shell the merge leaves behind, never from a live organisation.
+
 ---
 
 ## Sites
 
 A **Site** represents a physical or logical location within an organisation -- for example, a branch office, data centre, or remote office.
+
+### The Sites list
+
+**Fleet Management → Sites** (`/settings/sites`, v0.125.0+) lists sites in one place. With no organisation selected in the header it lists every site you can see, across organisations, with an **Organization** column; with an organisation selected it lists that organisation's sites. Each row's device count opens the device list filtered to that site. Anyone with `sites:read` sees the page; **Add**, **Edit** and **Delete** need `sites:write`, and adding a site from the cross-organisation view asks which organisation it belongs to. The organisation record's **Sites** tab is unchanged.
+
+To move devices between sites, see [Moving devices to another site](/features/devices/#moving-devices-to-another-site).
 
 ### Site Fields
 
@@ -444,6 +457,14 @@ On `PATCH`, an explicit `null` clears a field and an omitted key leaves it alone
 
   Writing `billingContact` edits that billing contact (or creates one with the `billing` role when none exists) and never touches any other contact. Writing an empty value — or, on `PATCH /orgs/:orgId/billing-settings`, `billingContactEmail: null` — removes the `billing` role from the current billing contact; the contact itself is kept.
 </Aside>
+
+### Responsible contacts
+
+A site's **Details** tab and a device's **Overview** tab show a read-only **Responsible contacts** card: for each contact role (Billing, Technical, Escalation, Administration, Local contact, After hours, Portal), who to call about this site or device. Each role shows its contacts with title, email and phone, a **Primary** marker, and the level the answer came from -- **Device group**, **This site**, or **Entire organization**.
+
+The most specific assignment wins: a device group the device belongs to, then the device's site, then the organization. Roles with no one assigned at any level are left out, and the card says so when no role has anyone. Contacts and their roles are still managed on the organization's contacts; the card does not edit them.
+
+The same answer is available from `GET /orgs/organizations/:id/contact-responsibilities` with exactly one of `siteId` or `deviceId` (see [Contact Endpoints](#contact-endpoints)).
 
 ---
 
@@ -571,6 +592,7 @@ These endpoints allow partner-scoped users to view and update their own partner 
 | `POST` | `/orgs/organizations/:id/contacts` | `organization`, `partner`, `system` | Create a contact. Returns the created record with a `201` status. |
 | `PATCH` | `/orgs/contacts/:contactId` | `organization`, `partner`, `system` | Update a contact. No organisation in the path. An explicit `null` clears a field; an omitted key leaves it alone. |
 | `DELETE` | `/orgs/contacts/:contactId` | `organization`, `partner`, `system` | Delete a contact. Returns `{ success: true }`. |
+| `GET` | `/orgs/organizations/:id/contact-responsibilities` | `organization`, `partner`, `system` | The responsible contacts for one site or device, per role, with the level each was resolved at (device group, site, organization). Takes exactly one of `siteId` or `deviceId` (`400` otherwise); a site or device outside the organization or your site access returns `404`. Requires `organizations:read`. |
 | `POST` | `/orgs/contacts/import/preview` | `organization`, `partner`, `system` | Annotate a batch of contact rows against existing state without writing anything. Up to 1,000 rows. |
 | `POST` | `/orgs/contacts/import` | `organization`, `partner`, `system` | Commit a previewed batch. Always answers `200` with `{ imported, updated, skipped, errors }`, including on a partial failure. |
 
@@ -625,10 +647,7 @@ curl -X PATCH https://breeze.example.com/api/v1/orgs/partners/me \
   -H "Content-Type: application/json" \
   -d '{
     "settings": {
-      "timezone": "America/Chicago",
-      "businessHours": {
-        "preset": "business"
-      }
+      "timezone": "America/Chicago"
     }
   }'
 ```

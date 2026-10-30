@@ -2,13 +2,30 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { writeEnvStack, readStackEnvValue, setStackEnvValues, pinWebAuthnForStack } from './env';
+import { writeEnvStack, readStackEnvValue, setStackEnvValues, pinWebAuthnForStack, caddyPortPin, restoreLocalPublicUrls } from './env';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'wt-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('writeEnvStack', () => {
+  // #8155 W03 — e2e-tests/helpers/tunnelOriginStack.ts turns Network Proxy host
+  // mode on after `up` (the template carries caddy's published port). A re-up
+  // must keep it, or the next `up` silently drops the stack back to path mode.
+  it('keeps the tunnel-origin runtime keys across a re-up', () => {
+    writeFileSync(path.join(dir, '.env'), '');
+    const values = {
+      TUNNEL_ORIGIN_TEMPLATE: 'http://{id}.tunnel.localhost:5',
+      TUNNEL_FRAME_ANCESTOR: 'http://app.localhost:5',
+      TUNNEL_SITE_ADDRESS: 'http://*.tunnel.localhost, http://*.*.tunnel.localhost',
+      TUNNEL_HOST_SUFFIX: 'tunnel.localhost',
+      PUBLIC_PORTAL_URL: 'http://app.localhost:5/portal',
+    };
+    setStackEnvValues(dir, values);
+    writeEnvStack(dir, { arch: 'x64' });
+    for (const [k, v] of Object.entries(values)) expect(readStackEnvValue(dir, k)).toBe(v);
+  });
+
   it('writes all secrets the API config validator requires to boot', () => {
     const p = writeEnvStack(dir);
     const env = readFileSync(p, 'utf8');
@@ -42,6 +59,45 @@ describe('writeEnvStack', () => {
   it('disables the rate limiters that a parallel Playwright run trips', () => {
     const env = readFileSync(writeEnvStack(dir), 'utf8');
     expect(env).toContain('E2E_MODE=true');
+  });
+});
+
+// #8718 — `docker restart` re-allocates a random published port, so a storm run
+// that restarts caddy needs a fixed host port. Opt-in via BREEZE_WT_CADDY_PORT.
+describe('caddyPortPin (#8718)', () => {
+  it('is null when unset or empty (random port, unchanged behaviour)', () => {
+    expect(caddyPortPin({})).toBeNull();
+    expect(caddyPortPin({ BREEZE_WT_CADDY_PORT: '' })).toBeNull();
+  });
+  it('parses a valid port', () => {
+    expect(caddyPortPin({ BREEZE_WT_CADDY_PORT: '18080' })).toBe(18080);
+  });
+  it.each(['abc', '0', '70000', '80.5', '-1'])('rejects %s', (v) => {
+    expect(() => caddyPortPin({ BREEZE_WT_CADDY_PORT: v })).toThrow(/BREEZE_WT_CADDY_PORT/);
+  });
+});
+
+describe('worktree override caddy publish (#8718)', () => {
+  it('publishes caddy as <bind addr>:${BREEZE_WT_CADDY_PORT:-0}:80 (the :-0 keeps the random-port default)', () => {
+    const override = readFileSync(path.resolve(__dirname, '../../../docker-compose.override.yml.worktree'), 'utf8');
+    expect(override).toMatch(/^\s*-\s*"\$\{BREEZE_WT_BIND_ADDR:-127\.0\.0\.1\}:\$\{BREEZE_WT_CADDY_PORT:-0\}:80"\s*$/m);
+  });
+});
+
+describe('writeEnvStack caddy pin (#8718)', () => {
+  const prev = process.env.BREEZE_WT_CADDY_PORT;
+  afterEach(() => {
+    if (prev === undefined) delete process.env.BREEZE_WT_CADDY_PORT; else process.env.BREEZE_WT_CADDY_PORT = prev;
+  });
+  it('writes BREEZE_WT_CADDY_PORT when pinned', () => {
+    process.env.BREEZE_WT_CADDY_PORT = '18080';
+    expect(readFileSync(writeEnvStack(dir), 'utf8')).toMatch(/^BREEZE_WT_CADDY_PORT=18080$/m);
+  });
+  it('omits it when unset, and drops a stale pin on re-up', () => {
+    process.env.BREEZE_WT_CADDY_PORT = '18080';
+    writeEnvStack(dir);
+    delete process.env.BREEZE_WT_CADDY_PORT;
+    expect(readFileSync(writeEnvStack(dir), 'utf8')).not.toContain('BREEZE_WT_CADDY_PORT');
   });
 });
 
@@ -147,6 +203,45 @@ describe('pinWebAuthnForStack', () => {
     expect(pinWebAuthnForStack(dir, 'http://localhost:55002', deps)).toBe(true);
     expect(calls).toEqual(['recreate', 'wait']);
     expect(readStackEnvValue(dir, 'WEBAUTHN_ORIGIN')).toBe('http://localhost:55002');
+  });
+
+  // #9777 — compose defaults these to https://${BREEZE_DOMAIN}..., and
+  // BREEZE_DOMAIN is empty on a local stack (=> `https:///portal`).
+  it('pins the public URLs to the caddy base URL', () => {
+    writeEnvStack(dir);
+    pinWebAuthnForStack(dir, 'http://localhost:55001', fakeDeps().deps);
+    expect(readStackEnvValue(dir, 'PUBLIC_PORTAL_URL')).toBe('http://localhost:55001/portal');
+    expect(readStackEnvValue(dir, 'PUBLIC_APP_URL')).toBe('http://localhost:55001');
+    expect(readStackEnvValue(dir, 'PUBLIC_API_URL')).toBe('http://localhost:55001');
+    expect(readStackEnvValue(dir, 'DASHBOARD_URL')).toBe('http://localhost:55001');
+  });
+
+  it('keeps the public URLs across a rewrite and re-pins on a new port', () => {
+    writeEnvStack(dir);
+    pinWebAuthnForStack(dir, 'http://localhost:55001', fakeDeps().deps);
+    writeEnvStack(dir);
+    expect(readStackEnvValue(dir, 'PUBLIC_PORTAL_URL')).toBe('http://localhost:55001/portal');
+    pinWebAuthnForStack(dir, 'http://localhost:55002', fakeDeps().deps);
+    expect(readStackEnvValue(dir, 'PUBLIC_PORTAL_URL')).toBe('http://localhost:55002/portal');
+  });
+
+  it('does not clobber a tunnel stack PUBLIC_PORTAL_URL', () => {
+    writeEnvStack(dir);
+    setStackEnvValues(dir, { TUNNEL_ORIGIN_TEMPLATE: 'https://{host}.tunnel.example', PUBLIC_PORTAL_URL: 'https://portal.tunnel.example/portal' });
+    pinWebAuthnForStack(dir, 'http://localhost:55001', fakeDeps().deps);
+    expect(readStackEnvValue(dir, 'PUBLIC_PORTAL_URL')).toBe('https://portal.tunnel.example/portal');
+  });
+
+  // #9777 — tunnel teardown used to blank PUBLIC_PORTAL_URL, which compose then
+  // resolves to `https:///portal` again.
+  it('restoreLocalPublicUrls resets a tunnel-mode portal URL to the local base', () => {
+    writeEnvStack(dir);
+    setStackEnvValues(dir, { TUNNEL_ORIGIN_TEMPLATE: 'x', PUBLIC_PORTAL_URL: 'http://app.localhost:55001/portal' });
+    restoreLocalPublicUrls(dir, 'http://localhost:55001');
+    expect(readStackEnvValue(dir, 'PUBLIC_PORTAL_URL')).toBe('http://localhost:55001/portal');
+    expect(readStackEnvValue(dir, 'PUBLIC_APP_URL')).toBe('http://localhost:55001');
+    expect(readStackEnvValue(dir, 'PUBLIC_API_URL')).toBe('http://localhost:55001');
+    expect(readStackEnvValue(dir, 'DASHBOARD_URL')).toBe('http://localhost:55001');
   });
 
   it('overrides a root .env WEBAUTHN_RP_ID and origin for the local stack', () => {

@@ -158,7 +158,9 @@
       "organizationPolicyTitle": "Política da organização — aplica-se somente a {{organization}}",
       "summary": "{{filtered}} de {{total}} políticas",
       "inheritsBadge": "Herda",
-      "statusFilterLabel": "Status"
+      "statusFilterLabel": "Status",
+      "partnerPolicy": "Parceiro",
+      "partnerPolicyAppliesOnlyWhereAssigned": "Política do parceiro — aplica-se somente onde está atribuída. Atribua-a a todas as organizações para torná-la de todo o parceiro."
     },
     "configurationPoliciesPage": {
       "failedToFetchConfigurationPolicies": "Falha ao buscar as políticas de configuração",
@@ -198,7 +200,9 @@
       "appliedToAllOrganizationsUncheckAllOrganizations": "Aplicada a todas as organizações. Desmarque “Todas as organizações” para escolher um subconjunto.",
       "polite": "polite",
       "loading": "Carregando…",
-      "loadMoreOrganizations": "Carregar mais organizações"
+      "loadMoreOrganizations": "Carregar mais organizações",
+      "appliedToAllOrgs": "A política agora se aplica a todas as organizações",
+      "removedFromAllOrgs": "A política não se aplica mais a todas as organizações"
     },
     "featureTabs": {
       "automationTab": {
@@ -354,7 +358,11 @@
         "pathPrefix": "Prefixo do caminho",
         "optional": "(opcional)",
         "backupsBreeze": "backups/breeze/",
-        "keyPrefixForOrganizingObjectsInThe": "Prefixo da chave para organizar objetos no bucket.",
+        "keyPrefixHelp": "Prefixo da chave deste destino. Novos snapshots são armazenados em <prefix>/snapshots/. Os snapshots existentes permanecem onde estão. Alterá-lo torna o próximo backup um backup completo.",
+        "keyPrefixInvalidTooLong": "Prefixo da chave inválido: deve ter no máximo {{max}} caracteres.",
+        "keyPrefixInvalidSegment": "Prefixo da chave inválido: não pode conter segmentos vazios, \".\" ou \"..\".",
+        "keyPrefixInvalidCharacters": "Prefixo da chave inválido: use apenas letras, dígitos e ! _ . * ' ( ) - em cada segmento, separados por /.",
+        "keyPrefixInvalidReserved": "Prefixo da chave inválido: não pode conter um segmento \"snapshots\".",
         "customEndpoint": "Endpoint personalizado",
         "optional2": "(opcional)",
         "httpsS3UsWest002Backblazeb2Com": "https://s3.us-west-002.backblazeb2.com",
@@ -666,7 +674,18 @@
         "maxEventsPerCycle2": "maxEventsPerCycle",
         "minimumLevel": "minimumLevel",
         "collectionIntervalMinutes2": "collectionIntervalMinutes",
-        "rateLimitPerHour2": "rateLimitPerHour"
+        "rateLimitPerHour2": "rateLimitPerHour",
+        "applicationProvidersHeading": "Provedores de aplicativos (Aviso e Informação)",
+        "applicationProvidersHelp": "Os eventos de aplicativo dos níveis Erro e Crítico são coletados de todos os provedores; os de Aviso e Informação, somente dos provedores integrados ({{providers}}) e dos listados aqui. Use o nome exato do provedor exibido na coluna “Origem” do Visualizador de Eventos ou em Get-WinEvent -ListProvider.",
+        "applicationProvidersScope": "Somente a política de Logs de Eventos com precedência para o dispositivo se aplica. As listas de provedores não são combinadas entre políticas.",
+        "providerNameLabel": "Nome do provedor de eventos de aplicativo",
+        "addProvider": "Adicionar provedor",
+        "removeProvider": "Remover",
+        "removeProviderNamed": "Remover {{provider}}",
+        "providerNameInvalid": "Use de 1 a {{max}} caracteres, começando com uma letra ou um dígito. São permitidos letras, dígitos, espaços, pontos, sublinhados, cifrões, parênteses e hífens.",
+        "providerLimitReached": "Você pode adicionar até {{max}} provedores adicionais. Remova um para adicionar outro.",
+        "providerAlreadyListed": "Este provedor já está na lista.",
+        "providerLimit": "{{total}} de {{max}} provedores adicionais"
       },
       "featureTabShell": {
         "override": "Substituir",
@@ -701,7 +720,11 @@
         "showOpenPortal": "showOpenPortal",
         "showDeviceInfo": "showDeviceInfo",
         "showRequestSupport": "showRequestSupport",
-        "portalUrl": "portalUrl"
+        "portalUrl": "portalUrl",
+        "endpointMessaging": "Mensagens para dispositivos",
+        "endpointMessagingHelp": "Permite que técnicos enviem mensagens para a pessoa que usa o dispositivo.",
+        "allowUserReply": "Permitir respostas do usuário",
+        "allowUserReplyHelp": "Permite que a pessoa no dispositivo responda em um chat iniciado por um técnico. Desativado, os chats são unidirecionais."
       },
       "inlineEntityPicker": {
         "search": "Pesquisar...",
@@ -735,7 +758,7 @@
         "muteAlertNotificationsDuringWindow": "Nenhum alerta novo é criado durante a janela.",
         "suppressAlerts2": "suppressAlerts",
         "suppressPatching": "Suprimir aplicação de patches",
-        "delayPatchInstallationsDuringWindow": "Adiar instalações de patches durante a janela.",
+        "delayPatchInstallationsDuringWindow": "As instalações agendadas durante a janela são ignoradas e executadas na próxima ocorrência agendada.",
         "suppressPatching2": "suppressPatching",
         "suppressAutomations": "Suprimir automações",
         "pauseAutomationRunsDuringWindow": "Pausar execuções de automação durante a janela.",
@@ -744,15 +767,16 @@
         "pauseScriptExecutionDuringWindow": "Pausar a execução de scripts durante a janela.",
         "suppressScripts2": "suppressScripts",
         "rebootIfARebootIsPending": "Reiniciar se houver uma reinicialização pendente",
-        "duringTheWindowRebootDevicesThatHave": "Durante a janela, reinicie os dispositivos que tiverem uma reinicialização pendente. O Windows avisa o usuário conectado cerca de 5 minutos antes da reinicialização; o Linux agenda a reinicialização para 15 minutos depois e avisa os usuários conectados. O macOS não é compatível.",
+        "duringTheWindowRebootDevicesThatHave": "Durante a janela, reinicia os dispositivos com reinicialização pendente. O período de aviso vem do atraso de reinicialização da política de patches do dispositivo. O macOS não é compatível.",
         "rebootIfPending": "rebootIfPending",
-        "maintenanceRebootIfPendingToggle": "maintenance-reboot-if-pending-toggle",
         "notifyOnStart": "Notificar no início",
         "sendNotificationWhenWindowOpens": "Enviar uma notificação quando a janela for iniciada.",
         "notifyOnStart2": "notifyOnStart",
         "notifyOnEnd": "Notificar no término",
         "sendNotificationWhenWindowCloses": "Enviar uma notificação quando a janela for encerrada.",
-        "notifyOnEnd2": "notifyOnEnd"
+        "notifyOnEnd2": "notifyOnEnd",
+        "weeklyOpensEverySunday": "Janelas semanais abrem todo domingo no horário de início, no fuso horário selecionado.",
+        "monthlyOpensOnTheFirst": "Janelas mensais abrem no dia 1º de cada mês no horário de início, no fuso horário selecionado."
       },
       "monitorsTab": {
         "agentCollectionTitle": "Coleta do agente",
@@ -769,6 +793,7 @@
         "overridesLabel": "Substituições:",
         "failedToLoadMonitors": "Falha ao carregar os monitores",
         "createMonitor": "Criar monitor",
+        "notAttachable": "Este monitor não pode ser anexado a esta política. Políticas do parceiro só podem usar monitores de todo o parceiro.",
         "monitorDeleted": "Monitor excluído",
         "recommended": {
           "title": "Monitores recomendados",
@@ -791,25 +816,6 @@
         "approvalRulesLiveInThePAMConsole": "As regras de aprovação ficam no console do PAM",
         "thisPolicyOnlyControlsWhetherDevicesCapture": "Esta política controla apenas se os dispositivos capturam solicitações de elevação. As decisões (aprovar automaticamente, negar ou exigir aprovação), a fila de solicitações e o histórico de auditoria são gerenciados no",
         "privilegedAccessConsole": "console de Acesso Privilegiado"
-      },
-      "patchAppRulesSection": {
-        "applicationRules": "Regras de aplicativos",
-        "blockSpecificApplicationsFromAutomatedPatchingOr": "Bloqueie aplicativos específicos da aplicação automática de patches ou fixe-os em uma versão máxima.",
-        "blocked": "Bloqueado",
-        "pinned": "Fixado",
-        "maxVersion": "Versão máxima",
-        "pinnedApplicationsNeedAVersion": "Aplicativos fixados precisam de uma versão.",
-        "addApplication": "Adicionar aplicativo",
-        "searchCatalogAndDetectedApplications": "Pesquisar no catálogo e nos aplicativos detectados...",
-        "searching": "Pesquisando...",
-        "catalog": "catálogo",
-        "couldnTLoadApplicationsYouCanStill": "Não foi possível carregar os aplicativos — você ainda pode adicionar um pelo ID do pacote abaixo.",
-        "noMatches": "Nenhuma correspondência.",
-        "orEnterAPackageIDManually": "Ou insira manualmente um ID de pacote",
-        "block": "block",
-        "pin": "pin",
-        "thirdParty": "third_party",
-        "removeRuleFor": "Remover regra de {{application}}"
       },
       "patchTab": {
         "daily": "Diário",
@@ -860,14 +866,21 @@
         "offlineBehaviorSkip": "Ignorar dispositivos offline",
         "offlineBehaviorSkipDescription": "Dispositivos offline no momento da execução do trabalho são registrados como ignorados.",
         "rebootPolicy": "Política de reinicialização",
-        "rebootDelayMinutes": "Reboot delay (minutes)",
-        "rebootDelayMinutesDescription": "How long the logged-in user is warned before a post-patch reboot.",
-        "rebootAllowDeferral": "Let users postpone the restart",
-        "rebootAllowDeferralDescription": "Show the signed-in user a prompt with a Postpone button. Requires the Breeze helper to be running in the user's session; Linux devices fall back to the terminal warning. The restart still happens at the deadline once the postponements run out.",
-        "rebootMaxDeferrals": "Maximum postponements",
-        "rebootMaxDeferralsDescription": "How many times one user may postpone a single restart before it proceeds.",
-        "rebootDeferralMinutes": "Postpone by (minutes)",
-        "rebootDeferralMinutesDescription": "How far each postponement pushes the restart out.",
+        "rebootDelayMinutes": "Atraso para reinicialização (minutos)",
+        "rebootDelayMinutesDescription": "Tempo de aviso ao usuário conectado antes da reinicialização após a aplicação de patches.",
+        "rebootAllowDeferral": "Permitir que os usuários adiem a reinicialização",
+        "rebootAllowDeferralDescription": "Exibe ao usuário conectado uma mensagem com o botão Adiar. O auxiliar do Breeze precisa estar em execução na sessão do usuário; em dispositivos Linux, o aviso é exibido no terminal. A reinicialização ocorrerá no prazo definido após o esgotamento dos adiamentos.",
+        "rebootMaxDeferrals": "Número máximo de adiamentos",
+        "rebootMaxDeferralsDescription": "Quantas vezes um usuário pode adiar uma mesma reinicialização antes que ela seja executada.",
+        "rebootDeferralMinutes": "Adiar por (minutos)",
+        "rebootDeferralMinutesDescription": "Quanto tempo cada adiamento acrescenta ao prazo da reinicialização.",
+        "rebootPromptText": "Texto do aviso de reinicialização",
+        "rebootPromptTextDescription": "Opcional. Substitui o texto dos avisos de reinicialização exibidos aos usuários, por exemplo, para apresentá-los no idioma deles. Deixe o campo em branco para manter o texto padrão em inglês.",
+        "rebootPromptTitle": "Título",
+        "rebootPromptButton": "Texto do botão Reiniciar",
+        "rebootPromptBody": "Mensagem",
+        "rebootPromptBodyDescription": "Texto simples. {{placeholder}} é substituído pelo tempo restante até a reinicialização. O Windows exibe botões fixos Sim/Não; nesse caso, o texto do botão é mencionado na mensagem.",
+        "rebootPromptInvalid": "O aviso de reinicialização deve conter apenas texto simples (sem < ou >, sem quebras de linha no título ou no texto do botão) e não pode usar placeholders diferentes de {{placeholder}}.",
         "windowsUpdateSource": "Origem do Windows Update",
         "manageWindowsUpdateExclusivelyThroughBreeze": "Gerenciar o Windows Update exclusivamente pelo Breeze",
         "suppressesTheEndpointSNativeWindowsUpdate": "Suprime o canal nativo de instalação automática do Windows Update no endpoint, para que as atualizações sejam distribuídas somente pelos anéis de aprovação do Breeze — evitando reinicializações inesperadas e patches fora do seu agendamento. Somente para Windows; o fluxo de verificação, aprovação e instalação do próprio Breeze não é afetado. A configuração é revertida de forma segura quando desativada (uma Política de Grupo administrativa preexistente permanece inalterada).",
@@ -889,7 +902,25 @@
         "text2xl": "2xl",
         "saveChanges": "Salvar alterações",
         "createRing": "Criar anel",
-        "thirdPartyRingHint": "As regras de aprovação automática para atualizações de terceiros são configuradas no anel de atualização vinculado."
+        "thirdPartyRingHint": "As regras de aprovação automática para atualizações de terceiros são configuradas no anel de atualização vinculado.",
+        "ringOwnsApprovalHint": "A aprovação automática e as regras de aplicativo são definidas no anel de atualização vinculado.",
+        "noRingManualApprovalHint": "Nenhum anel vinculado — os patches só são instalados após aprovação manual.",
+        "unavailableRingOption": "Anel indisponível",
+        "ringInvalidTitle": "O anel de atualização vinculado não está mais disponível.",
+        "ringInvalidBody": "Os patches desta política ficam retidos até você escolher um anel e salvar.",
+        "ringDetailsNoHold": "Ordem de implantação {{order}} · sem espera antes da aprovação",
+        "ringDetailsWithHold_one": "Ordem de implantação {{order}} · {{count}} dia de espera antes da aprovação",
+        "ringDetailsWithHold_other": "Ordem de implantação {{order}} · {{count}} dias de espera antes da aprovação",
+        "rebootPreviewHeading": "Pré-visualização",
+        "rebootPreviewDescription": "O que a pessoa no computador vê se uma reinicialização for agendada agora. Os horários são exemplos.",
+        "rebootPreviewDefaultMarker": "Padrão",
+        "rebootPreviewDefaultTitle": "Reinicie para concluir a instalação das atualizações",
+        "rebootPreviewDefaultBody": "Sua equipe de suporte de TI precisa reiniciar este computador para concluir a instalação das atualizações.",
+        "rebootPreviewConsequence": "Se você não fizer nada, este computador será reiniciado às {{time}}. Salve seu trabalho antes disso.",
+        "rebootPreviewRestartNow": "Reiniciar agora",
+        "rebootPreviewPostponeUntil": "Adiar até as {{time}}",
+        "rebootPreviewDeadline": "Adiar nunca leva a reinicialização para depois das {{time}}.",
+        "rebootPreviewOk": "OK"
       },
       "peripheralControlTab": {
         "linkPeripheralPolicy": "Vincular política de periféricos",
@@ -976,6 +1007,9 @@
         "showIndicatorHelp": "Mostrar o banner na tela enquanto um técnico estiver conectado.",
         "notifyOnEnd": "Aviso de término de sessão",
         "notifyOnEndHelp": "Notificar o usuário final quando a sessão terminar.",
+        "allowUserEnd": "Permitir que o usuário encerre a sessão",
+        "allowUserEndHelp": "A pessoa no dispositivo pode encerrar a sessão pelo indicador na tela, após uma confirmação. O técnico vê “Encerrada pelo usuário”.",
+        "allowUserEndNeedsIndicator": "Ative o indicador de sessão ativa para permitir que os usuários encerrem uma sessão.",
         "identityLevel": "Identidade do técnico",
         "identityLevelHelp": "Quanto da identidade do técnico o usuário final vê. O nome do MSP é sempre exibido.",
         "identityNameEmail": "Nome e e-mail",
@@ -1016,7 +1050,25 @@
         "fullScan": "Varredura completa",
         "maxFileSizeMb": "Tamanho máximo de arquivo (MB)",
         "scanTimeoutMinutes": "Tempo limite da varredura (minutos)",
-        "scanRunsServerSideDescription": "O Breeze despacha essa varredura a partir do servidor — o dispositivo não precisa de um agendamento local."
+        "scanRunsServerSideDescription": "O Breeze despacha essa varredura a partir do servidor — o dispositivo não precisa de um agendamento local.",
+        "ruleSets": {
+          "title": "Conjuntos de regras de detecção",
+          "description": "Conjuntos de regras que as varreduras de IOC desta política usam.",
+          "manageLink": "Gerenciar regras de detecção",
+          "loading": "Carregando conjuntos de regras…",
+          "loadError": "Não foi possível carregar os conjuntos de regras. A política mantém os conjuntos atuais; você ainda pode salvar as outras configurações.",
+          "none": "Nenhum conjunto de regras está disponível para esta política.",
+          "legacyNote": "Sem conjuntos de regras: as varreduras usam apenas as assinaturas legadas integradas.",
+          "cap": "Uma política pode usar no máximo {{max}} conjuntos de regras.",
+          "unavailable": "Conjunto de regras indisponível",
+          "blocking": "Esta política não pode usar os conjuntos de regras indisponíveis (excluídos, movidos ou de outra organização). Remova-os antes de salvar.",
+          "overrideDraft": "As configurações herdadas incluem conjuntos de regras que esta política não pode usar. Remova os conjuntos indisponíveis e depois salve.",
+          "errors": {
+            "tooMany": "Uma política pode usar no máximo {{max}} conjuntos de regras.",
+            "invalidIds": "A lista de conjuntos de regras não é válida. Recarregue a página e tente novamente.",
+            "notAttachable": "Esta política não pode usar alguns dos conjuntos de regras selecionados. Eles estão destacados abaixo."
+          }
+        }
       },
       "sensitiveDataTab": {
         "credentials": "Credenciais",
@@ -1109,14 +1161,56 @@
         "thisPolicyOnlyControlsWhetherDevicesAre": "Esta política controla apenas se os dispositivos são verificados. Os CVEs detectados, as pontuações de risco e as ações de correção são gerenciados no",
         "vulnerabilitiesConsole": "console de Vulnerabilidades"
       },
+      "systemProtectionTab": {
+        "title": "Proteção do sistema",
+        "description": "Tentar um ponto de restauração do Windows antes de patches, scripts e instalações de software",
+        "beforePatching": "Antes de instalar patches",
+        "beforePatchingHelp": "Tentar um ponto de restauração antes de instalar atualizações do sistema operacional.",
+        "beforeScripts": "Antes de scripts",
+        "beforeScriptsHelp": "Tentar um ponto de restauração antes de executar um script no dispositivo.",
+        "beforeSoftwareInstall": "Antes de instalar software",
+        "beforeSoftwareInstallHelp": "Tentar um ponto de restauração antes de instalar ou atualizar software.",
+        "labelPrefix": "Prefixo do rótulo",
+        "labelPrefixHelp": "Exibido no início da descrição de cada ponto de restauração no Windows. Até 64 caracteres.",
+        "platformDefaultNote": "Nenhuma política atribuída. Padrão da plataforma: um ponto de restauração é tentado apenas antes de instalar patches.",
+        "legacyAgentWarning": "Desativar esta opção só tem efeito em agentes que informam suporte à Restauração do Sistema. Agentes mais antigos continuarão tentando um ponto de restauração antes de instalar patches.",
+        "aboutTitle": "Sobre a Restauração do Sistema",
+        "aboutBody": "Aplica-se apenas a dispositivos Windows. A Restauração do Sistema abrange arquivos do sistema, o registro, programas instalados e configurações. Não é um backup e não abrange arquivos pessoais. Por padrão, o Windows limita a criação de pontos de restauração a um a cada 24 horas, e um ponto criado pode ser removido depois pelo Windows ou se tornar inutilizável."
+      },
+      "securityAgentsTab": {
+        "title": "Agentes de segurança",
+        "description": "Implante e mantenha instalados agentes de segurança gerenciados nos dispositivos",
+        "deployVendor": "Implantar {{vendor}}",
+        "comingSoon": "Em breve",
+        "platformWindows": "Windows: instalado automaticamente.",
+        "platformMacos": "macOS: exige aprovação de MDM, portanto o Breeze não o instala automaticamente. Esses dispositivos aparecem como não aplicáveis.",
+        "platformLinux": "Linux: sem suporte.",
+        "keysNotice": "As instalações usam as chaves por cliente da integração do fornecedor (chaves de organização do Huntress, tokens de site do SentinelOne). Organizações que não estão mapeadas nessa integração são ignoradas e exibidas como não aplicáveis, sem implantações com falha. Desativar um fornecedor interrompe a aplicação, mas nunca desinstala o agente.",
+        "closerWarning": "Uma política de configuração atribuída mais perto do dispositivo (site, grupo ou dispositivo, ou uma política filha que herda) com configurações próprias de agentes de segurança substitui totalmente estas configurações para esses dispositivos. Um fornecedor omitido ali não é aplicado.",
+        "partnerWideBadge": "Aplica-se a todas as organizações",
+        "noneEnabledNote": "Nenhum fornecedor está ativado: os dispositivos alcançados por esta política ficam fora de todos os agentes de segurança.",
+        "catalogMissing": "{{vendors}} ainda não está configurado para este parceiro. Conecte primeiro a integração e salve novamente.",
+        "catalogMissingLink": "Conectar a integração",
+        "executeRequired": "Ativar as instalações exige permissão para executar comandos nos dispositivos, com MFA. Peça a um administrador com essa permissão para salvar esta configuração.",
+        "binaryMissing": "{{vendors}} não pode ser ativado até que o pacote integrado tenha um instalador implantável: um MSI do Windows como versão mais recente, com argumentos de instalação que incluam SITE_TOKEN={s1_site_token}. Corrija isso na aba Versões do pacote e salve novamente.",
+        "binaryMissingLink": "Abrir a aba Versões",
+        "platformMacosUnsupported": "macOS: não suportado.",
+        "sentinelOneMsiNote": "Adicione primeiro o MSI do SentinelOne na aba Versões do pacote integrado do SentinelOne, com argumentos de instalação que incluam SITE_TOKEN={s1_site_token}. O Breeze não fornece o instalador, e o SentinelOne não pode ser ativado até que ele esteja lá.",
+        "catalogMissingBuiltin": "{{vendors}} ainda não está no catálogo de software deste parceiro. Adicione-o em Software → Catálogo → Pacotes integrados e salve novamente.",
+        "catalogMissingBuiltinLink": "Abrir Pacotes integrados",
+        "dnsBuiltinNote": "Primeiro adicione {{vendor}} ao catálogo de software deste parceiro em Software → Catálogo → Pacotes integrados; ele não pode ser ativado antes disso.",
+        "dnsVariableNote": "Cada organização precisa da variável de locatário {{variable}}, criada como variável normal (não secreta). Organizações sem ela são ignoradas e exibidas como não aplicáveis.",
+        "dnsVariableLink": "Abrir Variáveis",
+        "dnsCoverageNote": "O Breeze não sincroniza o console do {{vendor}}, então a cobertura mostra apenas se cada dispositivo pode receber o cliente (pendente ou não aplicável). O estado da instalação e do serviço (ausente, parado) aparece na conformidade da política de software gerada."
+      },
       "warrantyTab": {
         "warrantyAlertingIsOptInDevicesWith": "Os alertas de garantia são opcionais: dispositivos sem uma política de garantia atribuída nunca geram alertas. Os limites abaixo se aplicam somente à cobertura por prazo determinado — assinaturas ativas do AppleCare são renovadas em vez de expirar, portanto seus alertas de vencimento são sempre suprimidos.",
         "enableWarrantyExpiryAlerts": "Ativar alertas de vencimento da garantia",
         "generateAlertsWhenFixedTermDeviceWarranties": "Gerar alertas quando garantias de dispositivos com prazo determinado estiverem próximas do vencimento.",
         "warningThresholdDays": "Limite de aviso (dias)",
-        "generateAWarningAlertWhenWarrantyExpires": "Gerar um alerta de aviso quando a garantia vencer dentro deste número de dias.",
-        "criticalThresholdDays": "Limite crítico (dias)",
-        "generateACriticalAlertWhenWarrantyExpires": "Gerar um alerta crítico quando a garantia vencer dentro deste número de dias.",
+        "warnThresholdHelp": "Gerar um alerta de severidade Informativo quando a garantia vencer dentro deste número de dias.",
+        "urgentThresholdDays": "Limite de urgência (dias)",
+        "urgentThresholdHelp": "Gerar um alerta de severidade Baixa quando a garantia vencer dentro deste número de dias. Uma garantia vencida gera um alerta de severidade Média.",
         "enabled": "enabled",
         "warnDays": "warnDays",
         "criticalDays": "criticalDays",
@@ -1136,6 +1230,20 @@
         "title": "Os dispositivos desta política alertarão duas vezes",
         "body": "Estas condições existem como monitor anexado e também como regra ou vigilância legada: {{names}}"
       }
+    },
+    "partnerGroupAssignment": {
+      "title": "Grupos de dispositivos (todas as org.)",
+      "description": "Selecione como destino um grupo de dispositivos de todo o parceiro. Uma atribuição de grupo se aplica no nível do grupo de dispositivos e, portanto, tem precedência sobre atribuições de outras políticas nos níveis de organização e site.",
+      "selectGroup": "Selecione um grupo de dispositivos",
+      "assign": "Atribuir",
+      "remove": "Remover",
+      "assigned": "Grupo de dispositivos atribuído",
+      "removed": "Atribuição do grupo de dispositivos removida",
+      "failedToLoad": "Não foi possível carregar os grupos de dispositivos",
+      "failedToAssign": "Não foi possível atribuir o grupo de dispositivos",
+      "failedToRemove": "Não foi possível remover a atribuição do grupo de dispositivos",
+      "empty": "Ainda não há grupos de dispositivos de todo o parceiro. Crie um em Grupos de dispositivos → Todas as org.",
+      "loading": "Carregando grupos de dispositivos…"
     }
   },
   "software": {
@@ -1195,7 +1303,7 @@
       "uploadFile": "Enviar arquivo",
       "source2": "source",
       "downloadUrl": "downloadUrl",
-      "noFileSelectedMsiExeDmgDeb": "Nenhum arquivo selecionado (.msi, .exe, .dmg, .deb, .pkg)",
+      "noFileSelectedMsiExeDmgDeb": "Nenhum arquivo selecionado (.msi, .exe, .dmg, .deb, .pkg, .zip)",
       "supportedOs": "supportedOs",
       "pkgInstall": "pkg-install",
       "silentInstallArgs2": "silentInstallArgs",
@@ -1251,7 +1359,19 @@
       "thisOrganizationOnly": "Apenas esta organização",
       "partnerWideUrlOnly": "Pacotes de nível de parceiro usam uma URL de download — o upload de arquivos ainda não está disponível para eles.",
       "selectedFileRemoved": "O arquivo selecionado foi removido — pacotes de nível de parceiro usam uma URL de download.",
-      "scopeLockedAfterCreate": "O pacote já foi criado com este escopo — a propriedade não pode mudar após a criação."
+      "scopeLockedAfterCreate": "O pacote já foi criado com este escopo — a propriedade não pode mudar após a criação.",
+      "installScripts": "Scripts de instalação",
+      "installScriptsHelp": "Obrigatórios para pacotes zip, opcionais nos demais casos. Os scripts são executados como SYSTEM no Windows ou root no macOS e no Linux, expiram após 10 minutos, exigem a permissão devices.execute e exatamente um sistema operacional de destino.",
+      "availableTokens": "Tokens disponíveis:",
+      "preInstallScript": "Script de pré-instalação",
+      "postInstallScript": "Script de pós-instalação",
+      "preInstallScriptPlaceholder": "Executado antes do instalador (PowerShell no Windows, bash no macOS e no Linux)",
+      "postInstallScriptPlaceholder": "Executado após o instalador ou após a extração do zip",
+      "silentArgsNotUsedForType": "Os argumentos de instalação silenciosa não são usados em instaladores pkg, dmg, deb ou zip.",
+      "issueZipRequiresPostInstallScript": "Pacotes zip precisam de um script de pós-instalação: o agente apenas extrai o arquivo.",
+      "issueScriptsRequireSingleOs": "Os scripts de instalação exigem exatamente um sistema operacional de destino.",
+      "issueScriptTooLarge": "Cada script de instalação deve ter 64 KiB ou menos.",
+      "issueArgsUnsupportedForFileType": "Os argumentos de instalação silenciosa não são compatíveis com este tipo de instalador."
     },
     "builtinPackageDetail": {
       "managedBuiltIn": "Integrado gerenciado",
@@ -1297,9 +1417,8 @@
       "noSoftwarePoliciesFoundCreateOneTo": "Nenhuma política de software encontrada. Crie uma para começar.",
       "recentViolations": "Violações recentes",
       "noCurrentSoftwareViolations": "Nenhuma violação de software atual.",
-      "violationS": "violação(ões)",
-      "remediation": "Correção:",
-      "checked": "Verificado em:",
+      "remediation": "Correção: {{value}}",
+      "checked": "Verificado em: {{date}}",
       "deactivatePolicy": "Desativar política",
       "areYouSureYouWantToDeactivate": "Tem certeza de que deseja desativar",
       "thePolicyWillBeMarkedInactiveAnd": "? A política será marcada como inativa e os dados de conformidade serão apagados.",
@@ -1327,7 +1446,26 @@
       "installSkippedNoCatalog": "Uma regra obrigatória não tem um item de catálogo vinculado, então não há nada para instalar. Adicione um vínculo de catálogo no editor de políticas para corrigir isso.",
       "installSkippedCapOrPlatform": "Não é uma falha — o limite de instalações por passagem foi atingido ou a plataforma deste dispositivo não tem um método de instalação para o software. Pode ser tentado novamente na próxima passagem.",
       "installAttempts": "{{count}} tentativa(s)",
-      "installLastAttempt": "Última tentativa de instalação: "
+      "installLastAttempt": "Última tentativa de instalação: ",
+      "managedByConfigPolicy": "Gerenciada por política de configuração",
+      "managedByConfigPolicyHint": "Esta política é gerada a partir de uma política de configuração e é somente leitura aqui. Altere-a em Políticas de configuração.",
+      "securityAgentCoverage": "Cobertura de agentes de segurança",
+      "coverageDevice": "Dispositivo",
+      "coverageVendor": "Fornecedor",
+      "coverageReason": "Motivo",
+      "vendorOnlyAgent": "Agente somente do fornecedor",
+      "coverageRowsNote": "Exibindo {{shown}} de {{total}}",
+      "violationCount": "{{count}} violação",
+      "violationCount_one": "{{count}} violação",
+      "violationCount_other": "{{count}} violações",
+      "violationTypes": {
+        "unauthorized": "Não autorizado",
+        "missing": "Ausente",
+        "outdated": "Desatualizado",
+        "not_running": "Não está em execução",
+        "service_unverified": "Serviço não verificado",
+        "serviceTitle": "Serviço: {{name}}"
+      }
     },
     "deploymentList": {
       "running": "Em execução",
@@ -1390,6 +1528,8 @@
       "error": "Erro",
       "deploymentComplete": "Implantação concluída",
       "inProgress": "Em andamento",
+      "completedWithErrors": "Concluído com erros",
+      "scheduledFor": "Agendado para {{time}}",
       "autoRefreshing": "Atualização automática a cada 5 segundos",
       "queuedOffline": "Na fila — dispositivo offline",
       "cancelled": "Cancelado",
@@ -1411,7 +1551,8 @@
       "devicesFinished": "{{finished}} de {{total}} dispositivos concluídos",
       "setupNeeded": "Configuração necessária",
       "managerUnavailableSummary_one": "Falta o gerenciador de pacotes em {{count}} dispositivo. É uma configuração única do dispositivo: instale o winget (Windows) ou o Homebrew (macOS) nele; até lá, toda implantação por gerenciador de pacotes vai falhar.",
-      "managerUnavailableSummary_other": "Falta o gerenciador de pacotes em {{count}} dispositivos. É uma configuração única dos dispositivos: instale o winget (Windows) ou o Homebrew (macOS) neles; até lá, toda implantação por gerenciador de pacotes vai falhar."
+      "managerUnavailableSummary_other": "Falta o gerenciador de pacotes em {{count}} dispositivos. É uma configuração única dos dispositivos: instale o winget (Windows) ou o Homebrew (macOS) neles; até lá, toda implantação por gerenciador de pacotes vai falhar.",
+      "deviceOutputTail": "Saída do dispositivo (últimas linhas)"
     },
     "deploymentWizard": {
       "selectSoftware": "Selecionar Software",
@@ -1541,20 +1682,25 @@
       "registry": "registry",
       "fileExists": "file_exists",
       "msiProductCode": "msi_product_code",
-      "fileVersion": "file_version"
+      "fileVersion": "file_version",
+      "serviceRunning": "Serviço em execução",
+      "readOnlyHint": "Criada pela API. Não editável aqui; é mantida sem alterações ao salvar.",
+      "serviceName": "Nome do serviço",
+      "serviceNamePlaceholder": "ex.: ctrld",
+      "serviceNameHint": "Nome de serviço do Windows, rótulo launchd do macOS ou unidade systemd do Linux. Verificado antes e depois da instalação.",
+      "serviceNameInvalid": "Informe um nome de serviço sem caracteres de controle e sem \"-\" no início (no máximo 256 bytes)."
     },
     "deviceDrawer": {
       "failedToFetchDevices": "Falha ao buscar dispositivos",
-      "devicesWith": "Dispositivos com",
-      "by": "por",
+      "devicesWith": "Dispositivos com {{name}}",
+      "by": "por {{vendor}}",
       "noDevicesFoundWithThisSoftware": "Nenhum dispositivo encontrado com este software.",
       "hostname": "Hostname",
       "oS": "OS",
       "version": "Versão",
       "lastSeen": "Visto pela última vez",
-      "device": "dispositivo",
-      "total": "total",
-      "s": "s"
+      "deviceTotal_one": "{{count}} dispositivo no total",
+      "deviceTotal_other": "{{count}} dispositivos no total"
     },
     "policyForm": {
       "dryRunUnassigned": "0 dispositivos — geralmente porque esta política ainda não foi atribuída a nenhum dispositivo, mas uma frota totalmente conforme ou uma lista de sites vazia também resulta em 0",
@@ -1659,7 +1805,10 @@
       "catalogTab": "Catálogo",
       "summaryCompleted7d": "Concluídas (7 dias)",
       "summaryFailed7d": "Com falha (7 dias)",
-      "categoryFilterLabel": "Categoria"
+      "categoryFilterLabel": "Categoria",
+      "requiredVariables": "Variáveis obrigatórias",
+      "uninstallCommand": "Comando de desinstalação",
+      "managedByBreezeHint": "Gerenciado pelo Breeze. Este pacote não pode ser editado nem excluído, e novas versões não podem ser adicionadas aqui."
     },
     "softwareInventory": {
       "allowed": "Permitido",
@@ -1801,7 +1950,10 @@
       "uploadsRequireS3Storage": "O upload de arquivos requer um armazenamento de objetos S3 configurado no servidor.",
       "editingVersion": "Editando versão",
       "failedToUpdateVersion": "Falha ao atualizar a versão",
-      "replaceFileAddNewVersion": "Para substituir o arquivo do instalador, adicione uma nova versão."
+      "replaceFileAddNewVersion": "Para substituir o arquivo do instalador, adicione uma nova versão.",
+      "inactiveStoredScripts": "Os scripts de instalação armazenados não estão ativos; recrie a versão para ativá-los.",
+      "addZipFromAddPackage": "Adicione pacotes zip em Adicionar pacote.",
+      "builtinVersionsReadOnly": "Gerenciado pelo Breeze. As versões dos pacotes integrados não podem ser adicionadas nem alteradas aqui."
     },
     "variableInput": {
       "insertADeployTimeVariable": "Inserir uma variável de tempo de implantação",
@@ -1835,6 +1987,30 @@
       "queuedNone": "Nada foi enfileirado: os dispositivos da prévia não precisam mais de correção ou já a têm pendente.",
       "queuedPartial": "Correção enfileirada para {{queued}} de {{requested}} dispositivo(s) da prévia; os demais não precisam mais dela ou já a têm pendente.",
       "previewFailedWithReason": "Não foi possível carregar a prévia da correção: {{reason}}"
+    },
+    "builtinPackagesPanel": {
+      "title": "Pacotes integrados",
+      "description": "Clientes de filtragem de DNS fixados e verificados pelo Breeze. Adicione um ao seu catálogo, defina a variável dele para cada organização e depois implante-o como qualquer outro pacote.",
+      "colPackage": "Pacote",
+      "colPlatform": "Plataforma",
+      "colPinnedVersion": "Versão fixada",
+      "colRequiredVariables": "Variáveis obrigatórias",
+      "colUninstallCommand": "Comando de desinstalação",
+      "colStatus": "Status",
+      "addToCatalog": "Adicionar ao catálogo",
+      "adding": "Adicionando…",
+      "inCatalog": "No catálogo",
+      "archived": "Arquivado",
+      "restoreToCatalog": "Restaurar",
+      "addedToCatalog": "{{name}} adicionado ao catálogo",
+      "couldNotAddToCatalog": "Não foi possível adicionar {{name}} ao catálogo",
+      "couldNotLoadBuiltinPackages": "Não foi possível carregar os pacotes integrados",
+      "loadingBuiltinPackages": "Carregando pacotes integrados…",
+      "setVariablesPerOrganization": "Defina por organização em Configurações → Variáveis",
+      "copyUninstallCommand": "Copiar comando de desinstalação",
+      "uninstallCommandCopied": "Comando de desinstalação copiado",
+      "breezeDoesNotUninstall": "O Breeze não desinstala esses clientes. Execute o comando no dispositivo para remover um.",
+      "copyFailed": "Falha ao copiar. Selecione o comando e copie-o manualmente."
     }
   }
 }

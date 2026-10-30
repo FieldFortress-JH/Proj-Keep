@@ -46,7 +46,13 @@ export type SoftwarePolicyRulesDefinition = {
 };
 
 export type SoftwarePolicyViolation = {
-  type: 'unauthorized' | 'missing'; // 'outdated' planned but not yet emitted
+  /**
+   * 'outdated' is planned but not yet emitted. `not_running` and
+   * `service_unverified` come from the `service_running` compliance bridge
+   * (#6958 PR E, services/softwarePolicyServiceRules.ts) and never drive
+   * install or uninstall remediation.
+   */
+  type: 'unauthorized' | 'missing' | 'not_running' | 'service_unverified';
   software?: {
     name: string;
     version?: string | null;
@@ -64,6 +70,12 @@ export type SoftwarePolicyViolation = {
      * unique within a policy, so re-deriving it by name is not an option.
      */
     catalogId?: string;
+  };
+  /** The observed service behind a `not_running` / `service_unverified` violation (#6958). */
+  service?: {
+    name: string;
+    observedStatus: 'stopped' | 'not_found' | 'error' | null;
+    observedAt: string | null;
   };
   severity: 'low' | 'medium' | 'high' | 'critical';
   detectedAt: string;
@@ -118,11 +130,28 @@ export const softwarePolicies = pgTable('software_policies', {
    * never enforces a policy shape that was edited after it was queued.
    */
   approvalGeneration: integer('approval_generation').notNull().default(1),
+  /**
+   * Set only on a policy GENERATED from a `security_agents` config-policy
+   * feature link (#6960). Such a row is read-only to callers (the routes and AI
+   * tools answer 409 and point at the config policy) and resolves through its
+   * own dimension (`resolveDeviceIdsForSoftwarePolicy`). Only the generator
+   * writes it; write schemas never accept it. ON DELETE CASCADE: removing the
+   * link removes the generated policy (never an uninstall).
+   *
+   * The FK (-> the feature-link table's id, ON DELETE CASCADE) lives in the
+   * SQL migration only: a drizzle .references() would import
+   * ./configurationPolicies from here and close an import cycle through its
+   * schema dependencies (same reason as config_policy_backup_settings).
+   */
+  managedByLinkId: uuid('managed_by_link_id'),
 }, (table) => ({
   orgIdIdx: index('software_policies_org_id_idx').on(table.orgId),
   partnerIdIdx: index('software_policies_partner_id_idx').on(table.partnerId),
   targetTypeIdx: index('software_policies_target_type_idx').on(table.targetType),
   activePriorityIdx: index('software_policies_active_priority_idx').on(table.isActive, table.priority),
+  managedByLinkIdx: index('software_policies_managed_by_link_idx')
+    .on(table.managedByLinkId)
+    .where(sql`${table.managedByLinkId} IS NOT NULL`),
 }));
 
 export const softwareComplianceStatus = pgTable('software_compliance_status', {
@@ -152,6 +181,12 @@ export const softwareComplianceStatus = pgTable('software_compliance_status', {
   // cooldown bound the RATE of a mismatched-rule reinstall loop but never stop
   // it; this counter is what terminates it, at 'gave_up'.
   installRemediationAttempts: integer('install_remediation_attempts').notNull().default(0),
+  // #6958 PR E: the `service_running` names (OS-filtered, deduped, capped) the
+  // compliance worker derived for this (policy, device) on its last pass. The
+  // agent heartbeat unions them into the device's monitoring watches; restart
+  // authority is re-derived from the live policy row at read time and is
+  // never stored here. NULL = the policy derives no names for this device.
+  serviceWatches: jsonb('service_watches').$type<Array<{ name: string }>>(),
 }, (table) => ({
   deviceIdIdx: index('software_compliance_device_id_idx').on(table.deviceId),
   policyIdIdx: index('software_compliance_policy_id_idx').on(table.policyId),

@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Tester sur un appareil",
       "selectDevice": "Appareil",
-      "run": "Exécuter le test"
+      "run": "Exécuter le test",
+      "saveToTest": "Enregistrez pour tester vos modifications"
     },
     "deliveryPreview": {
       "selectOrg": "Sélectionnez une organisation pour prévisualiser la livraison.",
@@ -192,7 +193,8 @@
     "script": "Vérification de script",
     "network_check": "Vérification réseau",
     "hardware_health": "État du matériel",
-    "time_sync": "Synchronisation de l’heure"
+    "time_sync": "Synchronisation de l’heure",
+    "container_image_currency": "Actualité des images de conteneur"
   },
   "fields": {
     "operator": "Comparaison",
@@ -244,7 +246,9 @@
     "expectedValue": "Valeur attendue",
     "nameserver": "Serveur de noms",
     "degradedIsFailure": "Considérer « dégradé » comme un échec",
-    "maxResponseMs": "Échec au-delà de (ms)"
+    "maxResponseMs": "Échec au-delà de (ms)",
+    "eventLogCollectionNoSource": "Les événements d’application de niveau Information et Avertissement sont recueillis uniquement auprès de {{providers}}. Les événements d’autres sources correspondent à cette règle seulement au niveau Erreur ou Critique, sauf si une stratégie de configuration des journaux d’événements inclut la source (Stratégie de configuration → Journaux d’événements → Fournisseurs d’applications).",
+    "eventLogCollectionSourceNotCollected": "L’agent ne recueille pas les événements d’application de niveau Information ou Avertissement de « {{source}} », sauf si une stratégie de configuration des journaux d’événements l’inclut (Stratégie de configuration → Journaux d’événements → Fournisseurs d’applications). Sinon, cette règle correspond uniquement à ses événements Erreur ou Critique. Fournisseurs intégrés : {{providers}}."
   },
   "operators": {
     "gt": "supérieur à",
@@ -268,6 +272,7 @@
     "system": "Système"
   },
   "eventLevels": {
+    "info": "Informations",
     "warning": "Avertissement",
     "error": "Erreur",
     "critical": "Critique"
@@ -328,10 +333,13 @@
     "cancel": "Annuler",
     "detachConfirm": "Détacher de {{policy}}?",
     "errors": {
+      "loadGroups": "Impossible de charger les groupes d’appareils.",
       "attach": "Impossible de joindre le moniteur",
       "detach": "Impossible de détacher le moniteur",
       "linkedFeature": "Les moniteurs de cette politique proviennent d'une politique de fonctionnalité partagée. Modifiez cette politique ou choisissez-en une autre."
-    }
+    },
+    "partnerWideGroups": "Toutes les org. (à l’échelle du partenaire)",
+    "organizationGroups": "Groupes d’organisation"
   },
   "policyTab": {
     "title": "Moniteurs",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Règles d’alerte héritées",
     "description": "Règles d’alerte autonomes qui ne sont pas gérées par un moniteur. Convertissez-les pour regrouper réponses, livraison et escalade en un seul endroit.",
-    "empty": "Aucune règle héritée.",
+    "empty": "Aucune règle d’alerte autonome n’a besoin d’être convertie.",
     "columns": {
       "name": "Nom",
       "template": "Modèle",
@@ -535,11 +543,13 @@
       "more": "Charger plus",
       "empty": "Aucun historique de conversion.",
       "system": "Système",
+      "unknownUser": "Utilisateur inconnu",
       "reverted": "Annulée",
       "deadline": "L'annulation est indisponible après la suppression du moteur source par le retrait des alertes héritées."
     },
     "errorCodes": {
       "preview_stale": "La politique a changé depuis cet aperçu. Générez un nouvel aperçu avant de convertir.",
+      "conversion_contended": "Des modifications simultanées ont interrompu la conversion. Rien n'a été modifié. Réessayez.",
       "preview_failed": "L'aperçu n'a pas pu être généré. Réessayez plus tard.",
       "equivalence_delta": "Les moniteurs convertis ne se comporteraient pas comme les règles héritées sur tous les appareils. Vérifiez l'aperçu avant de convertir.",
       "CONVERSION_PREREQUISITE_MISSING": "Une mise à jour requise de la plateforme n'a pas encore été déployée; la conversion est donc impossible.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "La stratégie horaire n’a pas été appliquée",
           "policy_conflict_gpo": "Une stratégie de groupe contrôle les paramètres horaires"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Nombre minimal de jours de retard"
       }
     }
   },

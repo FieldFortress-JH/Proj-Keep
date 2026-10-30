@@ -2,6 +2,9 @@ import type { InheritableAiBudgetSettings } from '@breeze/shared';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import AiBudgetThresholdsInput from './AiBudgetThresholdsInput';
+import FieldLabel from './partnerSettings/FieldLabel';
+import SettingBadge from './partnerSettings/SettingBadge';
+import InheritanceLine from './partnerSettings/InheritanceLine';
 import { TOOL_RATE_LIMIT_MULTIPLIER_MAX, TOOL_RATE_LIMIT_MULTIPLIER_MIN } from '@/lib/aiBudget';
 
 type Props = {
@@ -9,14 +12,15 @@ type Props = {
   data: InheritableAiBudgetSettings;
   onChange: (data: InheritableAiBudgetSettings) => void;
   /**
-   * Raised when the alert-threshold box holds text that does not parse. The
-   * hub gates its Save button on it, so an unparseable ladder cannot be
-   * silently dropped while the save reports success (#4388 W03).
+   * The alert-threshold box as typed (`null` until edited). The page owns it so
+   * an unparseable ladder survives a tab switch and keeps Save blocked
+   * (#4388 W03); validity is derived from it by the partners/me unit.
    */
-  onValidityChange?: (valid: boolean) => void;
+  thresholdsText?: string | null;
+  onThresholdsTextChange?: (text: string) => void;
 };
 
-export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }: Props) {
+export default function PartnerAiBudgetsTab({ data, onChange, thresholdsText, onThresholdsTextChange }: Props) {
   const { t } = useTranslation('settings');
   const set = (patch: Partial<InheritableAiBudgetSettings>) =>
     onChange({ ...data, ...patch });
@@ -31,22 +35,29 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <input
-          type="checkbox"
-          checked={data.enabled ?? false}
-          onChange={e => set({ enabled: e.target.checked })}
-          className="h-4 w-4 rounded border"
-        />
-        <label className="text-sm font-medium">{t('partnerAiBudgets.enable')}</label>
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <label className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={data.enabled ?? false}
+              onChange={e => set({ enabled: e.target.checked })}
+              className="h-4 w-4 rounded border"
+            />
+            <span className="text-sm font-medium">{t('partnerAiBudgets.enable')}</span>
+          </label>
+          <SettingBadge fieldId="aiBudgets.enabled" />
+        </div>
+        <InheritanceLine fieldId="aiBudgets.enabled" />
       </div>
 
       {data.enabled && (
         <>
           <div className="grid gap-6 sm:grid-cols-2">
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.monthlyBudget')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-monthly-budget" fieldId="aiBudgets.monthlyBudgetCents">{t('partnerAiBudgets.monthlyBudget')}</FieldLabel>
               <input
+                id="partner-ai-budget-monthly-budget"
                 type="number"
                 step="0.01"
                 min={0}
@@ -55,11 +66,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 placeholder={t('partnerAiBudgets.notSet')}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm"
               />
+              <InheritanceLine fieldId="aiBudgets.monthlyBudgetCents" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.dailyBudget')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-daily-budget" fieldId="aiBudgets.dailyBudgetCents">{t('partnerAiBudgets.dailyBudget')}</FieldLabel>
               <input
+                id="partner-ai-budget-daily-budget"
                 type="number"
                 step="0.01"
                 min={0}
@@ -68,11 +81,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 placeholder={t('partnerAiBudgets.notSet')}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm"
               />
+              <InheritanceLine fieldId="aiBudgets.dailyBudgetCents" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.approvalMode')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-approval-mode" fieldId="aiBudgets.approvalMode">{t('partnerAiBudgets.approvalMode')}</FieldLabel>
               <select
+                id="partner-ai-budget-approval-mode"
                 value={data.approvalMode ?? ''}
                 onChange={e => set({ approvalMode: (e.target.value || undefined) as InheritableAiBudgetSettings['approvalMode'] })}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm"
@@ -83,11 +98,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 <option value="auto_approve">{t('partnerAiBudgets.modes.autoApprove')}</option>
                 <option value="hybrid_plan">{t('partnerAiBudgets.modes.hybridPlan')}</option>
               </select>
+              <InheritanceLine fieldId="aiBudgets.approvalMode" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.maxTurns')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-max-turns" fieldId="aiBudgets.maxTurnsPerSession">{t('partnerAiBudgets.maxTurns')}</FieldLabel>
               <input
+                id="partner-ai-budget-max-turns"
                 type="number"
                 value={data.maxTurnsPerSession ?? ''}
                 onChange={e => set({ maxTurnsPerSession: e.target.value ? Number(e.target.value) : undefined })}
@@ -96,11 +113,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 min={1}
                 max={100}
               />
+              <InheritanceLine fieldId="aiBudgets.maxTurnsPerSession" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.messagesPerMinute')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-messages-per-minute" fieldId="aiBudgets.messagesPerMinutePerUser">{t('partnerAiBudgets.messagesPerMinute')}</FieldLabel>
               <input
+                id="partner-ai-budget-messages-per-minute"
                 type="number"
                 value={data.messagesPerMinutePerUser ?? ''}
                 onChange={e => set({ messagesPerMinutePerUser: e.target.value ? Number(e.target.value) : undefined })}
@@ -109,11 +128,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 min={1}
                 max={60}
               />
+              <InheritanceLine fieldId="aiBudgets.messagesPerMinutePerUser" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.messagesPerHour')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-messages-per-hour" fieldId="aiBudgets.messagesPerHourPerOrg">{t('partnerAiBudgets.messagesPerHour')}</FieldLabel>
               <input
+                id="partner-ai-budget-messages-per-hour"
                 type="number"
                 value={data.messagesPerHourPerOrg ?? ''}
                 onChange={e => set({ messagesPerHourPerOrg: e.target.value ? Number(e.target.value) : undefined })}
@@ -122,11 +143,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 min={1}
                 max={10000}
               />
+              <InheritanceLine fieldId="aiBudgets.messagesPerHourPerOrg" />
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('aiUsagePage.toolRateLimitMultiplier')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-tool-rate-limit-multiplier" fieldId="aiBudgets.toolRateLimitMultiplier">{t('aiUsagePage.toolRateLimitMultiplier')}</FieldLabel>
               <input
+                id="partner-ai-budget-tool-rate-limit-multiplier"
                 type="number"
                 data-testid="partner-ai-budget-tool-rate-limit-multiplier"
                 value={data.toolRateLimitMultiplier ?? ''}
@@ -137,29 +160,28 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
                 min={TOOL_RATE_LIMIT_MULTIPLIER_MIN}
                 max={TOOL_RATE_LIMIT_MULTIPLIER_MAX}
               />
+              <InheritanceLine fieldId="aiBudgets.toolRateLimitMultiplier" />
               <p className="text-xs text-muted-foreground">{t('aiUsagePage.toolRateLimitMultiplierHelp')}</p>
             </div>
 
             <div className="space-y-2 sm:col-span-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.alertThresholds')}</label>
+              <FieldLabel htmlFor="partner-ai-budget-thresholds" fieldId="aiBudgets.alertThresholdPercents">{t('partnerAiBudgets.alertThresholds')}</FieldLabel>
               <AiBudgetThresholdsInput
+                id="partner-ai-budget-thresholds"
                 value={data.alertThresholdPercents}
                 onChange={(v) => set({ alertThresholdPercents: v })}
-                onValidityChange={onValidityChange}
+                text={thresholdsText}
+                onTextChange={onThresholdsTextChange}
                 placeholder={t('partnerAiBudgets.notSet')}
                 testId="partner-ai-budget-thresholds"
               />
+              <InheritanceLine fieldId="aiBudgets.alertThresholdPercents" />
               <p className="text-xs text-muted-foreground">{t('partnerAiBudgets.alertThresholdsHelp')}</p>
             </div>
           </div>
 
           <p className="text-xs text-muted-foreground">
             {t('partnerAiBudgets.description')}
-          </p>
-          {/* #6004: the org-side editor is now a tab of its own, so say plainly
-              what setting a field here does to it. */}
-          <p className="text-xs text-muted-foreground" data-testid="partner-ai-budgets-override-note">
-            {t('partnerAiBudgets.overridesOrgTab')}
           </p>
         </>
       )}

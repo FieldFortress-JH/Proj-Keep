@@ -5,23 +5,31 @@ import {
   FileCode,
   Keyboard,
   Loader2,
+  MessageSquare,
   Monitor,
   Plus,
   Search,
   Settings,
+  Sparkles,
   Terminal,
-  Users,
   Zap,
   type LucideIcon
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTranslation } from 'react-i18next';
 import { navigateTo } from '@/lib/navigation';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { useOrgStore } from '../../stores/orgStore';
+import { useFeaturesStore } from '../../stores/featuresStore';
+import { useAiStore } from '../../stores/aiStore';
+import { getJwtClaims } from '../../lib/authScope';
+import { getPartnersMe } from '../../lib/api/partnersMe';
+import { hasPermission } from '../../lib/permissions';
+import { searchSettingsCatalog } from '../../lib/settingsSearch';
 import { useUiStore } from '../../stores/uiStore';
 import { useRecentsStore } from '../../stores/recentsStore';
 
-type SearchCategory = 'devices' | 'scripts' | 'alerts' | 'users' | 'settings';
+type SearchCategory = 'devices' | 'scripts' | 'alerts' | 'settings';
 
 type SearchResult = {
   id?: string;
@@ -54,7 +62,6 @@ const CATEGORY_ORDER: SearchCategory[] = [
   'devices',
   'scripts',
   'alerts',
-  'users',
   'settings'
 ];
 
@@ -83,11 +90,6 @@ const CATEGORY_CONFIG: Record<
     label: 'Alerts',
     icon: Bell,
     baseHref: '/alerts'
-  },
-  users: {
-    label: 'Users',
-    icon: Users,
-    baseHref: '/settings/users'
   },
   settings: {
     label: 'Settings',
@@ -213,8 +215,60 @@ const buildResultHref = (result: SearchResult): string => {
   return config.baseHref;
 };
 
+type PartnerAiFlags = { wispEnabled: boolean; aiForOfficeEnabled: boolean };
+const PARTNER_AI_FLAGS_OFF: PartnerAiFlags = { wispEnabled: false, aiForOfficeEnabled: false };
+
+/**
+ * The partner's Wisp and AI for Office flags, from one GET /orgs/partners/me
+ * answer (#10135). The palette mounts on every page, so it asks only once it has
+ * been opened, at most once per mount while the answer is good (the shared read
+ * also coalesces with the sidebar's). Partner tokens only: the route is
+ * partner-level. Unknown, failed or non-partner reads as both off — an entry
+ * stays hidden rather than offering what may 404 — and a failed read is retried
+ * on the next open.
+ */
+function usePartnerAiFlags(active: boolean): PartnerAiFlags {
+  const [flags, setFlags] = useState<PartnerAiFlags>(PARTNER_AI_FLAGS_OFF);
+  const askedRef = useRef(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  useEffect(() => {
+    if (!active || askedRef.current) return;
+    if (getJwtClaims().scope !== 'partner') return;
+    askedRef.current = true;
+    getPartnersMe()
+      .then((read) => {
+        if (!read.ok) {
+          askedRef.current = false;
+          if (read.status !== 403 && read.status !== 404) {
+            console.warn('[CommandPalette] partner AI flags read returned', read.status);
+          }
+          return;
+        }
+        const data = read.data as { wispEnabled?: unknown; aiForOfficeEnabled?: unknown } | null;
+        if (data === null || typeof data !== 'object') {
+          // getPartnersMe turns an unparseable 200 body into null: no answer,
+          // not "both off" — ask again next time rather than latching off.
+          askedRef.current = false;
+          console.warn('[CommandPalette] partner AI flags read had no readable body');
+          return;
+        }
+        if (!mountedRef.current) return;
+        setFlags({ wispEnabled: data?.wispEnabled === true, aiForOfficeEnabled: data?.aiForOfficeEnabled === true });
+      })
+      .catch((err: unknown) => {
+        askedRef.current = false;
+        console.warn('[CommandPalette] reading partner AI flags failed', err);
+      });
+  }, [active]);
+  return flags;
+}
+
 export default function CommandPalette() {
-  const { t } = useTranslation('common');
+  const { t } = useTranslation(['common', 'pages', 'settings']);
   // Open state lives in the ui store so the "/" shortcut (useGlobalShortcuts)
   // and any other island can open the same palette.
   const open = useUiStore((s) => s.isCommandPaletteOpen);
@@ -224,6 +278,24 @@ export default function CommandPalette() {
   const openShortcutsHelp = useUiStore((s) => s.openShortcutsHelp);
   const recentDevices = useRecentsStore((s) => s.devices);
   const recentPages = useRecentsStore((s) => s.pages);
+  const isPlatformAdmin = useAuthStore((s) => s.user?.isPlatformAdmin === true);
+  const permissions = useAuthStore((s) => s.user?.permissions);
+  const serviceManagementMode = useOrgStore((s) => s.serviceManagementMode);
+  // The palette is a global overlay: server results follow the org switcher
+  // on every page, including catalog routes where fetchWithAuth injects no
+  // ambient orgId. null = All organizations (the server returns every
+  // accessible org). The API narrows only within the caller's access (#9612).
+  const selectedOrgId = useOrgStore((s) => s.currentOrgId);
+  // Read-only: the palette mounts on every page, so it must not trigger the
+  // /config or autopay fetches the gate hooks fire. An unknown gate hides the
+  // entry (the nav's own default), and the sidebar loads /config anyway.
+  const toolSourcesEnabled = useFeaturesStore((s) => s.features.toolSources);
+  const flowsEnabled = useFeaturesStore((s) => s.features.flows);
+  const { wispEnabled, aiForOfficeEnabled } = usePartnerAiFlags(open);
+  const openAiPanel = useAiStore((s) => s.open);
+  // #6396: every own-session /ai/* route requires ai_sessions:use — the same
+  // gate as the header's Breeze AI button and the sidebar's AI doors.
+  const canUseAi = hasPermission(permissions, 'ai_sessions', 'use');
   const [modifierLabel, setModifierLabel] = useState('');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -269,10 +341,19 @@ export default function CommandPalette() {
 
     const performSearch = async () => {
       try {
-        const response = await fetchWithAuth(`/search?q=${encodeURIComponent(debouncedQuery)}`);
+        const response = await fetchWithAuth(`/search?q=${encodeURIComponent(debouncedQuery)}`, {
+          orgIdOverride: selectedOrgId ?? null,
+        });
         if (!isActive) return;
 
         if (!response.ok) {
+          // A 403 with an org selected is the server refusing that org (a
+          // stale or revoked selection, #9612), not a dead session.
+          if (response.status === 403 && selectedOrgId) {
+            setResults([]);
+            setErrorMessage("You don't have access to the selected organization.");
+            return;
+          }
           // Auth errors mean an expired/absent session, not "no matches" — say
           // so explicitly instead of rendering the empty-results copy, which
           // would imply the data is gone.
@@ -301,7 +382,7 @@ export default function CommandPalette() {
     return () => {
       isActive = false;
     };
-  }, [debouncedQuery, open]);
+  }, [debouncedQuery, open, selectedOrgId]);
 
   useEffect(() => {
     if (open) return;
@@ -339,7 +420,7 @@ export default function CommandPalette() {
   );
 
   const quickActionItems = useMemo<CommandItem[]>(() => {
-    return QUICK_ACTIONS.map((action) => ({
+    const items: CommandItem[] = QUICK_ACTIONS.map((action) => ({
       key: action.key,
       title: t(/* i18n-dynamic */ `layout.search.actions.${action.id}`),
       description: t(/* i18n-dynamic */ `layout.search.actions.${action.id}Description`),
@@ -348,7 +429,31 @@ export default function CommandPalette() {
       icon: action.icon,
       kind: 'action'
     }));
-  }, [openShortcutsHelp, t]);
+    // #10135: the two AI doors. "Ask Breeze AI" opens the side panel (open, not
+    // the header button's toggle, so an open panel stays open); "Open Wisp"
+    // only when the server has Wisp on.
+    if (canUseAi) {
+      items.push({
+        key: 'action:ask-breeze-ai',
+        title: t('layout.search.actions.askBreezeAi'),
+        description: t('layout.search.actions.askBreezeAiDescription'),
+        onSelect: openAiPanel,
+        icon: MessageSquare,
+        kind: 'action'
+      });
+      if (wispEnabled) {
+        items.push({
+          key: 'action:open-wisp',
+          title: t('layout.search.actions.wispHome'),
+          description: t('layout.search.actions.wispHomeDescription'),
+          href: '/wisp',
+          icon: Sparkles,
+          kind: 'action'
+        });
+      }
+    }
+    return items;
+  }, [canUseAi, openAiPanel, openShortcutsHelp, t, wispEnabled]);
 
   // Recents come from the shared store (sidebar shows the same devices). Pages
   // carry their path as the description so two pages with one title (e.g. two
@@ -382,14 +487,57 @@ export default function CommandPalette() {
   );
 
   // Instant local matches while the server round-trip is still in flight.
+  const matchesQuery = useCallback(
+    (item: CommandItem) => {
+      const needle = trimmedQuery.toLowerCase();
+      return (
+        item.title.toLowerCase().includes(needle) ||
+        (item.description?.toLowerCase().includes(needle) ?? false)
+      );
+    },
+    [trimmedQuery]
+  );
+
   const localRecentMatches = useMemo<CommandItem[]>(() => {
     if (!trimmedQuery) return [];
-    const needle = trimmedQuery.toLowerCase();
-    const matches = (item: CommandItem) =>
-      item.title.toLowerCase().includes(needle) ||
-      (item.description?.toLowerCase().includes(needle) ?? false);
-    return [...recentDeviceItems.filter(matches), ...recentPageItems.filter(matches)];
-  }, [recentDeviceItems, recentPageItems, trimmedQuery]);
+    return [...recentDeviceItems.filter(matchesQuery), ...recentPageItems.filter(matchesQuery)];
+  }, [matchesQuery, recentDeviceItems, recentPageItems, trimmedQuery]);
+
+  // #10196: quick actions are searchable too ("breeze ai", "open wisp"). Built
+  // from quickActionItems, so the ai_sessions:use and Wisp gates still apply.
+  const localActionMatches = useMemo<CommandItem[]>(() => {
+    if (!trimmedQuery) return [];
+    return quickActionItems.filter(matchesQuery);
+  }, [matchesQuery, quickActionItems, trimmedQuery]);
+
+  // Settings results are the web's settings catalogue (#8365), gated like the
+  // nav and matched instantly, so they never wait on (or depend on) the server.
+  const settingsItems = useMemo<CommandItem[]>(() => {
+    if (!trimmedQuery) return [];
+    return searchSettingsCatalog(
+      trimmedQuery,
+      {
+        isPlatformAdmin,
+        permissions,
+        getScope: () => getJwtClaims().scope,
+        toolSourcesEnabled,
+        flowsEnabled,
+        // Read on first open, never at mount (usePartnerAiFlags).
+        aiForOfficeEnabled,
+        wispEnabled,
+        serviceManagementMode,
+      },
+      (key, fallback) => t(/* i18n-dynamic */ key, { defaultValue: fallback }) as string
+    ).map((hit) => ({
+      key: `result:settings:${hit.id}`,
+      title: hit.title,
+      description: hit.description || undefined,
+      href: hit.href,
+      icon: CATEGORY_CONFIG.settings.icon,
+      kind: 'result',
+      category: 'settings'
+    }));
+  }, [trimmedQuery, isPlatformAdmin, permissions, toolSourcesEnabled, flowsEnabled, aiForOfficeEnabled, wispEnabled, serviceManagementMode, t]);
 
   const resultItemsByCategory = useMemo(() => {
     const grouped = CATEGORY_ORDER.reduce((acc, category) => {
@@ -398,6 +546,8 @@ export default function CommandPalette() {
     }, {} as Record<SearchCategory, CommandItem[]>);
 
     results.forEach((result, index) => {
+      // The server no longer owns settings results; ignore any from an older API.
+      if (result.type === 'settings') return;
       const key = `result:${result.type}:${result.id ?? `${result.title}-${index}`}`;
       grouped[result.type].push({
         key,
@@ -410,8 +560,9 @@ export default function CommandPalette() {
       });
     });
 
+    grouped.settings = settingsItems;
     return grouped;
-  }, [results]);
+  }, [results, settingsItems]);
 
   const { sections, selectableItems, indexByKey } = useMemo(() => {
     const builtSections: Section[] = [];
@@ -450,6 +601,13 @@ export default function CommandPalette() {
     }
 
     if (showResults) {
+      // First, so typing an action's name and pressing Enter runs it.
+      pushSection({
+        id: 'quick-actions',
+        label: 'Quick actions',
+        icon: Zap,
+        items: localActionMatches
+      });
       pushSection({
         id: 'recent',
         label: 'Recent',
@@ -470,6 +628,7 @@ export default function CommandPalette() {
 
     return { sections: builtSections, selectableItems: selectable, indexByKey: indexMap };
   }, [
+    localActionMatches,
     localRecentMatches,
     quickActionItems,
     recentDeviceItems,
@@ -569,7 +728,7 @@ export default function CommandPalette() {
       >
         <Search className="h-4 w-4 shrink-0" />
         <span className="min-w-0 flex-1 truncate whitespace-nowrap text-left">{t('layout.search.prompt')}</span>
-        <span className="shrink-0 rounded border bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
+        <span className="shrink-0 rounded border bg-muted px-1.5 py-0.5 text-[11px] font-semibold uppercase text-foreground/70">
           {modifierLabel ? `${modifierLabel}+K` : 'K'}
         </span>
       </button>
@@ -595,7 +754,7 @@ export default function CommandPalette() {
                 placeholder={t('layout.search.placeholder')}
                 className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-hidden"
               />
-              <span className="rounded border px-2 py-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
+              <span className="rounded border px-2 py-0.5 text-[11px] font-semibold uppercase text-foreground/70">
                 Esc
               </span>
             </div>
@@ -676,10 +835,10 @@ export default function CommandPalette() {
                                 aria-hidden="true"
                                 data-testid="palette-item-number"
                                 className={cn(
-                                  'shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold',
+                                  'shrink-0 rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold',
                                   isActive
                                     ? 'border-primary-foreground/40 text-primary-foreground/90'
-                                    : 'bg-muted text-muted-foreground'
+                                    : 'bg-muted text-foreground/70'
                                 )}
                               >
                                 {itemIndex + 1}
@@ -692,7 +851,7 @@ export default function CommandPalette() {
                   </div>
                 ))}
 
-              {showResults && !isLoading && results.length === 0 && !errorMessage && (
+              {showResults && !isLoading && sections.length === 0 && !errorMessage && (
                 <div className="px-4 py-6 text-sm text-muted-foreground">
                   {t('layout.search.noResults')}
                 </div>

@@ -9,6 +9,8 @@ export interface DeviceStats {
   offline: number;
   byStatus: Record<string, number>;
   migrationRequiredCount: number;
+  /** Online devices with a sustained (>= 30 min) log-shipping failure (#8611). */
+  logShippingFailingCount: number;
 }
 
 /** GET /alerts/summary — apps/api/src/routes/alerts/alerts.ts */
@@ -27,6 +29,8 @@ export interface AlertRow {
   status: string;
   deviceId?: string | null;
   deviceHostname?: string | null;
+  /** Mirrored from the list row (apps/api/src/routes/alerts/alerts.ts); absent on older payloads. */
+  orgId?: string | null;
   orgName?: string | null;
   createdAt: string;
   triggeredAt?: string | null;
@@ -44,12 +48,23 @@ export interface TicketStats {
 /** GET /patches/compliance — apps/api/src/routes/patches/compliance.ts */
 export interface PatchCompliance {
   summary: { total: number; pending: number; installed: number; failed: number; missing: number; skipped: number };
+  /** Item percentage (installed over installed + pending). Not shown on the dashboard. */
   compliancePercent: number;
   totalDevices: number;
   compliantDevices: number;
+  /**
+   * #9791 C: round(compliantDevices / totalDevices * 100), 0 for an empty
+   * fleet. The figure the KPI, the card headline and /patches all show.
+   * Optional only so a web build ahead of its API still renders.
+   */
+  devicePercent?: number;
+  /** #9791 C: devices with an outstanding patch whose latest install failed. */
+  failedDevices?: number;
   criticalSummary: { total: number; patched: number; pending: number };
   importantSummary: { total: number; patched: number; pending: number };
   unratedSummary: { total: number; patched: number; pending: number };
+  /** W06: present only when the scope has container images to count. */
+  containerImages?: { stale: number; current: number; unknown: number };
 }
 
 /** GET /security/dashboard — apps/api/src/routes/security/dashboard.ts */
@@ -65,6 +80,7 @@ export interface SecurityOverview {
 /** GET /vulnerabilities/stats — apps/api/src/routes/vulnerabilities.ts */
 export interface VulnerabilityStats {
   criticalOpen: number;
+  openFindings: number;
   kevCveCount: number;
   kevDeviceCount: number;
   patchReadyFindingCount: number;

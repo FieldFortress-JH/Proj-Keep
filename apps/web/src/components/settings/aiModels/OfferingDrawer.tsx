@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { Loader2, RefreshCw, Save } from 'lucide-react';
+import { Loader2, RefreshCw, Save, Trash2 } from 'lucide-react';
 import {
   AI_MODEL_REQUIRED_PERMISSION_CHOICES,
   EFFORT_LEVELS,
@@ -17,6 +17,7 @@ import { formatCurrency } from '../../../lib/i18n/format';
 import { showToast } from '../../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 import { Drawer } from '../../shared/Drawer';
+import { ConfirmDialog } from '../../shared/ConfirmDialog';
 import { registryFriendly } from './surfaceLabels';
 
 const PREMIUM_PERMISSION = AI_MODEL_REQUIRED_PERMISSION_CHOICES[0];
@@ -186,6 +187,8 @@ export default function OfferingDrawer({ offering, offerings, envManaged = false
   const [draft, setDraft] = useState<Draft>(initial);
   const [saving, setSaving] = useState(false);
   const [verifying, setVerifying] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const friendly = registryFriendly(t);
 
   const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
@@ -232,6 +235,41 @@ export default function OfferingDrawer({ offering, offerings, envManaged = false
     }
   };
 
+  // Only a hand-added model can be removed: discovered / platform / catalog rows
+  // are re-listed by the next sync, so those are disabled instead. An
+  // env-managed connection's models are the operator's (the API refuses it).
+  const canRemove = offering.id !== null && offering.source === 'manual' && !envManaged;
+
+  const handleRemove = async () => {
+    if (offering.id === null || saving || removing) return;
+    setRemoving(true);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/ai/models/offerings/${offering.id}`, { method: 'DELETE' }),
+        successMessage: t('aiModels.offering.removed'),
+        errorFallback: t('aiModels.offering.removeFailed'),
+        friendly,
+        onUnauthorized,
+      });
+      setConfirmRemove(false);
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setConfirmRemove(false);
+      if (err instanceof ActionError && err.status === 401) return;
+      if (err instanceof ActionError && err.code === 'not_found') {
+        // Already toasted: removed elsewhere. Reload so the list drops the stale row, and close.
+        await onSaved();
+        onClose();
+        return;
+      }
+      if (!(err instanceof ActionError)) showToast({ type: 'error', message: t('aiModels.offering.removeFailed') });
+      // other ActionErrors (in use, not removable) already toasted; the drawer stays open
+    } finally {
+      setRemoving(false);
+    }
+  };
+
   const handleSave = async () => {
     if (saving || !dirty) return;
     if (patchOrInvalid === 'invalid_prices') {
@@ -269,8 +307,8 @@ export default function OfferingDrawer({ offering, offerings, envManaged = false
 
   return (
     <Drawer open onClose={onClose} title={offering.displayName}
-      dataTestId="ai-offering-drawer" closeDisabled={saving}>
-      <div className="space-y-5">
+      width="max-w-lg" dataTestId="ai-offering-drawer" closeDisabled={saving}>
+      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4" data-testid="ai-offering-drawer-body">
         {envManaged && (
           <p data-testid="ai-offering-env-managed" className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
             {t('aiModels.offering.envManaged')}
@@ -323,7 +361,7 @@ export default function OfferingDrawer({ offering, offerings, envManaged = false
           </fieldset>
         )}
 
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-2">
           {support.effort.length > 0 && (
             <div className="space-y-1">
               <label className="text-sm font-medium" htmlFor="ai-offering-default-effort">{t('aiModels.offering.defaultEffort')}</label>
@@ -395,30 +433,48 @@ export default function OfferingDrawer({ offering, offerings, envManaged = false
         {canVerify && offering.verification !== null && (
           <p data-testid="ai-offering-verify-hint" className="text-xs text-muted-foreground">{t('aiModels.offering.verifyGatewayHint')}</p>
         )}
+      </div>
 
-        <div className="flex items-center justify-between gap-2 border-t pt-4">
-          <div>
-            {canVerify && (
-              <button type="button" data-testid="ai-offering-verify" onClick={() => { void handleVerify(); }} disabled={saving || verifying}
-                className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50">
-                {verifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                {t('aiModels.offering.verify')}
-              </button>
-            )}
-          </div>
-          <div className="flex gap-2">
-          <button type="button" data-testid="ai-offering-cancel" onClick={onClose} disabled={saving}
-            className="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50">
-            {t('common:actions.cancel')}
-          </button>
-          <button type="button" data-testid="ai-offering-save" onClick={() => { void handleSave(); }} disabled={!dirty || saving}
-            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50">
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            {saving ? t('common:states.saving') : t('common:actions.save')}
-          </button>
-          </div>
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t px-5 py-4" data-testid="ai-offering-drawer-footer">
+        <div className="flex flex-wrap gap-2">
+          {canVerify && (
+            <button type="button" data-testid="ai-offering-verify" onClick={() => { void handleVerify(); }} disabled={saving || verifying}
+              className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50">
+              {verifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {t('aiModels.offering.verify')}
+            </button>
+          )}
+          {canRemove && (
+            <button type="button" data-testid="ai-offering-remove" onClick={() => setConfirmRemove(true)} disabled={saving || removing}
+              className="inline-flex items-center gap-2 rounded-md border border-destructive/40 px-3 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50">
+              <Trash2 className="h-4 w-4" />
+              {t('aiModels.offering.remove')}
+            </button>
+          )}
+        </div>
+        <div className="flex gap-2">
+        <button type="button" data-testid="ai-offering-cancel" onClick={onClose} disabled={saving}
+          className="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:opacity-50">
+          {t('common:actions.cancel')}
+        </button>
+        <button type="button" data-testid="ai-offering-save" onClick={() => { void handleSave(); }} disabled={!dirty || saving}
+          className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50">
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          {saving ? t('common:states.saving') : t('common:actions.save')}
+        </button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmRemove}
+        onClose={() => { if (!removing) setConfirmRemove(false); }}
+        onConfirm={() => { void handleRemove(); }}
+        title={t('aiModels.offering.removeTitle')}
+        message={t('aiModels.offering.removeMessage', { model: offering.displayName })}
+        confirmLabel={t('aiModels.offering.remove')}
+        confirmTestId="ai-offering-remove-confirm"
+        isLoading={removing}
+      />
     </Drawer>
   );
 }

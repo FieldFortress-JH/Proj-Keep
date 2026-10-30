@@ -16,6 +16,7 @@ import { fetchWithAuth } from '@/stores/auth';
 
 vi.mock('@/stores/auth', () => ({
   fetchWithAuth: vi.fn(),
+  registerOrgIdProvider: vi.fn(),
 }));
 
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
@@ -65,6 +66,47 @@ describe('unknown AV / firewall state (#8252)', () => {
     const row = (await screen.findByText('UNKNOWN-AV-PC')).closest('tr')!;
     expect(row.textContent).toContain('Unknown');
     expect(row.textContent).not.toContain('Inactive');
+  });
+
+  // #8538: a failed collection stores provider 'unknown'. The page localizes the
+  // bucket by id (the server `name` is only an English fallback) in both the
+  // device table and the provider distribution legend.
+  it('AntivirusPage renders provider id "unknown" as the localized Unknown, in table and legend', async () => {
+    routeFetch({
+      '/security/status': {
+        data: [
+          {
+            deviceId: 'dev-1',
+            deviceName: 'UNKNOWN-PROVIDER-PC',
+            os: 'windows',
+            status: 'at_risk',
+            riskLevel: 'low',
+            realTimeProtection: null,
+            providerId: 'unknown',
+            provider: { id: 'unknown', name: 'ServerFallbackName', vendor: 'Unknown' },
+          },
+        ],
+        pagination: page,
+      },
+      '/security/dashboard': {
+        data: {
+          totalDevices: 1,
+          protectedDevices: 0,
+          atRiskDevices: 1,
+          unprotectedDevices: 0,
+          offlineDevices: 0,
+          providers: [
+            { providerId: 'unknown', providerName: 'ServerFallbackName', deviceCount: 1, coverage: 100 },
+          ],
+        },
+      },
+    });
+
+    render(<AntivirusPage />);
+    const row = (await screen.findByText('UNKNOWN-PROVIDER-PC')).closest('tr')!;
+    expect(row.textContent).toContain('Unknown');
+    expect(row.textContent).not.toContain('ServerFallbackName');
+    expect(screen.queryByText('ServerFallbackName')).toBeNull();
   });
 
   it('FirewallPage shows Unknown, not Disabled, for a null firewall reading', async () => {

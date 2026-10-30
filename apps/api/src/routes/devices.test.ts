@@ -116,6 +116,7 @@ vi.mock('drizzle-orm', () => {
     and: vi.fn((...args: unknown[]) => ({ and: args })),
     gte: vi.fn((...args: unknown[]) => ({ gte: args })),
     like: vi.fn((...args: unknown[]) => ({ like: args })),
+    ilike: vi.fn((...args: unknown[]) => ({ ilike: args })),
     sql: sqlTag,
     desc: vi.fn((col: unknown) => ({ desc: col })),
     asc: vi.fn((col: unknown) => ({ asc: col })),
@@ -155,6 +156,10 @@ vi.mock('../services/dispatchDeviceCommand', () => ({
 // calls are hoisted above top-level variable initializers, so a `dbMock`
 // declared outside this factory and merely referenced inside it would throw
 // "Cannot access 'dbMock' before initialization" at import time.
+// PATCH /devices/:id requests a dynamic-group re-evaluation after commit (#8832);
+// stub the producer (covered in jobs/deviceGroupJobs.test.ts).
+vi.mock('../jobs/deviceGroupJobs', () => ({ requestDeviceGroupReevaluationAfterCommit: vi.fn() }));
+
 vi.mock('../db', () => {
   const dbMock: Record<string, ReturnType<typeof vi.fn>> = {
     select: vi.fn(() => ({

@@ -19,10 +19,12 @@ import {
   onedriveDeviceState,
   bareMetalRecoveries,
 } from '../../db/schema';
+import { ownDeviceRowChangedHands, selectOwnDeviceRowForUpdate, updateOwnDeviceRow } from '../../services/agentOwnDeviceRow';
 import { hashRecoveryNonce } from '../../services/bareMetalRecoveryCodes';
 import type { BatteryStatus, DesktopAccessState, TCCPermissions } from '@breeze/shared';
 import { ERROR_CODES } from '@breeze/shared';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { refreshReadinessAfterRecovery } from '../../services/bareMetalReadinessRefresh';
 import { recordBackupCapabilityRegressed, type BackupHelperCapability } from '../../services/backupMetrics';
 import {
   BACKUP_HELPER_PROTOCOL_MIN_VERSION,
@@ -33,6 +35,12 @@ import {
   normalizeBackupWriteProtocolVersion,
 } from '../../services/backupHelperProtocols';
 import { heartbeatSchema } from './schemas';
+import { recordWorkstationCapabilities } from '../../services/callerVerification/workstationCapabilities';
+import { notePromptHostReportDropped, recordPromptHostObservation } from '../../services/promptHostObservation';
+import { enabledPromptKinds } from '../../services/promptHostConfig';
+import { buildHeartbeatPromptIdentity } from '../../services/promptIdentity';
+import { noteRebootUserActionDropped, recordRebootUserAction } from '../../services/rebootUserActionAudit';
+import { callerVerificationEnabled } from '../../config/env';
 import type { PolicyProbeConfigUpdate } from './schemas';
 import {
   maybeQueueThresholdFilesystemAnalysis,
@@ -63,8 +71,17 @@ import {
   type OnedriveConfigUpdate,
   type HelperSettings,
 } from './helpers';
+import { buildFeatureUpdateConfigUpdate, toFeatureUpdateSettingsWire } from './featureUpdateConfig';
+import type { RingFeatureUpdates } from '@breeze/shared/validators';
 import { shouldSendAgentUpgrade } from './agentUpdatePolicy';
 import { DeferredCacheFills } from '../../services/hotPathCache';
+import {
+  buildSettingsDecisionFields,
+  retainStateKillSwitchEnabled,
+  agentEchEnabled,
+  type RemoteManagementDecision,
+} from './heartbeatSettingsDecision';
+import { agentCollectorAbsenceCache, agentCollectorAbsenceKey, deviceHasAgentCollectors } from '../../services/unifi/unifiCollectorService';
 import { orgHelperSettingsCache, orgPamFallbackCache, orgPolicyProbeCache } from '../../services/agentOrgSettingsCache';
 import { processDeviceIPHistoryUpdate } from '../../services/deviceIpHistory';
 import { requestDeviceGroupReevaluation } from '../../jobs/deviceGroupJobs';
@@ -72,7 +89,7 @@ import { enqueueDeviceReliabilityComputation } from '../../jobs/reliabilityWorke
 import { createReliabilityBaseline } from '../../services/reliabilityBaselines';
 import { claimPendingCommandsForDevice } from '../../services/commandDispatch';
 import { publishEvent } from '../../services/eventBus';
-import { DRAIN_CLAIM_TYPE_ALLOWLIST } from '../../middleware/agentAuth';
+import { DRAIN_CLAIM_TYPE_ALLOWLIST, staleAgentCredentialRejection } from '../../middleware/agentAuth';
 import { computeCredentialMaintenance } from './heartbeatCredentialMaintenance';
 import { respondParkedHeartbeat } from './heartbeatParked';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
@@ -87,13 +104,31 @@ import {
 import { prepareClaimedCommandsForDelivery } from '../../services/commandDelivery';
 import { normalizeReportedScriptSecretEnvVersion } from '../../services/scriptSecretDelivery';
 import { redactSecretsDeep } from '../../services/secretRedaction';
-import { recordAgentHeartbeat, resolveResponseStatus } from '../metrics';
+import {
+  recordAgentHeartbeat,
+  recordAgentHeartbeatEch,
+  recordAgentFilterSignatureReport,
+  resolveResponseStatus,
+} from '../metrics';
 import { ingestRollbackObservation } from '../../services/agentRollbackResult';
 import {
   editionWithheldDetail,
   type EditionWithheldContext as SharedEditionWithheldContext,
 } from '../../services/agentEditionCompat';
 import { recordAgentHealthObservation } from '../../services/agentHealthObservations';
+import { parseLogShipping, planLogShippingWrite } from '../../services/logShippingHealth';
+import { parseWatchdogInstall, planWatchdogInstallWrite } from '../../services/watchdogInstallHealth';
+import {
+  agentIdentityAssertionRefused,
+  agentIdentityAssertionVersionToSign,
+  agentIdentityEpochAckToRecord,
+  agentIdentityEpochAckUpdateSql,
+  normalizeIdentitySyncProtocolVersion,
+  signAgentIdentityAssertion,
+  type AgentIdentityAssertion,
+} from '../../services/agentIdentityAssertion';
+import { normalizeRebindProtocolVersion } from '../../services/deviceReattach/protocol';
+import { rebindDirectiveForBeat } from '../../services/deviceReattach/rebindDirective';
 
 /**
  * #1121 — pure collapse detector for the watchdogState tolerance gap.
@@ -257,6 +292,95 @@ export function resetWatchdogRestartLogCacheForTests(): void {
   watchdogRestartLogCache.clear();
 }
 
+// #8317 — bounded logging for the identity sync. A deployment with no signing
+// key would otherwise warn once per moved agent per beat, and a signing fault
+// (an APP_ENCRYPTION_KEY that no longer decrypts the key, say) would log and
+// send a Sentry event once per moved agent per beat.
+const IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS = 10 * 60 * 1000;
+let identitySyncNoSigningKeyWarned = false;
+let identityAssertionFailureReportedAt = 0;
+// #8623 — device-id mismatches are rate-limited per device, not fleet-wide:
+// one noisy agent must not hide another's copied agent.yaml. In-memory per API
+// instance like watchdogRestartLogCache, and bounded the same way.
+const IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX = 10_000;
+const identityDeviceMismatchReportedAt = new Map<string, number>();
+
+function warnIdentitySyncWithoutSigningKey(): void {
+  if (identitySyncNoSigningKeyWarned) return;
+  identitySyncNoSigningKeyWarned = true;
+  console.warn(
+    '[heartbeat] A moved device needs a signed identity assertion (#8317), but this deployment has no '
+    + 'deployment signing key and the heartbeat does not create one. Moved agents keep their enrolled '
+    + 'org/site until a key exists.',
+  );
+}
+
+function reportIdentityAssertionFailure(agentId: string, err: unknown): void {
+  const now = Date.now();
+  if (now - identityAssertionFailureReportedAt < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS) return;
+  identityAssertionFailureReportedAt = now;
+  console.error(`[heartbeat] Failed to sign identity assertion for agentId=${agentId}:`, err);
+  captureException(err);
+}
+
+/**
+ * #8623 — whether a device-id mismatch on this device may be logged now, and
+ * if so records that it was. Keyed by the row the credential belongs to (the
+ * authenticated device), not by the reported id, which the agent chooses.
+ *
+ * Bounded: the map is kept in the order devices were last logged, so a full
+ * map first drops the entries older than the interval (they no longer hold
+ * anything back) and, if every entry is recent, the one logged longest ago.
+ * Either way the cost of being full is an extra warning, never a hidden one.
+ * Exported for unit tests.
+ */
+export function claimIdentityDeviceMismatchWarning(rowDeviceId: string, nowMs: number): boolean {
+  const last = identityDeviceMismatchReportedAt.get(rowDeviceId);
+  // An entry from the future (the clock stepped back) counts as stale, so a
+  // clock step cannot mute a device until the clock catches up.
+  if (
+    last !== undefined
+    && last <= nowMs
+    && nowMs - last < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS
+  ) return false;
+  identityDeviceMismatchReportedAt.delete(rowDeviceId);
+  if (identityDeviceMismatchReportedAt.size >= IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX) {
+    for (const [deviceId, loggedAt] of identityDeviceMismatchReportedAt) {
+      if (loggedAt <= nowMs && nowMs - loggedAt < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS) break;
+      identityDeviceMismatchReportedAt.delete(deviceId);
+    }
+    if (identityDeviceMismatchReportedAt.size >= IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX) {
+      const oldest = identityDeviceMismatchReportedAt.keys().next().value;
+      if (oldest !== undefined) identityDeviceMismatchReportedAt.delete(oldest);
+    }
+  }
+  identityDeviceMismatchReportedAt.set(rowDeviceId, nowMs);
+  return true;
+}
+
+// #8382 — the agent reported a device id other than the row its credential
+// belongs to. Never synced (a device id does not change through this path),
+// but not silent either: it can mean an agent.yaml copied from another device.
+// Rate-limited per device (#8623).
+function warnIdentityDeviceMismatch(agentId: string, reportedDeviceId: string, rowDeviceId: string): void {
+  if (!claimIdentityDeviceMismatchWarning(rowDeviceId, Date.now())) return;
+  console.warn(
+    '[heartbeat] Agent reported a device id that is not the device its credential belongs to; no identity '
+    + 'assertion is sent. A copied agent.yaml can cause this (#8382).',
+    { agentId, reportedDeviceId, rowDeviceId },
+  );
+}
+
+export function resetIdentitySyncLogStateForTests(): void {
+  identitySyncNoSigningKeyWarned = false;
+  identityAssertionFailureReportedAt = 0;
+  identityDeviceMismatchReportedAt.clear();
+}
+
+export function identityDeviceMismatchLogSizeForTests(): number {
+  return identityDeviceMismatchReportedAt.size;
+}
+
 export function watchdogRestartLogCacheSizeForTests(): number {
   return watchdogRestartLogCache.size;
 }
@@ -274,6 +398,19 @@ export function normalizeRollbackProtocolVersion(value: unknown): 0 | 1 {
 /** Normalize the only PAM lifetime protocol version implemented here. */
 export function normalizePamLifetimeProtocolVersion(value: unknown): 0 | 2 {
   return value === 2 ? 2 : 0;
+}
+
+/**
+ * #8928 — normalize the PAM user-notify protocol (pam_request_notify outcome
+ * notices).
+ *   1 — the agent tracks a request handed to IT and shows outcome notices.
+ *   2 — #10190 W07: also decodes `decidedBy` on pam_apply_v2 (whose decoder
+ *       rejects unknown fields, so the apply worker adds it only at >= 2) and
+ *       draws the elevation prompt states.
+ * Anything else means "not capable" (0).
+ */
+export function normalizePamUserNotifyProtocolVersion(value: unknown): 0 | 1 | 2 {
+  return value === 1 || value === 2 ? value : 0;
 }
 
 /**
@@ -309,6 +446,26 @@ export function normalizeDesktopFenceProtocolVersion(value: unknown): 0 | 1 {
  */
 export function normalizeConsentPromptProtocolVersion(value: unknown): 0 | 1 | 2 {
   return value === 1 || value === 2 ? value : 0;
+}
+
+/**
+ * Normalize the retain-state protocol (#8616): whether THIS beat's agent
+ * honours the response's `retainState` list. Exactly 1 only; absent,
+ * malformed or a future version is 0 and gets the legacy payload. Parse-only,
+ * never persisted — each beat is answered from its own report.
+ */
+export function normalizeRetainStateProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * Normalize the prompt identity protocol (#10190 W03): whether THIS beat's
+ * agent caches the response's `promptIdentity` block. Exactly 1 only
+ * (PROMPT_IDENTITY_PROTOCOL_VERSION); absent, malformed or a future version is
+ * 0 and gets no block. Parse-only, never persisted.
+ */
+export function normalizePromptIdentityProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
 }
 
 /**
@@ -474,7 +631,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   //   - `helperEnabled`          -> handleHelperEnabled(false) turns the helper flag off
   //   - `manageRemoteManagement` -> SetManagedByPolicy(false) clears the tunnel policy flag
   // Both therefore flip off on every beat for the whole drain window.
-  // (`uacInterceptionEnabled` is a `*bool` and handles absence correctly.)
+  // `uacInterceptionEnabled` is absent too, and the agent reads that absence
+  // as "disable" (it switches PAM interception off and runs its disable
+  // cleanup) — benign on a machine being removed. This branch deliberately
+  // does not emit `retainState` (#8616, plan OD6): it stays minimal.
   // Bounded and self-correcting: these are in-memory flags on a machine that is
   // being uninstalled, and a restore ends the drain, after which the next
   // NORMAL heartbeat carries both fields again and restores them.
@@ -486,7 +646,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     const drainCommands = await runOutsideDbContext(() =>
       withSystemDbAccessContext(async () => {
         const claimed = await claimPendingCommandsForDevice(
-          agent.deviceId,
+          { deviceId: agent.deviceId, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
           10,
           'agent',
           // Fail closed: the middleware always populates this while draining,
@@ -650,17 +810,40 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     captureException(err);
   }
 
+  // #8318 §6.4: what the scoped block hands back when this beat turns out to
+  // be a stale caller (see `ownDeviceRowChangedHands` below). The rejection is
+  // thrown after the block, and agent auth's own error rendering answers it.
+  const STALE_CALLER = { staleCaller: true } as const;
+
   const scoped = await withDbAccessContext(
     dbContext,
-    async (): Promise<Response | { deviceOrgId: string; deviceId: string; mainResponse: Record<string, unknown> }> => {
+    async (): Promise<Response | typeof STALE_CALLER | { deviceOrgId: string; deviceSiteId: string; deviceOwnershipEpoch: number; deviceId: string; mainResponse: Record<string, unknown>; remoteManagement: RemoteManagementDecision }> => {
 
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.id, agent.deviceId))
-    .limit(1);
+  // #8318 §6.4: the beat's FIRST statement reads its own row bound to the
+  // authenticated id + agent_id and locks it (FOR NO KEY UPDATE, see
+  // selectOwnDeviceRowForUpdate). Everything below works from this row — the
+  // bare-metal check-in, the readiness refresh, the role-flip audit, the
+  // watchdog silence event — so a beat that a reattach confirm or an in-place
+  // re-enroll overtook must stop HERE, before any of it, not at the device
+  // write near the end (which would commit those effects onto the new
+  // install's row). The lock makes the answer hold until commit: a confirm
+  // that starts after this read waits for the beat, and one that committed
+  // before it leaves 0 rows. It is also the beat's first row lock, so it
+  // keeps confirm's devices → other-tables order.
+  const device = await selectOwnDeviceRowForUpdate(db, agent);
 
   if (!device) {
+    // 0 rows: the row now carries another agent_id (stale caller, the
+    // stale-credential 401 below, nothing written) or it is gone (today's
+    // not-found answer). The re-read only runs on this path.
+    if (await ownDeviceRowChangedHands(db, agent)) {
+      console.warn('[heartbeat] stale beat: the device row changed hands after auth; refusing it', {
+        deviceId: agent.deviceId,
+        agentId,
+        role: agent.role,
+      });
+      return STALE_CALLER;
+    }
     return c.json({ error: 'Device not found' }, 404);
   }
 
@@ -715,12 +898,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       watchdogUpdates.mainAgentSilentSince = now;
     }
 
+    let watchdogRowsUpdated: number | null = null;
     try {
-      await db.update(devices)
-        .set(watchdogUpdates)
-        .where(eq(devices.id, device.id));
+      // #8318 §6.4: bound to the authenticated id + agent_id, so a watchdog
+      // beat of a superseded install matches 0 rows after a reattach confirm.
+      watchdogRowsUpdated = (await updateOwnDeviceRow(db, agent, watchdogUpdates)).length;
     } catch (err) {
       console.error('Failed to update watchdog status:', err);
+    }
+    // #8318 §6.4: the row changed hands after this beat authenticated (the
+    // watchdog write has no status guard, so a 0-row write is that or a
+    // vanished row). Same as the main beat below: no silence event, log row,
+    // command claim or upgrade target for the retired install — the
+    // stale-credential 401. Defence in depth: the bound read at the top of
+    // the block already holds the row, so this should not fire.
+    if (watchdogRowsUpdated === 0 && (await ownDeviceRowChangedHands(db, agent))) {
+      console.warn('[heartbeat] stale watchdog beat: the device row changed hands after auth; refusing it', {
+        deviceId: agent.deviceId,
+        agentId,
+      });
+      return STALE_CALLER;
     }
 
     // Emit only on the silence→silent transition so subscribers (alerts,
@@ -787,7 +984,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // this line via a TENANT drain: a device-remove drain admits `role==='agent'`
     // only (middleware/agentAuth.ts Layer 1b).
     const watchdogCommands = await claimPendingCommandsForDevice(
-      device.id,
+      { deviceId: device.id, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
       10,
       'watchdog',
       agent?.claimTypeAllowlist
@@ -979,6 +1176,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     pamLifetimeProtocolVersion: normalizePamLifetimeProtocolVersion(
       data.securityCapabilities?.pamLifetimeProtocolVersion,
     ),
+    pamReconciliationResetProtocolVersion: data.securityCapabilities?.pamReconciliationResetProtocolVersion === 1 ? 1 : 0,
+    pamUserNotifyProtocolVersion: normalizePamUserNotifyProtocolVersion(
+      data.securityCapabilities?.pamUserNotifyProtocolVersion,
+    ),
     // Revocation-lease capability, same non-sticky contract: rewritten every
     // beat so an agent DOWNGRADE stops the dispatch gate trusting a stale claim
     // and desktop sessions are refused again until the agent is back.
@@ -999,6 +1200,11 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // agent that stops reporting it self-heals back to 0.
     workloadInventoryProtocolVersion: normalizeWorkloadInventoryProtocolVersion(
       data.securityCapabilities?.workloadInventoryProtocolVersion,
+    ),
+    // #8318 §6.2 — rebind capability, same non-sticky contract: a downgrade
+    // reports back down to 0, which also stops the `rebind` directive.
+    rebindProtocolVersion: normalizeRebindProtocolVersion(
+      data.securityCapabilities?.rebindProtocolVersion,
     ),
     // Migration-banner Task 2 — self-reported install edition + migration
     // flag. Written UNCONDITIONALLY every heartbeat, mirroring
@@ -1068,6 +1274,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     deviceUpdates.updateAttemptCount = null;
   }
 
+  // #8869 — ECH telemetry: counters only (no persistence). Absent = not counted.
+  if (data.echActive !== undefined) recordAgentHeartbeatEch(data.echActive);
+  if (data.filterSignatureSeenAt !== undefined) recordAgentFilterSignatureReport();
+
   // #6925 — persist the agent's Breeze Assist install problem ("enabled but
   // not installed, no server offer", or an abandoned install) so it shows on
   // the device page and device list instead of one agent-side log line.
@@ -1079,6 +1289,21 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     deviceUpdates.helperInstallIssue = helperInstallIssue;
     deviceUpdates.helperInstallIssueSince = helperInstallIssue ? new Date() : null;
   }
+
+  // #8608 — log-shipping health (#8406). Classified per beat, persisted ONLY on
+  // a state change against the `device` row this beat already loaded, so
+  // steady-state beats add zero keys to this single UPDATE. Absent = the agent
+  // does not report it (old agent / downgrade) -> reset to unknown; a malformed
+  // object changes nothing (neither clears nor extends an episode).
+  Object.assign(deviceUpdates, planLogShippingWrite(device, parseLogShipping(data.logShipping), new Date()));
+
+  // #8620 — watchdog install health (#8618). Same contract as above: the plan
+  // is compared to the already-loaded `device` row, so a steady-state beat adds
+  // zero keys. Absent = healthy/unreported -> cleared; malformed = no change.
+  Object.assign(
+    deviceUpdates,
+    planWatchdogInstallWrite(device, parseWatchdogInstall(data.watchdogInstall), new Date()),
+  );
 
   // #800 Layer C — recovery side. If the asymmetry detector previously
   // set mainAgentSilentSince (watchdog kept reporting while we went
@@ -1321,6 +1546,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       )).returning({ id: bareMetalRecoveries.id });
       recoveryMarkerAck = true;
       if (won) {
+        refreshReadinessAfterRecovery(agent.orgId, device.id);
         deviceUpdates.recoveredAt = checkedInNow;
         deviceUpdates.recoveredFromSnapshotId = rec.snapshotId;
         writeAuditEvent(c, {
@@ -1386,6 +1612,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
+  // #8206 — record which ownership epoch's identity the agent has loaded, so
+  // PAM dispatch (jobs/pamActuationWorker.ts) waits until the agent holds the
+  // identity of the row's current epoch. Rides this beat's existing guarded
+  // UPDATE (one write per beat at most, none when nothing advances). The SQL is
+  // monotonic and bounded by the row's epoch at write time, so a concurrent
+  // move or a stale snapshot can neither lower the ack nor push it past the row.
+  const identityEpochAck = agentIdentityEpochAckToRecord(data.reportedIdentity, {
+    id: device.id,
+    orgId: device.orgId,
+    ownershipEpoch: device.ownershipEpoch,
+    agentIdentityEpochAck: device.agentIdentityEpochAck ?? null,
+  });
+  if (identityEpochAck !== null) {
+    deviceUpdates.agentIdentityEpochAck = agentIdentityEpochAckUpdateSql(identityEpochAck);
+  }
+
   // agentAuthMiddleware 403s quarantined devices and every decommissioned
   // device EXCEPT one inside the #3986 device-remove uninstall drain, but a
   // decommission landing mid-request (between the auth fetch and this write)
@@ -1402,14 +1644,32 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // terminal-status device matches 0 rows, so `updatedRows` is empty and the
   // state-transition audit below is skipped (finding #10 — never audit a write
   // that the guard rejected).
-  const updatedRows = await db
-    .update(devices)
-    .set(deviceUpdates)
-    .where(and(
-      eq(devices.id, device.id),
-      notInArray(devices.status, ['decommissioned', 'quarantined'])
-    ))
-    .returning({ id: devices.id });
+  //
+  // #8318 §6.4: through updateOwnDeviceRow, so the write is also bound to the
+  // agent_id this beat authenticated as. A beat the previous install sent just
+  // before a reattach confirm matches 0 rows, exactly like a terminal-status
+  // row, and records no phantom transition.
+  const updatedRows = await updateOwnDeviceRow(db, agent, deviceUpdates, {
+    where: notInArray(devices.status, ['decommissioned', 'quarantined']),
+  });
+
+  // #8318 §6.4: a 0-row write is either the terminal-status guard (the row
+  // still carries this caller's agent_id: carry on exactly as before) or a
+  // stale caller — a reattach confirm or an in-place re-enroll gave the row to
+  // another install after this beat authenticated. Nothing after this point
+  // belongs to a stale caller: no metrics, IP history, child syncs or audit on
+  // the new install's row, and no configuration, upgrade or rotation
+  // instructions for the retired one. It gets the stale-credential 401 agent
+  // auth gives a token that no longer matches. Defence in depth: the bound
+  // read at the top of the block already refused a stale beat and holds the
+  // row until commit, so only the terminal-status half is expected here.
+  if (updatedRows.length === 0 && (await ownDeviceRowChangedHands(db, agent))) {
+    console.warn('[heartbeat] stale beat: the device row changed hands after auth; refusing it', {
+      deviceId: agent.deviceId,
+      agentId,
+    });
+    return STALE_CALLER;
+  }
 
   // Durable audit of security-relevant device state transitions (finding #10).
   // The heartbeat mutates several security-relevant fields but previously left
@@ -1743,7 +2003,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // this handler and never reaches this line; the invariant is stated here
   // because that branch is what a future refactor is most likely to remove.
   const commands = await claimPendingCommandsForDevice(
-    device.id,
+    { deviceId: device.id, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
     10,
     'agent',
     agent?.claimTypeAllowlist,
@@ -1756,6 +2016,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       ),
       pamLifetimeProtocolVersion: normalizePamLifetimeProtocolVersion(
         data.securityCapabilities?.pamLifetimeProtocolVersion,
+      ),
+      pamReconciliationResetProtocolVersion: data.securityCapabilities?.pamReconciliationResetProtocolVersion === 1 ? 1 : 0,
+      pamUserNotifyProtocolVersion: normalizePamUserNotifyProtocolVersion(
+        data.securityCapabilities?.pamUserNotifyProtocolVersion,
       ),
     },
   );
@@ -2006,6 +2270,12 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     backup_server_url: (process.env.AGENT_BACKUP_SERVER_URL ?? '').trim(),
   };
 
+  // #8869 — ECH kill switch, ALWAYS sent as true/false (an absent key means
+  // "no change" on the agent, so the explicit value is the only lever).
+  // Takes effect on the agent's next connection; never tears down live
+  // connections.
+  mergedConfigUpdate.ech_enabled = agentEchEnabled();
+
   // Security remediation Wave 6, Task 9 — ALWAYS sent, as true or false.
   //
   // An earlier revision omitted the key when unset/false, mirroring
@@ -2055,17 +2325,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     presentedTokenHash: agent.authTokenHash,
   });
 
-  let manageRemoteManagement = false;
+  // #8616: `resolved` is false when the resolver threw or found no effective
+  // config (its settings are then defaults, not a decision); a protocol-aware
+  // agent is then told to retain its remote-management state.
+  let remoteManagement: RemoteManagementDecision = { resolved: false, value: false };
   try {
     // #8053: the heartbeat's own (longer) max age — the default 30 s is
     // shorter than the 60 s beat, so it never hit and every beat re-ran the
     // full effective-config resolution inside this org transaction.
+    // #8997: `savepoint` confines a failed policy read (e.g. a permission
+    // error) to a savepoint taken only on a cache miss. Otherwise the failure
+    // aborts the org transaction: this catch "recovers" but the commit
+    // re-throws and the whole heartbeat 500s. Cache hits add no statement.
     const remoteAccess = await resolveRemoteAccessForDevice(device.id, {
       maxAgeMs: HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS,
+      savepoint: true,
     });
-    manageRemoteManagement = remoteAccess.settings.vncRelay === true;
+    remoteManagement = { resolved: remoteAccess.resolved, value: remoteAccess.settings.vncRelay === true };
   } catch (err) {
     console.error('[heartbeat] Failed to resolve remote access policy:', err);
+    captureException(err);
   }
 
   // #2414 — decrypt just-in-time; a command whose payload fails decryption is
@@ -2125,7 +2404,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // context closes (see below).
   return {
     deviceOrgId: device.orgId,
+    deviceSiteId: device.siteId,
+    deviceOwnershipEpoch: device.ownershipEpoch,
     deviceId: device.id,
+    remoteManagement,
     mainResponse: {
       commands: deliverableCommands,
       configUpdate: mergedConfigUpdate,
@@ -2140,7 +2422,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       // helperEnabled/helperSettings are merged in AFTER this org-scoped block
       // closes — see the #1105 comment below. uacInterceptionEnabled likewise
       // (#2930): the pam resolver moved out with the other policy readers.
-      manageRemoteManagement: manageRemoteManagement || undefined,
+      // manageRemoteManagement: this slot only fixes the key's position in the
+      // response (unchanged since before #8616); its value is set at final
+      // assembly by buildSettingsDecisionFields.
+      manageRemoteManagement: undefined,
       // Bare-metal recovery W04a: only present (and only ever `true`) when a
       // recoveryMarker in this beat matched — its absence tells the agent
       // nothing (no ack yet, or no marker was sent), same shape as the other
@@ -2154,6 +2439,69 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // 404 / 401 / watchdog branches returned a Response directly from the scoped
   // block — pass it through.
   if (scoped instanceof Response) return scoped;
+  if ('staleCaller' in scoped) throw staleAgentCredentialRejection();
+
+  // Caller verification readiness (#6354 W02), keyed by the authenticated
+  // device's org — never a body-supplied identity. Replaced on every main
+  // agent beat (absent = cleared, so an old agent reads as unavailable);
+  // watchdog beats do not describe the user session and never touch it.
+  // Redis only, after the org transaction released; it never throws. Skipped
+  // entirely while the feature is dark, so a fleet-wide beat makes no Redis
+  // call for it; readiness written before a flag-off lapses on its TTL.
+  if (agent.role !== 'watchdog' && callerVerificationEnabled()) {
+    await recordWorkstationCapabilities(scoped.deviceOrgId, scoped.deviceId, data.helperCapabilities);
+  }
+
+  // #10190 W02 — the live prompt-renderer observation for the device page and
+  // the Assist-floor evidence (compatibility rule 8). Main-agent beats only,
+  // keyed by the authenticated device. Absent (old agent, no renderer, or a
+  // block the schema dropped) DELETES it, so what the page shows is always
+  // this beat's report. Redis only, after the org transaction released;
+  // bounded and never throws, so it cannot fail or stall the beat. A block the
+  // schema dropped would look like "no renderer", so that collapse is logged
+  // (throttled); Hono caches the parsed body, so the re-read is free (#1121).
+  if (agent.role !== 'watchdog') {
+    const promptHostReport = data.helperCapabilities?.promptHost;
+    if (promptHostReport === undefined) {
+      try {
+        notePromptHostReportDropped(scoped.deviceId, await c.req.json(), promptHostReport);
+      } catch {
+        // Raw body unavailable — nothing to report.
+      }
+    }
+    await recordPromptHostObservation(scoped.deviceId, promptHostReport);
+  }
+
+  // #10190 W05 — the restart decision the person at the keyboard made
+  // (Postpone / Restart now). The agent re-sends it on every beat while the
+  // restart is scheduled; the service writes one audit row per decision
+  // (Redis NX on device + decision time). Keyed by the authenticated device
+  // and its org (the row's, not the token's), after the org transaction
+  // released, and NOT awaited: the beat's answer never waits on Redis or the
+  // audit writer, and the service never throws (the catch is belt and braces
+  // for the floating promise). A schedule whose lastUserAction the schema
+  // dropped is logged (throttled); Hono caches the parsed body, so the
+  // re-read is free.
+  const rebootStatus = data.rebootStatus;
+  const lastUserAction = rebootStatus?.lastUserAction;
+  if (agent.role !== 'watchdog' && rebootStatus && !lastUserAction) {
+    try {
+      noteRebootUserActionDropped(scoped.deviceId, await c.req.json(), lastUserAction);
+    } catch {
+      // Raw body unavailable — nothing to report.
+    }
+  }
+  if (agent.role !== 'watchdog' && rebootStatus && lastUserAction) {
+    void recordRebootUserAction(scoped.deviceId, scoped.deviceOrgId, lastUserAction, {
+      c,
+      agentId,
+      scheduledAt: rebootStatus.scheduledAt,
+      deferralsUsed: rebootStatus.deferralsUsed,
+      maxDeferrals: rebootStatus.maxDeferrals,
+    }).catch((err) => {
+      console.error('[heartbeat] restart decision audit failed', { deviceId: scoped.deviceId, err });
+    });
+  }
 
   // Self-health is independent from reachability and is persisted only after
   // the request's org-scoped transaction has released. A failed observation
@@ -2216,6 +2564,81 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // #8053: both this keyset and the delegations below are global, so they are
   // served from a 60 s process cache — their system context opens once per
   // process per TTL, not once per agent per beat. See MANIFEST_TRUST_CACHE_TTL_MS.
+  // #8317 — the device was moved to another org or site after enrollment; the
+  // agent still holds the old pair in agent.yaml and rejects every payload
+  // bound to the new one. Send a signed assertion of the row's identity that
+  // echoes this beat's nonce. Outside the org transaction for the same reason
+  // as the keyset (#1105). Never creates the deployment key: without one, no
+  // assertion is sent. Non-fatal: a missed assertion is retried next beat.
+  //
+  // #8382 — an agent that refused the assertion for this org/site says so on
+  // its next beat; the assertion is then held back for a while (Redis TTL)
+  // instead of being signed, and refused, on every beat.
+  //
+  // #8206 — a v2 agent gets a v2 assertion carrying the row's ownership epoch,
+  // also when only the epoch it holds is behind (see
+  // agentIdentityAssertionVersionToSign: an unreported epoch counts as 1, so a
+  // never-moved device is never signed for). A v1 agent is unchanged.
+  let identityAssertion: AgentIdentityAssertion | undefined;
+  const identitySyncVersion = normalizeIdentitySyncProtocolVersion(
+    data.securityCapabilities?.identitySyncProtocolVersion,
+  );
+  const reportedIdentity = identitySyncVersion !== 0 ? data.reportedIdentity : undefined;
+  const identityRow = {
+    id: scoped.deviceId,
+    orgId: scoped.deviceOrgId,
+    siteId: scoped.deviceSiteId,
+    ownershipEpoch: scoped.deviceOwnershipEpoch,
+  };
+  if (reportedIdentity && reportedIdentity.deviceId !== identityRow.id) {
+    warnIdentityDeviceMismatch(agentId, reportedIdentity.deviceId, identityRow.id);
+  }
+  const identityAssertionVersion = agentIdentityAssertionVersionToSign(reportedIdentity, identityRow, identitySyncVersion);
+  if (
+    reportedIdentity
+    && identityAssertionVersion !== 0
+    && !(await agentIdentityAssertionRefused({
+      agentId,
+      deviceId: identityRow.id,
+      target: { orgId: identityRow.orgId, siteId: identityRow.siteId },
+      rejection: data.identityAssertionRejection,
+    }))
+  ) {
+    try {
+      const identity = {
+        agentId,
+        deviceId: identityRow.id,
+        orgId: identityRow.orgId,
+        siteId: identityRow.siteId,
+      };
+      const signed = identityAssertionVersion === 2
+        ? await signAgentIdentityAssertion({
+          ...identity,
+          ownershipEpoch: identityRow.ownershipEpoch,
+          nonce: reportedIdentity.nonce,
+        })
+        : await signAgentIdentityAssertion({ ...identity, nonce: reportedIdentity.nonce });
+      if (signed) {
+        identityAssertion = signed;
+      } else {
+        warnIdentitySyncWithoutSigningKey();
+      }
+    } catch (err) {
+      reportIdentityAssertionFailure(agentId, err);
+    }
+  }
+
+  // #8318 §6.2 — the signed `rebind` directive, while this device is the
+  // source of an open reattach intent. Only a device that declared the rebind
+  // capability on THIS beat is looked up (one indexed system read, outside
+  // the org transaction like the assertion above, #1105); every other beat
+  // costs nothing. Non-fatal: a missed directive is re-sent next beat.
+  const rebind = await rebindDirectiveForBeat({
+    deviceId: scoped.deviceId,
+    agentId: agent.agentId,
+    rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
+  });
+
   let manifestTrustKeys: ManifestTrustKey[] = [];
   try {
     manifestTrustKeys = await getActiveTrustKeysetCached();
@@ -2251,6 +2674,9 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // assignments made inside that callback.)
   let policyProbeConfig = null as PolicyProbeConfigUpdate | null;
   let helperSettings = null as HelperSettings | null;
+  // #8616: read after the context below. Defaults to 'error', which also
+  // covers a context that failed before the hierarchy load assigned it.
+  let hierarchyOutcome = 'error' as 'loaded' | 'missing' | 'error';
 
   // #8142 (scaling W03 / W1a-2) — ONE post-commit context for every
   // policy-derived field, ORG-SCOPED: the org block's own `dbContext`
@@ -2272,9 +2698,12 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   //      org/partner is not the authenticated one (moved, deleted or
   //      re-parented after the org transaction committed). Skip EVERY policy
   //      builder: generating answers here would send defaults/reverts and cache
-  //      them. Helper and PAM read false for this one beat, as they do whenever
-  //      this context fails (the agent reads an absent value as off).
-  //    - hierarchy ERROR: every resolver reads its own (W01's fallback).
+  //      them. For a legacy beat helper and PAM read false for this one beat,
+  //      as they do whenever this context fails (the agent reads an absent
+  //      value as off); a retain-state beat is told to keep both (#8616).
+  //    - hierarchy ERROR: every resolver reads its own (W01's fallback). Their
+  //      values reach legacy beats as before; a retain-state beat retains PAM
+  //      and helper instead, and neither builder writes its device cache.
   //    - set ERROR: the hierarchy is kept (it was read before the failure);
   //      resolvers read their own assignments with it.
   // 2. Every result is written to an outer variable as soon as it is produced.
@@ -2293,6 +2722,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     monitoringSettings: Record<string, unknown> | null;
     pamSettings: { uacInterceptionEnabled: boolean } | null;
     patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null;
+    featureUpdateSettings: RingFeatureUpdates | null;
     warrantySettings: { hpCmslEnabled: boolean } | null;
     hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null;
     timeSyncSettings: Awaited<ReturnType<typeof buildTimeSyncConfigUpdate>> | null;
@@ -2303,12 +2733,15 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     monitoringSettings: null,
     pamSettings: null,
     patchSourceSettings: null,
+    featureUpdateSettings: null,
     warrantySettings: null,
     hardwareMonitoringSettings: null,
     timeSyncSettings: null,
     workloadInventorySettings: null,
   };
   let onedrivePlan = null as OnedriveConfigPlan | null;
+  // #7970 — whether this device is a UniFi collector; null = unknown this beat (key omitted).
+  let unifiCollectorsAssigned = null as boolean | null;
   // #8053 W1a-1 per-org caches; under this org-scoped context a miss is stored
   // only for the exact org + partner the context was built for (#8142).
   const orgCacheFills = new DeferredCacheFills();
@@ -2316,7 +2749,6 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     await withDbAccessContext(dbContext, async () => {
       let beatHierarchy = null as DeviceHierarchy | null;
       let beatPolicySet = null as DevicePolicySet | null;
-      let hierarchyOutcome = 'error' as 'loaded' | 'missing' | 'error';
       let missingReason = 'absent' as 'absent' | 'org_mismatch' | 'partner_mismatch';
       let missingLoadedOrgId = null as string | null;
       let missingLoadedPartnerId = null as string | null;
@@ -2370,20 +2802,28 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         ? { orgId: beatHierarchy.orgId, partnerId: beatHierarchy.org.partnerId }
         : undefined;
       const probePartnerOpts = beatHierarchy?.org ? { partnerId: beatHierarchy.org.partnerId } : undefined;
+      // #8257: the device-keyed Redis policy caches are bound to the device's
+      // org. With a hierarchy it supplies the org (already checked equal to
+      // scoped.deviceOrgId above); without one this names it. No statement.
+      const cachedPolicyOpts = { ...policyOpts, orgId: scoped.deviceOrgId };
 
       // Helper. Redis first (no statement on a hit). With the set the helper
       // resolves in memory and only the legacy org flag can read (its own
       // savepoint, on a per-org cache miss). Without it, the whole helper read
       // keeps its own savepoint, as before: a null helper delivers
-      // helperEnabled:false, so its SQL error must not abort the context.
+      // helperEnabled:false to a legacy beat (a retain-state beat retains it),
+      // so its SQL error must not abort the context.
       try {
-        const cachedHelper = await readCachedHelperSettings(scoped.deviceId);
+        const cachedHelper = await readCachedHelperSettings(scoped.deviceId, scoped.deviceOrgId);
         if (cachedHelper) {
           helperSettings = cachedHelper;
         } else {
           const helperOpts = {
             ...policyOpts,
             skipCacheRead: true,
+            // #8616 (decision 13, approved override of the plan's OD13): a
+            // value read without this beat's own hierarchy is never cached.
+            skipCacheWrite: hierarchyOutcome !== 'loaded',
             loadOrgHelperSettings: (orgId: string) =>
               orgCacheFills.through(orgHelperSettingsCache, orgId, () => withDbTransaction(() => getOrgHelperSettings(orgId)), fillScope),
           };
@@ -2414,14 +2854,14 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
 
       // Sentry on every feature: losing a policy silently is exactly #2930.
       try {
-        policyConfigs.eventLogSettings = await buildEventLogConfigUpdate(scoped.deviceId, policyOpts);
+        policyConfigs.eventLogSettings = await buildEventLogConfigUpdate(scoped.deviceId, cachedPolicyOpts);
       } catch (err) {
         console.error(`[agents] failed to build event log config update for ${agentId}:`, err);
         captureException(err);
       }
 
       try {
-        policyConfigs.hardwareMonitoringSettings = await buildHardwareMonitoringConfigUpdate(scoped.deviceId, policyOpts);
+        policyConfigs.hardwareMonitoringSettings = await buildHardwareMonitoringConfigUpdate(scoped.deviceId, cachedPolicyOpts);
       } catch (err) {
         console.error(`[agents] failed to build hardware monitoring config update for ${agentId}:`, err);
         captureException(err);
@@ -2429,16 +2869,19 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
 
       try {
         policyConfigs.pamSettings = await buildPamConfigUpdate(scoped.deviceId, {
-          ...policyOpts,
+          ...cachedPolicyOpts,
+          // #8616: see the helper read above.
+          skipCacheWrite: hierarchyOutcome !== 'loaded',
           loadOrgPamFallback: (orgId) =>
             orgCacheFills.through(orgPamFallbackCache, orgId, () => withDbTransaction(() => resolveOrgPamFallback(orgId)), fillScope),
         });
       } catch (err) {
-        // Opt-in default: a resolver failure sends uacInterceptionEnabled:false.
-        // For an org that ENFORCES PAM this momentarily drops elevation gating
-        // until the next successful heartbeat. Not cached; self-heals.
+        // Opt-in default: a resolver failure sends uacInterceptionEnabled:false
+        // to a legacy agent (for an org that ENFORCES PAM this momentarily
+        // drops elevation gating until the next successful heartbeat), and
+        // `retainState: ['pam']` to a protocol-aware one (#8616). Not cached.
         console.error(
-          `[agents] failed to build pam config update for ${agentId} — sending uacInterceptionEnabled:false this heartbeat:`,
+          `[agents] failed to build pam config update for ${agentId} — no PAM decision this heartbeat:`,
           err,
         );
         captureException(err);
@@ -2450,6 +2893,16 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         policyConfigs.patchSourceSettings = await buildPatchSourceConfigUpdate(scoped.deviceId, policyOpts);
       } catch (err) {
         console.error(`[agents] failed to build patch_source config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // Windows feature-update policy from the device's update ring: same
+      // posture as patch_source — an error omits the block (the agent keeps
+      // its last policy), a successful resolve with no ring says block.
+      try {
+        policyConfigs.featureUpdateSettings = await buildFeatureUpdateConfigUpdate(scoped.deviceId, policyOpts);
+      } catch (err) {
+        console.error(`[agents] failed to build feature_update config update for ${agentId}:`, err);
         captureException(err);
       }
 
@@ -2488,7 +2941,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       // "no policy applies" arrives as { watches: [] } and must be sent (#2949).
       // With the set, a device with no monitors link costs no statement.
       try {
-        policyConfigs.monitoringSettings = await buildMonitoringConfigUpdate(scoped.deviceId, policyOpts) as Record<string, unknown> | null;
+        policyConfigs.monitoringSettings = await buildMonitoringConfigUpdate(scoped.deviceId, cachedPolicyOpts) as Record<string, unknown> | null;
       } catch (err) {
         console.error(`[agents] failed to build monitoring config update for ${agentId}:`, err);
         captureException(err);
@@ -2502,6 +2955,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         policyConfigs.workloadInventorySettings = await buildWorkloadInventoryConfigUpdate(scoped.deviceId, policyOpts);
       } catch (err) {
         console.error(`[agents] failed to build workload inventory config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // #7970 — UniFi collector presence hint (configUpdate.unifi_collectors_assigned).
+      // The agent backs its collector-config fetch off to a long idle interval
+      // while it has none; `true` here wakes it. Shares the unifi-collectors
+      // route's negative cache (same key, same predicate), so a collector-less
+      // device costs one savepoint per TTL, not one per beat. Last in this
+      // context: an earlier aborting statement only omits the key (the agent
+      // then keeps its idle re-check).
+      try {
+        unifiCollectorsAssigned = await orgCacheFills.through(
+          agentCollectorAbsenceCache,
+          agentCollectorAbsenceKey(scoped.deviceId, agent.orgId),
+          () => withDbTransaction(() => deviceHasAgentCollectors(db, scoped.deviceId, agent.orgId)),
+          fillScope,
+          { keyOrgId: agent.orgId, shouldCache: (present) => !present },
+        );
+      } catch (err) {
+        console.error(`[agents] failed to resolve UniFi collector presence for ${agentId}:`, err);
         captureException(err);
       }
     });
@@ -2540,11 +3013,40 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     ? { onedrive_helper_settings: onedriveSettings }
     : null;
 
+  // #10190 W03 — the MSP identity drawn on every device prompt. Only for an
+  // agent that speaks the block, and only when this beat's own hierarchy
+  // loaded (the device's org and partner were just checked against the
+  // authenticated ones). Otherwise, and on any resolution failure, the block
+  // is OMITTED, never `cleared`: an absent block keeps the agent's last-known
+  // identity, so a transient DB or Redis error never strips the MSP name from
+  // a prompt. `cleared` is sent only when the device's org resolves no partner
+  // row (services/promptIdentity.ts). Resolved here, after the policy context
+  // is released: it runs its own short system read and may fetch the logo
+  // (#1105). A sibling of helperSettings, not inside it: native prompts need
+  // the identity on a device with no helper policy.
+  let promptIdentity: Awaited<ReturnType<typeof buildHeartbeatPromptIdentity>>;
+  if (
+    normalizePromptIdentityProtocolVersion(data.securityCapabilities?.promptIdentityProtocolVersion) === 1
+    && hierarchyOutcome === 'loaded'
+  ) {
+    try {
+      promptIdentity = await buildHeartbeatPromptIdentity({
+        deviceId: scoped.deviceId,
+        orgId: scoped.deviceOrgId,
+        partnerId: agent.partnerId,
+      });
+    } catch (err) {
+      console.error(`[agents] failed to resolve the prompt identity for ${agentId}; block omitted:`, err);
+      captureException(err);
+    }
+  }
+
   const {
     eventLogSettings,
     monitoringSettings,
     pamSettings,
     patchSourceSettings,
+    featureUpdateSettings,
     warrantySettings,
     hardwareMonitoringSettings,
     timeSyncSettings,
@@ -2575,6 +3077,9 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   if (patchSourceSettings) {
     policyConfigUpdate.patch_source_settings = patchSourceSettings;
   }
+  if (featureUpdateSettings) {
+    policyConfigUpdate.feature_update_settings = toFeatureUpdateSettingsWire(featureUpdateSettings);
+  }
   // Snake_case inside the block as well as outside (contract D6): this
   // assembly is where camelCase resolver output becomes wire keys, and the
   // agent's inner parse accepts either spelling.
@@ -2584,26 +3089,53 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   const hasPolicyConfigUpdate = Object.keys(policyConfigUpdate).length > 0;
 
   const scopedConfigUpdate = scoped.mainResponse.configUpdate as Record<string, unknown> | null;
-  const configUpdate = policyProbeConfig || scopedConfigUpdate || hasPolicyConfigUpdate || onedriveConfigUpdate
+  const unifiHint = unifiCollectorsAssigned === null ? null : { unifi_collectors_assigned: unifiCollectorsAssigned };
+  const configUpdate = policyProbeConfig || scopedConfigUpdate || hasPolicyConfigUpdate || onedriveConfigUpdate || unifiHint
     ? {
       ...(policyProbeConfig ?? {}),
       ...(scopedConfigUpdate ?? {}),
       ...policyConfigUpdate,
       ...(onedriveConfigUpdate ?? {}),
+      ...(unifiHint ?? {}),
     }
     : null;
 
+  // #8616 — PAM, helper and remote management: the legacy payload for every
+  // beat except one that advertised retainStateProtocolVersion 1 (kill switch
+  // HEARTBEAT_RETAIN_STATE_ENABLED=false forces legacy for all). Legacy keeps
+  // the opt-in default: no PAM decision sends false, so we never prompt users
+  // on a device that opted into nothing. Each key below sits at its pre-#8616
+  // position (manageRemoteManagement overwrites its mainResponse slot), so a
+  // legacy payload is byte-identical to before.
+  const settingsDecision = buildSettingsDecisionFields({
+    retainProtocol: normalizeRetainStateProtocolVersion(data.securityCapabilities?.retainStateProtocolVersion),
+    enabled: retainStateKillSwitchEnabled(),
+    policyHierarchyLoaded: hierarchyOutcome === 'loaded',
+    pamSettings,
+    helperSettings,
+    remoteManagement: scoped.remoteManagement,
+  });
+
   return c.json({
     ...scoped.mainResponse,
+    manageRemoteManagement: settingsDecision.manageRemoteManagement,
     configUpdate,
     manifestTrustKeys,
     manifestKeyDelegations,
-    // Opt-in default: a null pamSettings (resolver error, logged above) sends
-    // false so we never prompt users on a device that opted into nothing.
-    uacInterceptionEnabled: pamSettings?.uacInterceptionEnabled ?? false,
-    helperEnabled: helperSettings?.enabled ?? false,
-    helperSettings: helperSettings ?? undefined,
+    uacInterceptionEnabled: settingsDecision.uacInterceptionEnabled,
+    helperEnabled: settingsDecision.helperEnabled,
+    helperSettings: settingsDecision.helperSettings,
+    // #10190 — the prompt host kill switch (spec §3.1 rule 2). ALWAYS sent,
+    // with or without a helper policy: the agent reads an absent block as an
+    // empty list, so omitting it would be indistinguishable from the kill
+    // switch. Server config only; the agent still needs the renderer's live
+    // advertisement and its own build to speak a kind before using it.
+    promptHost: { enabledKinds: enabledPromptKinds() },
+    ...(promptIdentity ? { promptIdentity } : {}),
     acknowledgedRollbackObservationId,
+    ...(identityAssertion ? { identityAssertion } : {}),
+    ...(rebind ? { rebind } : {}),
+    ...(settingsDecision.retainState ? { retainState: settingsDecision.retainState } : {}),
   });
 });
 

@@ -11,6 +11,8 @@ import {
   getDeviceCascadeDeleteTables,
   DEVICE_DETACH_DEVICE_ID_TABLES,
   getDeviceOrgDenormalizedTables,
+  getDeviceOrgMoveDeleteTables,
+  CORE_DEVICE_ORG_MOVE_DELETE_TABLES,
   DEVICE_ORG_DENORMALIZED_TABLES,
   DEVICE_ORG_FK_CASCADE_TABLES,
   DEVICE_SITE_DENORMALIZED_TABLES,
@@ -206,10 +208,257 @@ describe('getDeviceOrgDenormalizedTables() coverage', () => {
       'software_inventory_observations',
       'agent_rollback_events',
       'peripheral_policy_delivery_events',
+      // #4755: composite (device_id, org_id) FK ON UPDATE CASCADE restamps it.
+      'device_restore_point_attempts',
+      'security_agent_device_status',
     ]);
     expect(deviceOrgDenormalizedTables).toEqual(
       expect.arrayContaining([...DEVICE_ORG_FK_CASCADE_TABLES]),
     );
+  });
+});
+
+/**
+ * Org-move disposition (#8634) — exactly one of restamp / DB-cascade / delete.
+ *
+ * moveDeviceOrgInTransaction() handles a device-scoped row in one of three
+ * ways, chosen by list membership in core.ts:
+ *   - RESTAMP: in getDeviceOrgDenormalizedTables() and in neither sub-list
+ *     below. The move loop UPDATEs org_id to the target org.
+ *   - DB CASCADE: DEVICE_ORG_FK_CASCADE_TABLES. An ON UPDATE CASCADE FK or the
+ *     breeze_cascade_device_org_id() trigger restamps it; the loop skips it.
+ *   - DELETE: getDeviceOrgMoveDeleteTables(). Its rows name a source-org
+ *     entity (topology_device_presence.matched_site_id), so a restamp is
+ *     unrepresentable; the loop skips it and the delete loop removes the rows
+ *     (for the topology tables a BEFORE UPDATE trigger on devices normally
+ *     deleted them already; the loop is the fallback).
+ * Core move-delete and DB-cascade tables ALSO stay in
+ * CORE_DEVICE_ORG_DENORMALIZED_TABLES (the coverage contract above), so the
+ * restamp disposition is "denormalized minus the two sub-lists".
+ *
+ * A table in BOTH sub-lists has two contradictory dispositions, and a table in
+ * INTENTIONALLY_NO_ORG_ID (never moved) must not also sit in a move list.
+ *
+ * Limits: scope is read from the Drizzle schema. A device pointer under another
+ * column name (source_device_id, linked_device_id), or a FK declared only in a
+ * migration (ai_sessions.topology_site_id -> sites), is invisible here. A green
+ * run means every Drizzle-visible device table is classified, not that each
+ * classification is right; review the SQL for those.
+ */
+describe('device org-move disposition (#8634)', () => {
+  const RESTAMP = 'getDeviceOrgDenormalizedTables() restamp loop';
+  const FK_CASCADE = 'DEVICE_ORG_FK_CASCADE_TABLES';
+  const MOVE_DELETE = 'getDeviceOrgMoveDeleteTables()';
+  const NOT_MOVED = 'INTENTIONALLY_NO_ORG_ID (this test)';
+  const LISTS = `${RESTAMP}, ${FK_CASCADE}, ${MOVE_DELETE} (all in routes/devices/core.ts)`;
+
+  const denormSet = new Set<string>(deviceOrgDenormalizedTables);
+  const fkCascadeSet = new Set<string>(DEVICE_ORG_FK_CASCADE_TABLES);
+  const moveDeleteSet = new Set<string>(getDeviceOrgMoveDeleteTables());
+
+  const allTables = Object.values(schema).filter(
+    (v) => v instanceof PgTable,
+  ) as PgTable<any>[];
+  const tableByName = new Map(allTables.map((t) => [getTableName(t), t] as const));
+
+  function referencedTables(table: PgTable<any>): string[] {
+    return getTableConfig(table).foreignKeys.map((fk) =>
+      getTableName(fk.reference().foreignTable),
+    );
+  }
+
+  // A device_id that is a FK to some OTHER table (snmp_metrics.device_id ->
+  // snmp_devices.id) does not name a Breeze device, so the move never sees it.
+  function deviceIdReferencesAnotherTable(table: PgTable<any>): boolean {
+    return getTableConfig(table).foreignKeys.some((fk) => {
+      const ref = fk.reference();
+      return ref.columns.length === 1 && ref.columns[0]!.name === 'device_id'
+        && getTableName(ref.foreignTable) !== 'devices';
+    });
+  }
+
+  // Device-scoped tables (a device_id column) whose rows carry the device's
+  // org (an org_id column, which every such table FKs to organizations) or
+  // point at a site (a Drizzle FK to `sites`). An org move must decide what
+  // happens to each one. `devices` owns these columns; it is the move itself.
+  const inScope = allTables.filter((table) => {
+    const name = getTableName(table);
+    if (name === 'devices') return false;
+    const cols = getColumns(table).map((c) => c.name);
+    if (!cols.includes('device_id')) return false;
+    if (deviceIdReferencesAnotherTable(table)) return false;
+    return cols.includes('org_id') || referencedTables(table).includes('sites');
+  });
+
+  /**
+   * In scope, but the app never writes them, so they cannot sit in the
+   * app-level lists (all of which must also be device-managed — see the
+   * coverage block above). Each entry says what moves its org_id instead.
+   */
+  const DB_MAINTAINED_ON_MOVE: ReadonlyMap<string, string> = new Map([
+    [
+      'partner_export_device_material_state',
+      // 2026-07-23-partner-export-material-state-hardening.sql: breeze_app has
+      // no write grant; the composite (device_id, org_id) -> devices(id, org_id)
+      // FK is ON UPDATE CASCADE, so the devices row flip restamps it. Same
+      // exemption as DB_TRIGGER_MAINTAINED in cascadeDelete.test.ts.
+      'composite (device_id, org_id) FK ON UPDATE CASCADE; the FK is declared only in the migration',
+    ],
+  ]);
+  const DB_MAINTAINED = 'DB_MAINTAINED_ON_MOVE (this test)';
+
+  function dispositions(name: string): string[] {
+    const found: string[] = [];
+    if (DB_MAINTAINED_ON_MOVE.has(name)) found.push(DB_MAINTAINED);
+    if (denormSet.has(name) && !fkCascadeSet.has(name) && !moveDeleteSet.has(name)) {
+      found.push(RESTAMP);
+    }
+    if (fkCascadeSet.has(name)) found.push(FK_CASCADE);
+    if (moveDeleteSet.has(name)) found.push(MOVE_DELETE);
+    if (INTENTIONALLY_NO_ORG_ID.has(name)) found.push(NOT_MOVED);
+    return found;
+  }
+
+  it('sanity: the schema-derived scope includes one table per disposition and excludes non-device tables', () => {
+    const names = new Set(inScope.map((t) => getTableName(t)));
+    expect(names.has('device_metrics')).toBe(true); // restamp
+    expect(names.has('agent_health_observations')).toBe(true); // DB cascade
+    expect(names.has('topology_device_presence')).toBe(true); // move-delete
+    expect(names.has('partner_export_device_material_state')).toBe(true); // DB-maintained
+    expect(names.has('ai_agent_runs')).toBe(true); // not moved
+    // Composite-FK site detection works (site_id, org_id) -> sites.
+    expect(referencedTables(tableByName.get('topology_node_bindings')!)).toContain('sites');
+    // devices is the move itself; snmp_metrics.device_id names an snmp_devices row.
+    expect(names.has('devices')).toBe(false);
+    expect(names.has('snmp_metrics')).toBe(false);
+  });
+
+  it('classifies every device-scoped table with an org_id column or a site FK into exactly one list', () => {
+    const unclassified: string[] = [];
+    const ambiguous: string[] = [];
+
+    for (const table of inScope) {
+      const name = getTableName(table);
+      const found = dispositions(name);
+      if (found.length === 0) unclassified.push(name);
+      else if (found.length > 1) ambiguous.push(`${name} (in ${found.join(' AND ')})`);
+    }
+
+    expect(
+      unclassified,
+      `These device-scoped tables have an org_id column or a FK to sites, but no org-move disposition. ` +
+        `Add each to exactly one of ${LISTS}. Use the restamp list when the row can follow the device; ` +
+        `DEVICE_ORG_FK_CASCADE_TABLES when an ON UPDATE CASCADE FK or breeze_cascade_device_org_id() already ` +
+        `restamps it; CORE_DEVICE_ORG_MOVE_DELETE_TABLES when the row references a source-org entity (a site, ` +
+        `a config row) through a composite (x, org_id) FK, so a restamp would 23503. If the row must stay ` +
+        `with its source org, add it to ${NOT_MOVED} and the core.ts comment block instead; if breeze_app ` +
+        `cannot write it and a DB mechanism moves it, add it to ${DB_MAINTAINED} with the reason.` +
+        `\n\nUnclassified: ${unclassified.join(', ')}`,
+    ).toEqual([]);
+    expect(
+      ambiguous,
+      `These device-scoped tables have more than one org-move disposition. Keep each in exactly one of ` +
+        `${LISTS}, or in ${NOT_MOVED}. ` +
+        `(A core move-delete or DB-cascade table also stays in CORE_DEVICE_ORG_DENORMALIZED_TABLES; that is ` +
+        `not a conflict.)\n\nAmbiguous: ${ambiguous.join('; ')}`,
+    ).toEqual([]);
+  });
+
+  it('names no DB_MAINTAINED_ON_MOVE entry that has left the scope', () => {
+    const inScopeNames = new Set(inScope.map((t) => getTableName(t)));
+    const stale = [...DB_MAINTAINED_ON_MOVE.keys()].filter((name) => !inScopeNames.has(name));
+    expect(stale, `Remove these stale DB_MAINTAINED_ON_MOVE entries.`).toEqual([]);
+  });
+
+  // Core entries only: extension move-delete tables live in the extension's own
+  // schema, which this test does not import.
+  it('only lists move-delete tables that exist and are device-scoped', () => {
+    // The delete loop keys on `WHERE device_id = $1`.
+    const stale = CORE_DEVICE_ORG_MOVE_DELETE_TABLES.filter((name) => {
+      const table = tableByName.get(name);
+      return !table || !getColumns(table).some((c) => c.name === 'device_id');
+    });
+    expect(
+      stale,
+      `These ${MOVE_DELETE} entries no longer exist in the schema or have no device_id column. Remove them.`,
+    ).toEqual([]);
+  });
+
+  it('only deletes tables whose rows name a source-org row through a composite (x, org_id) FK', () => {
+    // A move-delete table discards the device's rows on every org move. That
+    // is only justified when a restamp is unrepresentable: a composite FK that
+    // carries org_id to some row other than the device (a site, a config row)
+    // which stays in the source org. Without one, the table belongs in the
+    // restamp list, and listing it here would silently destroy its data.
+    const unjustified = CORE_DEVICE_ORG_MOVE_DELETE_TABLES.filter((name) => {
+      const table = tableByName.get(name);
+      if (!table) return false; // covered by the stale-entry test above
+      return !getTableConfig(table).foreignKeys.some((fk) => {
+        const ref = fk.reference();
+        const target = getTableName(ref.foreignTable);
+        // Composite only: the plain org_id -> organizations FK every org table
+        // has, and (org_id, partner_id) -> organizations, name no source-org row.
+        return ref.columns.length > 1 && ref.columns.some((c) => c.name === 'org_id')
+          && target !== 'devices' && target !== 'organizations';
+      });
+    });
+    expect(
+      unjustified,
+      `These ${MOVE_DELETE} entries carry no composite (x, org_id) FK to a non-device row, so nothing ` +
+        `makes a restamp unrepresentable and the move would delete their rows for no reason. Move them to ` +
+        `CORE_DEVICE_ORG_DENORMALIZED_TABLES (restamp).\n\nUnjustified: ${unjustified.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * A restamped row that FKs a site keeps pointing at a SOURCE-org site
+   * unless something moves the site pointer too. That is either
+   * DEVICE_SITE_DENORMALIZED_TABLES (the move rewrites site_id to the target
+   * site) or a reviewed per-table mechanism listed below. Anything else is a
+   * move-delete table.
+   */
+  const SITE_FK_RESTAMP_REVIEWED: ReadonlyMap<string, string> = new Map([
+    [
+      'alerts',
+      // M3-D6 (2026-11-06-210400-topology-alert-ownership.sql): a SITE-OWNED
+      // alert (topology_site_id set) is held in its site's org by
+      // breeze_alerts_topology_ownership_guard; only device-owned alerts
+      // (topology_site_id NULL) are restamped.
+      'site-owned alerts stay in the site org (ownership guard trigger)',
+    ],
+  ]);
+
+  it('restamps a site-referencing table only when its site pointer moves too', () => {
+    const siteDenormSet = new Set<string>(DEVICE_SITE_DENORMALIZED_TABLES);
+    const unsafe: string[] = [];
+
+    for (const table of inScope) {
+      const name = getTableName(table);
+      if (!referencedTables(table).includes('sites')) continue;
+      const found = dispositions(name);
+      const restamped = found.includes(RESTAMP) || found.includes(FK_CASCADE);
+      if (!restamped) continue;
+      if (siteDenormSet.has(name) || SITE_FK_RESTAMP_REVIEWED.has(name)) continue;
+      unsafe.push(name);
+    }
+
+    expect(
+      unsafe,
+      `These device-scoped tables FK a site and are restamped on org move, so a moved row would keep ` +
+        `pointing at a SOURCE-org site (or 23503 on a composite (site, org_id) FK). Move each to ` +
+        `CORE_DEVICE_ORG_MOVE_DELETE_TABLES, rewrite its site column via DEVICE_SITE_DENORMALIZED_TABLES, or ` +
+        `document its own mechanism in SITE_FK_RESTAMP_REVIEWED in this test.\n\nUnsafe: ${unsafe.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('names no reviewed site-FK exemption that no longer FKs a site or is no longer restamped', () => {
+    const stale = [...SITE_FK_RESTAMP_REVIEWED.keys()].filter((name) => {
+      const table = tableByName.get(name);
+      if (!table || !referencedTables(table).includes('sites')) return true;
+      const found = dispositions(name);
+      return !found.includes(RESTAMP) && !found.includes(FK_CASCADE);
+    });
+    expect(stale, `Remove these stale SITE_FK_RESTAMP_REVIEWED entries.`).toEqual([]);
   });
 });
 
@@ -386,9 +635,24 @@ describe('ALERT_CHILD_ORG_REWRITE_TABLES coverage (#4867)', () => {
     'network_change_events',
   ]);
 
+  // A composite alert/org FK with ON UPDATE CASCADE follows the alert
+  // inside breeze_cascade_device_org_id(); an application rewrite is neither
+  // needed nor desirable. Unlike producer exclusions, derive this from DDL.
+  const followsAlertOrgByForeignKey = (table: PgTable<any>): boolean =>
+    getTableConfig(table).foreignKeys.some((fk) => {
+      const ref = fk.reference();
+      return fk.onUpdate === 'cascade' && getTableName(ref.foreignTable) === 'alerts'
+        && ref.columns.some((column, index) => column.name === 'org_id' && ref.foreignColumns[index]?.name === 'org_id')
+        && ref.columns.some((column, index) => column.name === 'alert_id' && ref.foreignColumns[index]?.name === 'id');
+    });
+
+  it('derives alert refs as database-restamped through the composite alert/org FK', () => {
+    expect(followsAlertOrgByForeignKey(schema.alertExternalRefs)).toBe(true);
+  });
+
   function deriveAlertChildOrgTables(): string[] {
     const direct = allTables
-      .filter((t) => isOrgScopedWithoutDeviceId(t) && referencesTable(t, new Set(['alerts'])))
+      .filter((t) => isOrgScopedWithoutDeviceId(t) && referencesTable(t, new Set(['alerts'])) && !followsAlertOrgByForeignKey(t))
       .map(getTableName)
       .filter((name) => !customSet.has(name) && !ALERT_PRODUCERS_NOT_CHILDREN.has(name));
     const directSet = new Set(direct);
@@ -1256,9 +1520,9 @@ describe('device_vulnerabilities.ticket_id detach coverage (#4645)', () => {
  * re-stamped to the target org while its group_id kept naming the SOURCE org's
  * group. Two system-context readers then dereferenced those rows by group_id.
  *
- * The structural fix is two composite FKs — `(group_id, org_id) ->
- * device_groups(id, org_id)` and `(device_id, org_id) -> devices(id, org_id)`
- * — which means the memberships must now be DELETED on a move rather than
+ * The structural fix is the deferred group-owner trigger (#10521 W1) plus
+ * the composite device FK `(device_id, org_id) -> devices(id, org_id)`,
+ * which means memberships must be DELETED on a move rather than
  * re-stamped, before the generic re-stamp loop that would otherwise 23503.
  *
  * The DEVICE-axis FK's deferrability is the one non-stylistic detail here and
@@ -1284,20 +1548,22 @@ describe('device_group_memberships cross-org detach coverage (#3182)', () => {
       .map((name) => readFileSync(`${MIGRATIONS_DIR}${name}`, 'utf8'))
       .join('\n');
 
-  it('pins the group-axis composite FK to device_groups(id, org_id), DEFERRABLE', () => {
-    const match = membershipFkStatements().match(
-      /ADD CONSTRAINT device_group_memberships_group_org_fk[\s\S]{0,400}?;/,
-    );
-    expect(match, 'no migration adds device_group_memberships_group_org_fk (#3182)').toBeTruthy();
-    const ddl = match![0].replace(/\s+/g, ' ');
-    expect(
-      ddl,
-      'the group-axis FK must reference device_groups (id, org_id) — pinning the row to its group\'s org is the whole point',
-    ).toContain('REFERENCES public.device_groups (id, org_id)');
-    expect(
-      ddl,
-      'must be DEFERRABLE: the org merge runs SET CONSTRAINTS ALL DEFERRED and repoints devices/device_groups/device_group_memberships in separate statements, and orgLifecycleFoundations.integration.test.ts rejects any non-deferrable FK referencing a parent org_id',
-    ).toContain('DEFERRABLE');
+  it('pins the deferred membership owner trigger', () => {
+    const migrations = readdirSync(MIGRATIONS_DIR)
+      .filter((name) => /^\d{4}-.*\.sql$/.test(name))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({ name, body: readFileSync(`${MIGRATIONS_DIR}${name}`, 'utf8') }));
+    const latest = [...migrations].reverse().find(({ body }) =>
+      /CREATE CONSTRAINT TRIGGER device_group_memberships_group_owner_check\b/.test(body));
+    expect(latest, 'no migration creates the membership owner trigger (#10521 W1)').toBeDefined();
+    const statement = latest!.body.match(
+      /CREATE CONSTRAINT TRIGGER device_group_memberships_group_owner_check[\s\S]*?;/,
+    )![0].replace(/\s+/g, ' ');
+    expect(statement).toContain('DEFERRABLE INITIALLY DEFERRED');
+    expect(statement).toContain('FOR EACH ROW');
+    expect(migrations.some(({ name, body }) => name.localeCompare(latest!.name) >= 0
+      && /DROP CONSTRAINT IF EXISTS device_group_memberships_group_org_fk\b/.test(body)),
+    'the replacement must drop the group-axis composite FK in the same or a later migration').toBe(true);
   });
 
   it('declares the device-axis composite FK INITIALLY DEFERRED, not IMMEDIATE', () => {
@@ -1319,11 +1585,11 @@ describe('device_group_memberships cross-org detach coverage (#3182)', () => {
     const loop = body.indexOf('breeze_device_child_orgid_tables()');
     expect(
       detach,
-      `${name} is the newest definition of breeze_cascade_device_org_id() and its body has no device_group_memberships detach — a device org-move that bypasses the moveOrg route (e.g. orgMerge's raw UPDATE devices) would re-stamp memberships onto a SOURCE-org group and 23503 on device_group_memberships_group_org_fk (#3182)`,
+      `${name} is the newest definition of breeze_cascade_device_org_id() and its body has no device_group_memberships detach — a device org-move that bypasses the moveOrg route (e.g. orgMerge's raw UPDATE devices) would re-stamp memberships onto a SOURCE-org group and 23503 on device_group_memberships_group_owner_check (#10521 W1)`,
     ).toBeGreaterThan(-1);
     expect(
       detach,
-      `${name}: the device_group_memberships detach must run BEFORE the generic re-stamp loop — the loop is the statement that trips the group FK`,
+      `${name}: the device_group_memberships detach must run BEFORE the generic re-stamp loop — the loop creates the invalid owner checked by the deferred trigger`,
     ).toBeLessThan(loop);
   });
 
@@ -1480,4 +1746,48 @@ describe('device move severs cross-tenant AI origin pointers (#5022 W01)', () =>
       'breeze_cascade_device_org_id() must mirror the route, or a fix-up script that writes devices.org_id directly strands a cross-tenant pointer',
     ).toMatch(/UPDATE public\.script_executions SET ai_session_id = NULL, ai_agent_run_id = NULL/);
   });
+});
+
+/**
+ * ticket_links (#7900 W02) — the one ticket child the schema-derived
+ * completeness check above CANNOT see: it has two ticket legs
+ * (source_ticket_id, target_ticket_id) and no literal `ticket_id`, so it is
+ * neither re-stamped nor discovered. A link whose ticket moves would leave
+ * legs in two orgs, which its composite FKs forbid, so BOTH movers delete
+ * every link touching a moved ticket and defer both FKs by name (the device
+ * axis re-stamps tickets.org_id inside the devices UPDATE trigger, long
+ * before its child tail runs). Pinned statically here because a missing
+ * leg or a missing deferral only fails on a real move of a linked ticket.
+ */
+describe('ticket_links on both org movers (#7900 W02)', () => {
+  const flat = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8').replace(/\s+/g, ' ');
+  const sources = [
+    ['moveTicketOrg', flat('../../services/ticketService.ts')],
+    ['moveDeviceOrgInTransaction', flat('../../services/deviceOrgMove/moveDeviceOrgInTransaction.ts')],
+  ] as const;
+
+  it('the schema gives ticket_links two ticket legs and no ticket_id (why discovery misses it)', () => {
+    const cols = getTableConfig(schema.ticketLinks).columns.map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(['org_id', 'source_ticket_id', 'target_ticket_id']));
+    expect(cols).not.toContain('ticket_id');
+  });
+
+  for (const [axis, src] of sources) {
+    it(`${axis} defers both ticket_links FKs by name`, () => {
+      // The executed statements only (sql`…` templates), not prose comments.
+      const setConstraints = src.match(/sql`SET CONSTRAINTS [^`]* DEFERRED`/g) ?? [];
+      expect(setConstraints.length).toBeGreaterThan(0);
+      for (const stmt of setConstraints) {
+        expect(stmt).toContain('ticket_links_source_org_fk');
+        expect(stmt).toContain('ticket_links_target_org_fk');
+      }
+    });
+
+    it(`${axis} deletes links on BOTH legs of a moved ticket`, () => {
+      const del = src.match(/DELETE FROM ticket_links WHERE [^`]*/)?.[0] ?? '';
+      expect(del).toMatch(/source_ticket_id/);
+      expect(del).toMatch(/target_ticket_id/);
+      expect(del).toMatch(/RETURNING/);
+    });
+  }
 });

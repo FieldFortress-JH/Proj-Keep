@@ -1062,6 +1062,25 @@ else
   CONFIG_DIR="/etc/breeze"
 fi
 BINARY_NAME="breeze-agent"
+# The macOS .pkg installs the agent to /Library/Breeze/bin or /usr/local/bin
+# (agent/installer/macos/install-location.sh, #7211), so enrollment must use
+# the binary it actually installed (#8778).
+MACOS_TRUSTED_BIN_DIR="/Library/Breeze/bin"
+
+# resolve_macos_agent_bin: print the agent binary the .pkg installed. Mirrors
+# choose_bin_dir in install-location.sh: an agent already in the trusted dir
+# stays there (so it wins over a leftover pre-relocation copy), otherwise the
+# package used /usr/local/bin. Fails when neither holds an executable agent.
+resolve_macos_agent_bin() {
+  local p
+  for p in "\$MACOS_TRUSTED_BIN_DIR/\$BINARY_NAME" "\$INSTALL_DIR/\$BINARY_NAME"; do
+    if [[ -f "\$p" && ! -L "\$p" && -x "\$p" ]]; then
+      echo "\$p"
+      return 0
+    fi
+  done
+  return 1
+}
 DOWNLOAD_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}"
 PKG_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}/pkg"
 VERSION_METADATA_URL="\${BREEZE_SERVER}/api/v1/agent-versions/latest?platform=\${OS}&arch=\${ARCH}&component=agent"
@@ -1250,9 +1269,6 @@ if [[ "\$OS" == "darwin" ]]; then
   # Enroll agent
   info "Enrolling agent with Breeze server..."
   ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-  if [[ -n "\$BREEZE_SITE_ID" ]]; then
-    ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-  fi
   if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
     ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
   fi
@@ -1262,8 +1278,10 @@ if [[ "\$OS" == "darwin" ]]; then
   # read a process's argv (e.g. /proc/*/cmdline on Linux, ps on macOS), but
   # not another user's environment. Scoped with a VAR=value prefix so it only
   # applies to this one invocation, never exported into this shell.
+  MACOS_AGENT_BIN="\$(resolve_macos_agent_bin)" || \
+    fatal "The package installed, but no breeze-agent was found in \$MACOS_TRUSTED_BIN_DIR or \$INSTALL_DIR."
   if ! BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET" \
-      "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
+      "\$MACOS_AGENT_BIN" "\${ENROLL_ARGS[@]}"; then
     fatal "Enrollment failed. Check the server URL and that the enrollment token is valid and not expired (plus the enrollment secret, if your server requires one)."
   fi
   success "Agent enrolled successfully"
@@ -1324,6 +1342,26 @@ success "Downloaded agent binary ($(wc -c < "\$TMPFILE" | tr -d ' ') bytes)"
 info "Verifying agent binary checksum..."
 verify_sha256 "\$TMPFILE" "\$EXPECTED_SHA256"
 success "Verified agent binary checksum"
+
+# ----- Refuse an agent too old for this script's enrollment flow (#9566) -----
+# This script hands the enrollment token to \`breeze-agent enroll\` through
+# BREEZE_AGENT_ENROLLMENT_KEY with no positional argument. Agents before
+# MIN_AGENT_VERSION only knew \`enroll <enrollment-key>\`, so against one the user
+# would see a bare cobra "accepts 1 arg(s), received 0" after a good download.
+# 0.118.0 is the first tag containing env-var enrollment (aa95674df5, #7199).
+# Conservative: only fail when the version parses AND is clearly lower; a binary
+# that cannot be executed here (noexec tmp) or prints something unparseable
+# (dev build) is let through. Runs before the existing install is touched.
+MIN_AGENT_VERSION="0.118.0"
+chmod 755 "\$TMPFILE" 2>/dev/null || true
+DOWNLOADED_VERSION_RAW="$("\$TMPFILE" version 2>/dev/null | head -n 1)" || DOWNLOADED_VERSION_RAW=""
+DOWNLOADED_VERSION="$(printf '%s' "\$DOWNLOADED_VERSION_RAW" | sed -n 's/^[^0-9]*\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\).*/\\1/p' | head -n 1)"
+if [[ -n "\$DOWNLOADED_VERSION" ]]; then
+  OLDEST_VERSION="$(printf '%s\\n%s\\n' "\$MIN_AGENT_VERSION" "\$DOWNLOADED_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)"
+  if [[ "\$DOWNLOADED_VERSION" != "\$MIN_AGENT_VERSION" && "\$OLDEST_VERSION" == "\$DOWNLOADED_VERSION" ]]; then
+    fatal "The agent binary served by this server is v\$DOWNLOADED_VERSION, which is older than this server's install flow (needs v\$MIN_AGENT_VERSION or newer). Set BREEZE_VERSION on the server (or check the release channel) so it serves a current agent, then re-run this script."
+  fi
+fi
 
 # ----- Stop existing service before replacing binary (safe for upgrades) -----
 if command -v systemctl &>/dev/null && systemctl is-active --quiet breeze-agent 2>/dev/null; then
@@ -1408,12 +1446,20 @@ mkdir -p "\$CONFIG_DIR"
 chmod 0700 "\$CONFIG_DIR"
 success "Config directory ready"
 
+# ----- Create data directory and breeze group (#9566) -----
+# Without these a first enroll logs WARNs about the DNS cache file
+# (/var/lib/breeze/dns-cache.json) and the missing breeze group (helper token
+# left root-only). Mirrors agent/scripts/install/install-linux.sh and
+# \`breeze-agent service install\` (0755 data dir, system group).
+mkdir -p /var/lib/breeze
+chmod 0755 /var/lib/breeze
+if command -v groupadd &>/dev/null && ! getent group breeze &>/dev/null; then
+  groupadd --system breeze 2>/dev/null || warn "Could not create the breeze group; the helper token file will stay root-only"
+fi
+
 # ----- Enroll agent -----
 info "Enrolling agent with Breeze server..."
 ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-if [[ -n "\$BREEZE_SITE_ID" ]]; then
-  ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-fi
 if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
   ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
 fi

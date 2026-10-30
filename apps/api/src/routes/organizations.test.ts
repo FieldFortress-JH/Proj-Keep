@@ -55,6 +55,7 @@ vi.mock('../services/monitors/builtInMonitors', () => ({
 vi.mock('../services/agentOrgSettingsCache', () => ({
   invalidateAgentOrgSettingsCaches: vi.fn(),
 }));
+vi.mock('../services/trustPage/servingSet', () => ({ scheduleServingRefreshForPartner: vi.fn() }));
 vi.mock('../db', () => {
   const db: Record<string, unknown> = {
     select: vi.fn(() => ({
@@ -648,15 +649,24 @@ describe('organization routes', () => {
         return next();
       });
 
-      vi.mocked(db.select).mockReturnValue({
-        from: vi.fn().mockReturnValue({
-          where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([
-              { id: 'site-1', orgId, name: 'HQ' }
-            ])
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { id: 'site-1', orgId, name: 'HQ' }
+              ])
+            })
           })
-        })
-      } as any);
+        } as any)
+        // GET /sites/:id also runs the grouped device-count queries (#9792).
+        .mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
 
       const res = await app.request('/orgs/sites/site-1', {
         method: 'GET',

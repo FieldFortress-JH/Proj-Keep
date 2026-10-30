@@ -122,7 +122,8 @@
     "testDialog": {
       "title": "Prova su un dispositivo",
       "selectDevice": "Dispositivo",
-      "run": "Esegui prova"
+      "run": "Esegui prova",
+      "saveToTest": "Salva per testare le modifiche"
     },
     "deliveryPreview": {
       "selectOrg": "Seleziona un’organizzazione per visualizzare la consegna.",
@@ -192,7 +193,8 @@
     "script": "Verifica script",
     "network_check": "Verifica di rete",
     "hardware_health": "Stato hardware",
-    "time_sync": "Sincronizzazione dell’ora"
+    "time_sync": "Sincronizzazione dell’ora",
+    "container_image_currency": "Aggiornamento delle immagini container"
   },
   "fields": {
     "operator": "Confronto",
@@ -244,7 +246,9 @@
     "expectedValue": "Valore atteso",
     "nameserver": "Server dei nomi",
     "degradedIsFailure": "Considera degradato come errore",
-    "maxResponseMs": "Fallisci se più lento di (ms)"
+    "maxResponseMs": "Fallisci se più lento di (ms)",
+    "eventLogCollectionNoSource": "Gli eventi applicazione di livello Informazioni e Avviso vengono raccolti solo da {{providers}}. Gli eventi di altre origini corrispondono a questa regola solo ai livelli Errore o Critico, a meno che un criterio di configurazione dei registri eventi non includa l’origine (Criterio di configurazione → Registri eventi → Provider applicazioni).",
+    "eventLogCollectionSourceNotCollected": "L’agente non raccoglie eventi applicazione di livello Informazioni o Avviso da \"{{source}}\", a meno che un criterio di configurazione dei registri eventi non lo includa (Criterio di configurazione → Registri eventi → Provider applicazioni). Altrimenti, questa regola corrisponde solo ai suoi eventi Errore o Critico. Provider integrati: {{providers}}."
   },
   "operators": {
     "gt": "maggiore di",
@@ -268,6 +272,7 @@
     "system": "Sistema"
   },
   "eventLevels": {
+    "info": "Informazioni",
     "warning": "Avviso",
     "error": "Errore",
     "critical": "Critica"
@@ -328,10 +333,13 @@
     "cancel": "Annulla",
     "detachConfirm": "Scollegare da {{policy}}?",
     "errors": {
+      "loadGroups": "Impossibile caricare i gruppi di dispositivi.",
       "attach": "Impossibile collegare il monitor",
       "detach": "Impossibile scollegare il monitor",
       "linkedFeature": "I monitor di questa policy provengono da una policy di funzionalità condivisa. Modifica quella policy o scegline un'altra."
-    }
+    },
+    "partnerWideGroups": "Tutte le org. (a livello di partner)",
+    "organizationGroups": "Gruppi dell’organizzazione"
   },
   "policyTab": {
     "title": "Monitor",
@@ -359,7 +367,7 @@
   "legacy": {
     "title": "Regole di avviso legacy",
     "description": "Regole di avviso autonome non gestite da un monitor. Convertile per ottenere risposte, consegna ed escalation in un unico posto.",
-    "empty": "Nessuna regola legacy.",
+    "empty": "Nessuna regola di avviso autonoma richiede conversione.",
     "columns": {
       "name": "Nome",
       "template": "Modello",
@@ -535,11 +543,13 @@
       "more": "Carica altro",
       "empty": "Nessuna conversione precedente.",
       "system": "Sistema",
+      "unknownUser": "Utente sconosciuto",
       "reverted": "Annullato",
       "deadline": "Annullamento non disponibile dopo la rimozione del motore di origine da parte del ritiro degli avvisi legacy."
     },
     "errorCodes": {
       "preview_stale": "Il criterio è cambiato dopo questa anteprima. Genera una nuova anteprima prima di convertire.",
+      "conversion_contended": "Modifiche simultanee hanno interrotto la conversione. Non è stato modificato nulla. Riprova.",
       "preview_failed": "Impossibile generare l'anteprima. Riprova più tardi.",
       "equivalence_delta": "I monitor convertiti non si comporterebbero come le regole legacy su tutti i dispositivi. Controlla l'anteprima prima di convertire.",
       "CONVERSION_PREREQUISITE_MISSING": "Un aggiornamento necessario della piattaforma non è ancora stato distribuito, quindi la conversione non è possibile.",
@@ -643,6 +653,9 @@
           "policy_not_applied": "Il criterio relativo all’ora non è stato applicato",
           "policy_conflict_gpo": "Criteri di gruppo controlla le impostazioni dell’ora"
         }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Giorni minimi di ritardo"
       }
     }
   },

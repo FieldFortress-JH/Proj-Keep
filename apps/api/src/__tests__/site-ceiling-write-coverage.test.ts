@@ -77,6 +77,10 @@ const GOVERNANCE_TABLE_NAMES = [
   // A DNS allow/block policy is pushed to the org's DNS filtering provider and
   // applies to every device behind it; the table has no site axis.
   'dnsPolicies',
+  // YARA rule sets (#6263 W03a) are scanned by every device of every policy
+  // that attaches them (and may auto-quarantine there); no site axis.
+  'yaraRuleSets',
+  'yaraRules',
 ] as const;
 
 /**
@@ -84,6 +88,15 @@ const GOVERNANCE_TABLE_NAMES = [
  * site-ceiling gate. Every entry carries the reason it is exempt.
  */
 const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
+  // #6263 W03a. Called only from the mutating routes in
+  // routes/security/yara.ts, each of which runs writeDenial
+  // (canMutateOrgWideGovernance) before reaching it.
+  'services/yaraBuiltinPackStore.ts':
+    'boot-only system-scope upsert of THE built-in set (no org, no site); no caller, so no site-restricted actor can reach it (#6263 W03b)',
+  'services/yaraRuleSetPublisher.ts':
+    'reached only through routes/security/yara.ts and services/yaraIocImportService.ts mutations, which call canMutateOrgWideGovernance (writeDenial / create) first — verify when editing any of these files',
+  'services/yaraIocImportService.ts':
+    'every mutation runs writeDenial (services/yaraRuleSetAccess.ts: canMutateOrgWideGovernance + canManagePartnerWidePolicies) first; 403s pinned in yaraIocImportService.test.ts and routes/security/yaraIocImport.test.ts (#6263 W04; extracted for the AI ioc_hunt import_iocs path, #6268)',
   // Background probe of a destination's create-only write support, started
   // after a brokered backup write is issued. Writes only the
   // provider_capabilities.conditionalWrites record, in system context; no
@@ -136,6 +149,22 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   'services/webhookDeliveryRecord.ts':
     'updates only successCount/failureCount/lastDeliveryAt after a delivery attempt, invoked from the delivery worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
 
+  // #6960 / #8736. Writes the software policy GENERATED for a
+  // `security_agents` feature link, inside the link-write transaction.
+  // syncManagedSoftwarePolicy is reached only through
+  // services/configurationPolicy.ts addFeatureLink / updateFeatureLink for a
+  // security_agents link, whose only callers for that feature type are
+  // routes/configurationPolicies/featureLinks.ts (POST + PATCH) and
+  // services/aiToolsConfigPolicy.ts (`manage_policy_feature_link`) — both call
+  // canMutateOrgWideGovernance before invoking them (the monitor-family callers
+  // currently pass only `monitors` links). The caller set is pinned by
+  // services/securityAgents/managedPolicyGenerator.callers.contract.test.ts.
+  // The other caller is the
+  // repairManagedSoftwarePolicies sweep in jobs/softwareComplianceWorker.ts,
+  // which reloads links by id in system context with no caller identity.
+  'services/securityAgents/managedPolicyGenerator.ts':
+    'derived write inside the security_agents link-write transaction — reached only through configurationPolicy.ts add/updateFeatureLink from routes/configurationPolicies/featureLinks.ts (POST/PATCH) and services/aiToolsConfigPolicy.ts manage_policy_feature_link, which both call canMutateOrgWideGovernance first, plus the system-context repair sweep in jobs/softwareComplianceWorker.ts — verify those callers still gate when editing this file',
+
   // Security-scan dispatch flips a grandfathered legacy link to 'revoked' when
   // its policy creator no longer holds devices:execute. Runs in the scan
   // worker's system context; it only ever narrows (stops auto-quarantine), and
@@ -178,6 +207,13 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // services/aiToolsDns.ts) gate before enqueueing.
   'jobs/dnsSyncJob.ts':
     'updates only syncStatus/lastSynced/syncError on a saved DNS policy from the sync worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
+
+  // DNS integration background delete (#10019): removes the policies of an
+  // integration the DELETE route already deactivated. That route is the
+  // caller-facing gate (requireOrgWideIntegrationAccess rejects any site
+  // ceiling); the worker reloads the row by id in system context.
+  'jobs/dnsSecurityRetention.ts':
+    'deletes dns_policies only for an integration already marked deleting by DELETE /dns-security/integrations/:id (site-ceiling gated by requireOrgWideIntegrationAccess); runs in a BullMQ worker in system context — no caller-scoped auth object reaches this path',
 
   'modules/mcpInvites/tools/configureDefaults.ts':
     'creates the default admin-email notification channel during MCP-invite partner bootstrap — the caller is a partner-bootstrap key, not a site-restricted org-scope caller, and the target org is fixed by the bootstrap context, not caller-chosen',

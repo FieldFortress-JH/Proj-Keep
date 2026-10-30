@@ -13,6 +13,7 @@ import { PageHeader } from '../shared/PageHeader';
 import type { AiAgentRunListItemDto, AiAgentRunStatus } from '@breeze/shared';
 import { AI_AGENT_RUN_STATUSES } from '@breeze/shared';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 // SSR-safe: reading `window` inside an effect (not a `useState` initializer)
 // avoids the hydration-mismatch class useHashState.ts documents — this page
@@ -447,6 +448,8 @@ export default function RunsListPage() {
   const currentOrgId = useOrgStore((s) => s.currentOrgId);
   const [runs, setRuns] = useState<AiAgentRunListItemDto[]>([]);
   const [agents, setAgents] = useState<AgentOption[]>([]);
+  // #10135: kinds present on the partner, for the report links in the header.
+  const [agentKinds, setAgentKinds] = useState<ReadonlySet<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string>();
@@ -545,6 +548,7 @@ export default function RunsListPage() {
         setAgents(
           (body.data as Array<{ id: string; name: string }>).map((a) => ({ id: a.id, name: a.name })),
         );
+        setAgentKinds(new Set((body.data as Array<{ kind?: string }>).map((a) => a.kind ?? '')));
         setAgentsLoaded(true);
       } catch {
         // The agent filter is a convenience; a failed load just leaves it at
@@ -569,7 +573,7 @@ export default function RunsListPage() {
     if (agents.some((agent) => agent.id === agentFilter)) return;
     setAgentFilter('');
     if (window.location.hash) {
-      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      replaceUrl(window.location.pathname + window.location.search);
     }
   }, [agentsLoaded, agents, agentFilter]);
 
@@ -734,7 +738,27 @@ export default function RunsListPage() {
         title={t('aiAgentsPage.runs.title')}
         description={t('aiAgentsPage.runs.description')}
         actions={
-          showFilterChrome ? (
+          showFilterChrome || agentKinds.has('research') || agentKinds.has('designer') ? (
+            <>
+              {agentKinds.has('research') && (
+                <a
+                  href="/ai-agents/fix-memory"
+                  className="text-sm text-primary hover:underline"
+                  data-testid="runs-link-fix-memory"
+                >
+                  {t('aiAgentsRuns.headerLinks.fixMemoryReport')}
+                </a>
+              )}
+              {agentKinds.has('designer') && (
+                <a
+                  href="/ai-agents/fleet-design"
+                  className="text-sm text-primary hover:underline"
+                  data-testid="runs-link-fleet-design"
+                >
+                  {t('aiAgentsRuns.headerLinks.fleetDesignReport')}
+                </a>
+              )}
+              {showFilterChrome && (
             <>
               <select
                 data-testid="runs-list-filter-agent"
@@ -793,6 +817,8 @@ export default function RunsListPage() {
               >
                 {showCost ? t('aiAgentsRuns.list.hideCost') : t('aiAgentsRuns.list.showCost')}
               </button>
+            </>
+              )}
             </>
           ) : undefined
         }

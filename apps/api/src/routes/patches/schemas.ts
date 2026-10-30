@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { COMPLIANCE_DEVICE_STATUSES, COMPLIANCE_DEVICES_MAX_LIMIT } from './complianceDevices';
 
 // Whitelisted sortable columns for the patches list. Never feed raw user input
 // into orderBy — list.ts maps these keys to real columns (issue #1316).
@@ -20,6 +21,12 @@ export const listPatchesSchema = z.object({
   os: z.enum(['windows', 'macos', 'linux']).optional(),
   sortBy: z.enum(PATCH_SORT_KEYS).optional(),
   sortDir: z.enum(['asc', 'desc']).optional()
+});
+
+export const listPatchDevicesSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional()
 });
 
 export const patchIdParamSchema = z.object({
@@ -100,7 +107,13 @@ export const complianceSchema = z.object({
   orgId: z.string().guid().optional(),
   ringId: z.string().guid().optional(),
   source: z.enum(['microsoft', 'apple', 'linux', 'third_party', 'custom']).optional(),
-  severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional()
+  severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
+  // #9791 C: the paginated device list. Narrows `devices` only; every summary
+  // field still describes the whole counted device set.
+  status: z.enum(COMPLIANCE_DEVICE_STATUSES).optional(),
+  search: z.string().trim().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(COMPLIANCE_DEVICES_MAX_LIMIT).optional(),
+  offset: z.coerce.number().int().min(0).optional()
 });
 
 export const complianceReportSchema = z.object({

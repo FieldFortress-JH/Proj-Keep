@@ -33,19 +33,30 @@ cp .env.example .env
 #   JWT_SECRET: openssl rand -base64 64
 #   AGENT_ENROLLMENT_SECRET: openssl rand -hex 32
 #   APP_ENCRYPTION_KEY: openssl rand -hex 32
+# THEN change the three values in "Local .env values" below:
+# .env.example is the production template.
 
 # Start infrastructure (Postgres and Redis)
 # The base compose file requires digest-pinned BREEZE_*_IMAGE_REF values and
 # .env.example ships placeholders for them, so local dev layers the dev override on
 # top. Same invocation as docs/guides/DEVELOPER_GUIDE.md.
 docker compose -f docker-compose.yml -f docker-compose.override.yml.dev up -d postgres redis
+# These publish on 127.0.0.1 only, so the dev Postgres and Redis are reachable
+# from this machine alone. Set BREEZE_DEV_BIND_ADDR=0.0.0.0 only if another
+# machine must reach the stack -- and first replace the POSTGRES_PASSWORD and
+# REDIS_PASSWORD placeholders .env.example ships, because they are published
+# exactly as they stand.
 
 # Set up the database
 pnpm db:migrate
 pnpm db:seed
 
-# Start dev servers
-pnpm dev
+# Start dev servers (api + web + portal)
+pnpm dev:app
+
+# `pnpm dev` runs every package's dev task, including the Office add-ins. Those need the
+# Windows or macOS certificate store (office-addin-dev-certs), so on Linux/WSL they skip
+# themselves with a message rather than failing the run.
 
 # When you're done: stop the infrastructure (nothing stops it for you).
 # Add -v to also drop the database volumes.
@@ -56,6 +67,24 @@ docker compose ls -a   # shows any stack still running, from any checkout
 - **Frontend**: http://localhost:4321
 - **API**: http://localhost:3001
 - **Default login**: `admin@breeze.local` / `BreezeAdmin123!` (change after first login)
+
+### Local `.env` values
+
+`.env.example` is the template for a production install, so a few of its defaults are wrong for
+local development. After copying it, change these three:
+
+| Variable | `.env.example` | Local dev | Why |
+|---|---|---|---|
+| `NODE_ENV` | `production` | `development` | In production mode `pnpm db:migrate` refuses to create the default `admin@breeze.local` account and fails with *Production bootstrap requires BREEZE_BOOTSTRAP_ADMIN_EMAIL and BREEZE_BOOTSTRAP_ADMIN_PASSWORD*. |
+| `FORCE_HTTPS` | `true` | `false` | With it on, the API refuses to start unless `PUBLIC_API_URL` is an `https://` URL; local dev is plain HTTP. |
+| `REDIS_URL` | `redis://:${REDIS_PASSWORD}@localhost:6379` | `redis://:<your REDIS_PASSWORD>@localhost:6379` | Docker Compose expands `${REDIS_PASSWORD}`, but the API reads `.env` with dotenv, which does not, so Redis rejects the login (`WRONGPASS`). Write the password into the URL, percent-encoding any `@`, `:`, `/`, `#` or `?` in it (a password from `openssl rand -hex 32` needs none). |
+
+Two more look like they need changing but do not:
+
+- `PUBLIC_API_URL`: leave it empty. The web dev server proxies `/api` to the API on port 3001, so
+  the browser calls its own origin and needs no CORS setup.
+- `BREEZE_*_IMAGE_REF`: the placeholders are fine, because the `docker-compose.override.yml.dev`
+  layer above replaces those images with local dev builds.
 
 ### Agent Development
 
@@ -75,7 +104,10 @@ make build-all # Cross-platform builds
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feat/my-feature`)
-3. Make your changes
+3. Make your changes, **with tests**. New functionality ships with automated
+   tests that cover it, in the same PR. A bug fix adds a test that fails
+   without the fix. Tests sit alongside the source they cover (Vitest for
+   TypeScript, Go `testing` for the agent); see `docs/agents/testing.md`.
 4. Mirror the CI gate locally before pushing.
 
    **Security gates** (`.github/workflows/security.yml` + the `security-audit`

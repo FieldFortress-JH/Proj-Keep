@@ -25,12 +25,18 @@ export default defineConfig({
       'src/services/autopay/charging.integration.test.ts',
       'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
+      'src/services/scriptProposals/reviewConcurrency.integration.test.ts',
       'src/__tests__/integration/**',
       // Real bearer + PostgreSQL integration connection authority checks.
       'src/routes/integrationConnectionScope.integration.test.ts',
       // Real-PostgreSQL exact request-pool role checks have a dedicated runner.
       'src/db/requestDatabaseRole.integration.test.ts',
       'src/db/auditRetentionDefault.integration.test.ts',
+      // #9344: real-DB contract-renewal tests, run by vitest.integration.config.ts.
+      // In the unit runner they ran whenever DATABASE_URL was set, which (with the
+      // root .env loaded) meant against the developer's own database.
+      'src/services/contractRenewal.integration.test.ts',
+      'src/jobs/contractWorker.renewal.integration.test.ts',
       // Real-driver integration test for the inbound email pipeline. It needs the
       // integration setup (real postgres pool + autoMigrate seed) and is run by
       // vitest.integration.config.ts — not the unit runner, which has no DB.
@@ -64,6 +70,8 @@ export default defineConfig({
       'src/services/hardwareHealth/**/*.integration.test.ts',
       'src/services/timeSync/**/*.integration.test.ts',
       'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency W05 (#8194): real-DB pass + system-only cache proof.
+      'src/services/imageCurrency/**/*.integration.test.ts',
       // Hardware & RAID monitoring (W05 BMC in-band): use real PostgreSQL and
       // the integration setup.
       'src/services/discovery/agentReportedBmcLink.integration.test.ts',
@@ -204,6 +212,8 @@ export default defineConfig({
       'src/routes/installerRotationRevocation.integration.test.ts',
       // Disposable-database credential cutover proof uses the integration runner.
       'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
+      // Disposable-database proof for the quarantine execution-authority migration.
+      'src/db/securityQuarantineExecutionAuthorityMigration.integration.test.ts',
       // Hardware & RAID monitoring (W03): disposable-database replay proof for
       // the monitor-kind enum and alert subject-identity migrations. Belongs to
       // vitest.integration.config.ts (registered in its include list).
@@ -223,6 +233,8 @@ export default defineConfig({
       // Real-DB suites owned by vitest.integration.config.ts (#3778).
       'src/services/invoiceService.issue.integration.test.ts',
       'src/services/invoicePdf.integration.test.ts',
+      'src/services/customerDocument.integration.test.ts',
+      'src/services/customerDocument.quote.integration.test.ts',
       // #5861 Customer Portal Network Visibility: real-Postgres proof of org
       // isolation and partner-wide monitor result scoping. Imports
       // `__tests__/integration/setup` (real postgres pool + autoMigrate) and

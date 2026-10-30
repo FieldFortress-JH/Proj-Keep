@@ -39,9 +39,10 @@
     },
     "confirm": {
       "title": "Confirm patch approval",
-      "selectedOrganization": "the selected organization",
-      "messageOne": "Approve patch on {{count}} device in {{org}}?",
-      "messageMany": "Approve patch on {{count}} devices in {{org}}?"
+      "selectedRing": "(unnamed)",
+      "messageRingOne": "Approve patch on {{count}} device across all organizations in ring {{ring}}?",
+      "messageRingMany": "Approve patch on {{count}} devices across all organizations in ring {{ring}}?",
+      "messagePartnerWide": "Approve patch for all organizations under your partner?"
     },
     "checkingAccess": "Checking your access..."
   },
@@ -83,14 +84,19 @@
       "pendingDevices": "{{count}} have pending patches",
       "approved": "{{count}} approved",
       "pendingApproval": "{{count}} pending approval",
+      "failedInstalls_one": "{{count}} failed install",
+      "failedInstalls_other": "{{count}} failed installs",
       "critical": "{{count}} critical",
-      "reboot": "{{count}} reboot"
+      "reboot": "{{count}} reboot",
+      "imagesNotChecked_one": "{{count}} container image not checked",
+      "imagesNotChecked_other": "{{count}} container images not checked"
     },
     "filters": {
       "allDevices": "All Devices ({{count}})",
       "statusFilterLabel": "Compliance status filter",
       "pendingPatches": "Pending Patches ({{count}})",
       "critical": "Critical ({{count}})",
+      "failed": "Failed Installs ({{count}})",
       "pendingReboot": "Pending Reboot ({{count}})",
       "thirdPartyPending": "3rd-Party Pending ({{count}})",
       "compliant": "Compliant ({{count}})"
@@ -109,6 +115,8 @@
       "approvedTitle": "Outstanding patches approved for installation",
       "pendingApproval": "Pending Approval",
       "pendingApprovalTitle": "Outstanding patches still awaiting approval",
+      "failed": "Failed",
+      "failedTitle": "Outstanding patches whose last install attempt failed",
       "osPatches": "OS Patches",
       "osPatchesTitle": "Outstanding updates from Windows Update, Apple, or Linux package managers",
       "thirdParty": "3rd-Party",
@@ -153,6 +161,11 @@
       "messageOne": "{{action}} on {{count}} device in {{org}}?",
       "messageMany": "{{action}} on {{count}} devices in {{org}}?",
       "messageMultiOrg": "{{action}} on {{count}} devices across {{orgCount}} organizations ({{orgNames}})?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} of {{total}}",
+      "previous": "Previous page",
+      "next": "Next page"
     }
   },
   "patchInstallHistory": {
@@ -253,7 +266,9 @@
       "moderate": "Moderate",
       "low": "Low",
       "unrated": "Unrated",
-      "unratedNote": "Will not auto-approve"
+      "unratedNote": "Will not auto-approve",
+      "derivedNote": "Derived rating",
+      "derivedTooltip": "The vendor published no rating for this update. This severity was derived from its classification and title."
     },
     "approval": {
       "pending": "Pending",
@@ -301,6 +316,7 @@
       "os": "OS",
       "release": "Release",
       "approval": "Approval",
+      "devices": "Devices",
       "actions": "Actions"
     },
     "releaseUnknown": "Unknown",
@@ -313,6 +329,23 @@
       "badgeDevices_other": "Install failed on {{count}} devices",
       "noReason": "No reason reported by the agent",
       "failedAt": "Last install attempt failed: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} device",
+      "badge_other": "{{count}} devices",
+      "none": "No device in scope still needs this patch",
+      "open": "Show devices that still need {{title}}",
+      "heading": "Devices that still need {{title}}",
+      "loading": "Loading devices…",
+      "error": "Couldn't load the device list.",
+      "showing": "Showing {{shown}} of {{total}}",
+      "loadMore": "Load more",
+      "lastChecked": "Last checked: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Package version {{version}}",
+      "id": "Catalog ID {{id}}",
+      "title": "Another catalog entry has the same title. Each is approved separately."
     }
   },
   "patchesPage": {
@@ -353,7 +386,8 @@
       "createRing": "Failed to create update ring",
       "deleteRing": "Failed to delete ring",
       "approveUnknown": "Approval status unknown — the server response could not be read. Refresh to confirm which patches were approved.",
-      "approveAbortedWithFailures": "{{message}} ({{count}} patches were also rejected by the server before this.)"
+      "approveAbortedWithFailures": "{{message}} ({{count}} patches were also rejected by the server before this.)",
+      "checkRingLinks": "Failed to check which policies use this ring — nothing was deleted"
     },
     "toast": {
       "ringSaved": "Update ring saved",
@@ -383,10 +417,18 @@
       "createTitle": "Create update ring"
     },
     "truncatedNotice": "Showing {{shown}} of {{total}} patches. The filters here only narrow what's already loaded, so the rest can't be reached from this view — use the patches API to work through the full catalog.",
-    "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest."
+    "emptyRingSeverityNotice": "No devices in this ring yet. Device-reported severity appears once devices are assigned, so most patches read Unrated until then.",
+    "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest.",
+    "ringDelete": {
+      "messageNone": "No policies use this ring. Its approval rules and schedule settings will be deleted and cannot be restored.",
+      "title": "Delete {{name}}?",
+      "messageOne": "1 policy will stop scheduled patching until you pick another ring.",
+      "messageMany": "{{count}} policies will stop scheduled patching until you pick another ring.",
+      "confirm": "Delete ring"
+    }
   },
   "patchJobsList": {
-    "empty": "No patch jobs yet. Jobs created by policies, update rings, or the AI assistant will appear here.",
+    "empty": "No patch jobs yet. Jobs created by policies, update rings, or Breeze AI will appear here.",
     "loading": "Loading patch jobs...",
     "columns": {
       "name": "Job",
@@ -509,6 +551,22 @@
       "title": "Install enforcement",
       "description": "How long devices have to install approved patches, and how long a user can defer the reboot. Reboot behavior itself is set per policy on the Patch tab."
     },
+    "featureUpdates": {
+      "title": "Windows feature updates",
+      "description": "Whether devices in this ring receive Windows feature releases (for example 25H2). Breeze installs them only through the approval rules below; add a Feature Updates override to approve them automatically.",
+      "modeBlock": "Block",
+      "modeAllow": "Allow the newest release",
+      "modePin": "Pin to a release",
+      "productLabel": "Windows version",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Release",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Windows Update on each device is set to target this release (Windows Update for Business target-release policy). Unless the policy's \"Breeze is the only Windows Update source\" setting is on, Windows may download and install the release on its own schedule, outside Breeze approval.",
+      "validation": {
+        "release": "Enter a release like 25H2."
+      }
+    },
     "approvalPolicy": {
       "title": "Approval policy",
       "description": "What auto-approves in this ring, and how long to hold a patch after its vendor release. The default applies to every category; add an override to treat one differently.",
@@ -564,7 +622,47 @@
     "badges": {
       "manual": "Manual",
       "os": "OS: {{severities}}",
-      "thirdParty": "3rd-party apps"
+      "thirdParty": "3rd-party apps",
+      "appRules_one": "{{count}} app rule",
+      "appRules_other": "{{count}} app rules",
+      "featureUpdatesNewest": "Feature updates: newest",
+      "featureUpdatesPinned": "Feature updates: {{release}}"
+    }
+  },
+  "ringAppRules": {
+    "applicationRules": "Application Rules",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Block specific applications from automated patching, or pin them to a maximum version.",
+    "blocked": "Blocked",
+    "pinned": "Pinned",
+    "maxVersion": "Max version",
+    "pinnedApplicationsNeedAVersion": "Pinned applications need a version.",
+    "addApplication": "Add application",
+    "searchCatalogAndDetectedApplications": "Search catalog and detected applications...",
+    "searching": "Searching...",
+    "catalog": "catalog",
+    "couldnTLoadApplicationsYouCanStill": "Couldn't load applications — you can still add by package ID below.",
+    "noMatches": "No matches.",
+    "orEnterAPackageIDManually": "Or enter a package ID manually",
+    "removeRuleFor": "Remove rule for {{application}}",
+    "scopeNote": "These rules apply to every device whose configuration policy links this ring."
+  },
+  "patchDetails": {
+    "unknown": "Unknown",
+    "source": "Source",
+    "packageId": "KB / package ID",
+    "severity": "Severity",
+    "releaseDate": "Release date",
+    "firstSeen": "First seen in catalog",
+    "rings": {
+      "title": "Update rings",
+      "note": "When each ring auto-approves this patch (ring-level rule; category overrides are not shown).",
+      "none": "No update rings configured.",
+      "manual": "Not auto-approved — needs manual approval",
+      "immediate": "Auto-approves immediately",
+      "needsDate": "Held — no release date to start the {{count}}-day window",
+      "autoApproves": "Auto-approves {{date}}",
+      "hold_one": "{{count}}-day hold",
+      "hold_other": "{{count}}-day hold"
     }
   }
 }

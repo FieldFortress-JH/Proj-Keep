@@ -67,6 +67,14 @@ const DOCUMENT: ContractDocument = {
   templateVersionNumber: 3,
   signerName: 'Jane Doe',
   signedAt: '2026-06-15T00:00:00Z',
+  signerEmail: null,
+  acceptanceOrigin: 'customer',
+  acceptanceMethod: 'typed-signature',
+  acceptanceReference: null,
+  evidenceAvailable: true,
+  sourceKind: 'quote',
+  agreementRequestId: null,
+  mime: 'application/pdf',
   quoteNumber: 'Q-2026-0001',
   byteSize: 2048,
   sha256: 'a'.repeat(64),
@@ -109,31 +117,62 @@ describe('ContractDetail — executed documents section', () => {
     await waitFor(() => expect(screen.getByTestId('contract-documents-empty')).toBeInTheDocument());
   });
 
-  it('downloads the PDF via an authenticated fetch when Download is clicked', async () => {
+  it('downloads the certified PDF via an authenticated fetch when Download is clicked', async () => {
     fetchWithAuthMock.mockResolvedValue({
       ok: true,
       status: 200,
+      headers: new Headers({ 'X-Agreement-Copy': 'certified' }),
       blob: vi.fn().mockResolvedValue(new Blob(['%PDF'])),
     } as unknown as Response);
     Object.assign(window.URL, {
       createObjectURL: vi.fn().mockReturnValue('blob:mock'),
       revokeObjectURL: vi.fn(),
     });
-    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    const saved: string[] = [];
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push(this.download);
+    });
 
     render(<ContractDetail detail={activeDetail} onChanged={vi.fn()} />);
     const downloadBtn = await screen.findByTestId('contract-document-download-doc-1');
     fireEvent.click(downloadBtn);
 
     await waitFor(() =>
-      expect(fetchWithAuthMock).toHaveBeenCalledWith('/contracts/contract-documents/doc-1/pdf'),
+      expect(fetchWithAuthMock).toHaveBeenCalledWith('/contracts/contract-documents/doc-1/pdf?copy=certified'),
     );
+    await waitFor(() => expect(saved).toEqual(['signed-agreement-doc-1.pdf']));
+    clickSpy.mockRestore();
+  });
+
+  it('names the file for the original when the server falls back (X-Agreement-Copy: original)', async () => {
+    fetchWithAuthMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'X-Agreement-Copy': 'original' }),
+      blob: vi.fn().mockResolvedValue(new Blob(['%PDF'])),
+    } as unknown as Response);
+    Object.assign(window.URL, {
+      createObjectURL: vi.fn().mockReturnValue('blob:mock'),
+      revokeObjectURL: vi.fn(),
+    });
+    const saved: string[] = [];
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push(this.download);
+    });
+
+    render(<ContractDetail detail={activeDetail} onChanged={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId('contract-document-download-doc-1'));
+
+    await waitFor(() =>
+      expect(fetchWithAuthMock).toHaveBeenCalledWith('/contracts/contract-documents/doc-1/pdf?copy=certified'),
+    );
+    await waitFor(() => expect(saved).toEqual(['signed-agreement-doc-1-original.pdf']));
     clickSpy.mockRestore();
   });
 });
 
 describe('ContractDetail — invoice note (spec §3)', () => {
-  it('renders the contract terms as an Invoice note row next to Notes', async () => {
+  it('renders the contract terms as an Invoice note row next to Internal notes', async () => {
     const detail: ContractDetailData = {
       ...activeDetail,
       contract: { ...activeDetail.contract, notes: 'Renewal call booked', terms: 'Net 30. Late fees apply after 15 days.' },
@@ -142,8 +181,8 @@ describe('ContractDetail — invoice note (spec §3)', () => {
     await waitFor(() => expect(screen.getByTestId('contract-documents-section')).toBeInTheDocument());
     expect(screen.getByText('Invoice note')).toBeInTheDocument();
     expect(screen.getByText('Net 30. Late fees apply after 15 days.')).toBeInTheDocument();
-    // The billing contract's own Notes row is unaffected.
-    expect(screen.getByText('Notes')).toBeInTheDocument();
+    // The billing contract's own notes row is labelled internal-only (#9347).
+    expect(screen.getByText('Internal notes')).toBeInTheDocument();
     expect(screen.getByText('Renewal call booked')).toBeInTheDocument();
   });
 

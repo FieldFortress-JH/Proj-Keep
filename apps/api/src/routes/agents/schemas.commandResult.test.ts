@@ -5,6 +5,7 @@ import {
   commandResultSchema,
   commandResultResultByteLength,
   MAX_COMMAND_RESULT_BYTES,
+  AGENT_COMMAND_ERROR_CODES,
 } from './schemas';
 
 // The Go mirror of the cap. Relative to this file's directory.
@@ -171,5 +172,112 @@ describe('commandResultResultByteLength', () => {
     cyclic.self = cyclic;
     expect(commandResultResultByteLength(cyclic)).toBeNull();
     expect(commandResultSchema.safeParse(validResult({ result: cyclic })).success).toBe(false);
+  });
+});
+
+// The Go mirror of the error-code enum. Relative to this file's directory.
+const GO_ERROR_CODES_PATH = resolve(__dirname, '../../../../../agent/internal/wire/errorcodes.go');
+
+describe('command_result `errorCode` (#4026)', () => {
+  it('pins AGENT_COMMAND_ERROR_CODES to the Go enum in agent/internal/wire/errorcodes.go', () => {
+    // The other direction is TestCommandErrorCodesMatchServerSchema in Go.
+    // A missing file is a failure, not a skip: readFileSync throws.
+    const go = readFileSync(GO_ERROR_CODES_PATH, 'utf8');
+    const goCodes = [...go.matchAll(/^\s*ErrCode\w+\s+CommandErrorCode\s*=\s*"([a-z0-9_]+)"/gm)].map((m) => m[1]);
+    expect(goCodes.length).toBeGreaterThan(0);
+    expect([...AGENT_COMMAND_ERROR_CODES].sort()).toEqual([...goCodes].sort());
+    expect(new Set(AGENT_COMMAND_ERROR_CODES).size).toBe(AGENT_COMMAND_ERROR_CODES.length);
+  });
+
+  it('carries a typed code through parsing', () => {
+    const parsed = commandResultSchema.parse(
+      validResult({ status: 'failed', error: 'path does not exist: /x', errorCode: 'path_not_found' }),
+    );
+    expect(parsed.errorCode).toBe('path_not_found');
+  });
+
+  it('accepts a code this API does not know yet rather than rejecting the result', () => {
+    // A newer agent can ship a code before the API learns it; the classifier
+    // treats it as absent. Rejecting the whole command_result would lose the
+    // outcome entirely — far worse than prose classification.
+    const parsed = commandResultSchema.safeParse(validResult({ status: 'failed', errorCode: 'brand_new_code' }));
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.errorCode).toBe('brand_new_code');
+  });
+
+  it('drops a malformed code instead of rejecting the result', () => {
+    for (const errorCode of [42, 'x'.repeat(65), { nested: true }]) {
+      const parsed = commandResultSchema.safeParse(validResult({ status: 'failed', error: 'boom', errorCode }));
+      expect(parsed.success, JSON.stringify(errorCode)).toBe(true);
+      expect(parsed.success && parsed.data.errorCode).toBeUndefined();
+      expect(parsed.success && parsed.data.error).toBe('boom');
+    }
+  });
+
+  it('is optional for agents that predate it', () => {
+    const parsed = commandResultSchema.parse(validResult({ status: 'failed', error: 'boom' }));
+    expect(parsed.errorCode).toBeUndefined();
+  });
+});
+
+// The Go wire structs that carry the #3525 cancellation marker. Relative to
+// this file's directory.
+const GO_WS_RESULT_PATH = resolve(__dirname, '../../../../../agent/internal/websocket/client.go');
+const GO_TOOLS_RESULT_PATH = resolve(__dirname, '../../../../../agent/internal/remote/tools/types.go');
+
+describe('command_result cancellation marker (#3525, #10377)', () => {
+  const CANCEL_COMMAND_ID = '6f1c2a9e-1b2c-4d3e-8f4a-0123456789ab';
+
+  it('pins the JSON names to the Go wire structs on both transports', () => {
+    // #10377: the agent sent these on every cancelled script and this schema
+    // silently stripped them, so no racing script result could ever confirm a
+    // cancel. If the Go tags change, the schema keys must change with them.
+    for (const path of [GO_WS_RESULT_PATH, GO_TOOLS_RESULT_PATH]) {
+      const go = readFileSync(path, 'utf8');
+      expect(go, path).toMatch(/\bCancelled\s+bool\s+`json:"cancelled,omitempty"`/);
+      expect(go, path).toMatch(/\bCancelledByCommandID\s+string\s+`json:"cancelledByCommandId,omitempty"`/);
+    }
+  });
+
+  it('carries the marker through parsing instead of stripping it', () => {
+    const parsed = commandResultSchema.parse(validResult({
+      status: 'failed',
+      exitCode: -1,
+      error: 'execution cancelled',
+      cancelled: true,
+      cancelledByCommandId: CANCEL_COMMAND_ID,
+    }));
+    expect(parsed.cancelled).toBe(true);
+    expect(parsed.cancelledByCommandId).toBe(CANCEL_COMMAND_ID);
+  });
+
+  it('drops a malformed marker instead of rejecting the result', () => {
+    // A bad marker must never cost the script its real outcome, and a non-uuid
+    // id must never reach the uuid-typed cancel_command_id compare (22P02).
+    // Dropping it lands the result on the honest unproven path.
+    const cases: Array<[unknown, unknown]> = [
+      ['yes', CANCEL_COMMAND_ID],
+      [true, 'not-a-uuid'],
+      [true, 42],
+      [true, { nested: true }],
+    ];
+    for (const [cancelled, cancelledByCommandId] of cases) {
+      const parsed = commandResultSchema.safeParse(validResult({
+        status: 'failed', error: 'boom', cancelled, cancelledByCommandId,
+      }));
+      expect(parsed.success, JSON.stringify([cancelled, cancelledByCommandId])).toBe(true);
+      if (!parsed.success) continue;
+      expect(parsed.data.error).toBe('boom');
+      expect(parsed.data.cancelled).toBe(typeof cancelled === 'boolean' ? cancelled : undefined);
+      expect(parsed.data.cancelledByCommandId).toBe(
+        cancelledByCommandId === CANCEL_COMMAND_ID ? CANCEL_COMMAND_ID : undefined,
+      );
+    }
+  });
+
+  it('is optional for results that were not cancelled', () => {
+    const parsed = commandResultSchema.parse(validResult());
+    expect(parsed.cancelled).toBeUndefined();
+    expect(parsed.cancelledByCommandId).toBeUndefined();
   });
 });

@@ -273,8 +273,8 @@ async function deliverPreparedDeviceCommand(
   // queued reboot could land in the middle of a running script.
   //
   // Review round 2 (J): a blanket skip was too blunt. `maintenanceRebootWorker`
-  // and the fleet-findings dispatch map both issue reboots that ALWAYS pushed
-  // before #5128, and downgrading them to "wait for the next heartbeat" delays
+  // (Linux, until #9181 moved it onto schedule_reboot) and the fleet-findings
+  // dispatch map both issued reboots that ALWAYS pushed before #5128, and downgrading them to "wait for the next heartbeat" delays
   // a maintenance-window reboot by a whole heartbeat interval. So apply the
   // barrier's actual condition instead: push only when nothing is in flight on
   // this device, which is exactly what the heartbeat claim checks.
@@ -309,7 +309,10 @@ async function deliverPreparedDeviceCommand(
   const prepared = fresh
     ? decryptCommandForDelivery({ id: command.id, type: input.type, deviceId: input.deviceId, payload: fresh })
     : null;
-  const sent = prepared ? sendCommandToAgent(device.agentId, toAgentCommandFrame(prepared)) : false;
+  // #8318 §6.4: push to the agent_id read IN the claim, not to the one read
+  // by prepareDeviceCommand before it — a reattach confirm between the two
+  // changes who owns the row.
+  const sent = prepared ? sendCommandToAgent(claimed.agentId, toAgentCommandFrame(prepared)) : false;
   if (sent) {
     return {
       ok: true,

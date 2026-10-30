@@ -219,6 +219,7 @@
     "created2": "Creado",
     "expires2": "Vence",
     "protection2": "Protección",
+    "integrity": "Integridad",
     "hold": "Retener",
     "standard": "Estándar",
     "restorePointCount_one": "punto de restauración {{count}}",
@@ -487,6 +488,22 @@
     "selectASnapshot": "Seleccione una instantánea",
     "chooseTheRecoveryPointYouWantToRestore": "Elija el punto de recuperación desde el que desea restaurar.",
     "noSnapshotsAvailable": "No hay instantáneas disponibles.",
+    "device": "Dispositivo",
+    "selectADevice": "Seleccione un dispositivo",
+    "chooseTheDeviceToRestore": "Elija el dispositivo cuya copia de seguridad desea restaurar.",
+    "deviceOption_one": "{{device}} ({{count}} instantánea)",
+    "deviceOption_other": "{{device}} ({{count}} instantáneas)",
+    "unknownDevice": "Dispositivo desconocido",
+    "reviewDevice": "Dispositivo: {{device}}",
+    "snapshotNeedsSecondFactor": "Requiere segundo factor",
+    "secondFactorNote": "Este punto de restauración no está verificado. Al iniciar la restauración se te pedirá confirmar con tu segundo factor.",
+    "secondFactorNoteNotEnrolled": "Este punto de restauración no está verificado y no tienes un segundo factor configurado. Para iniciar la restauración se requiere uno.",
+    "secondFactorSetUp": "Configurar la autenticación de dos factores",
+    "commandDetails": "Detalles del comando",
+    "copyCommandId": "Copiar ID del comando",
+    "commandIdCopied": "ID del comando copiado",
+    "commandIdCopyFailed": "No se pudo copiar el ID del comando",
+    "carriedSnapshotUnavailable": "La instantánea con la que abrió el asistente ya no está disponible. Elija un dispositivo y una de sus instantáneas.",
     "selectRestoreType": "Seleccione el tipo de restauración",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Completamente restaura todo, selectivo restaura archivos específicos.",
     "fullRestore": "restauración completa",
@@ -529,9 +546,18 @@
     "noRestoreHistoryYet": "Aún no hay historial de restauración.",
     "files2": "Archivos:",
     "size": "Tamaño:",
-    "filesSelected_one": "{{count}} archivo seleccionado",
-    "filesSelected_other": "{{count}} archivos seleccionados",
-    "unknownDevice": "Dispositivo desconocido",
+    "filesSelected_one": "{{formatted}} archivo seleccionado",
+    "filesSelected_other": "{{formatted}} archivos seleccionados",
+    "folderFileCount_one": "{{formatted}} archivo",
+    "folderFileCount_other": "{{formatted}} archivos",
+    "allFilesFromSnapshot": "Todos los archivos de la instantánea",
+    "selectionFiles_one": "{{formatted}} archivo",
+    "selectionFiles_other": "{{formatted}} archivos",
+    "selectionFolders_one": "{{formatted}} carpeta",
+    "selectionFolders_other": "{{formatted}} carpetas",
+    "largeFolderSelectionTitle": "Selección grande",
+    "selectFolder": "Seleccionar carpeta {{name}}",
+    "confirmLargeFolderSelection": "Esta selección abarca unos {{formatted}} archivos y la restauración puede tardar. ¿Continuar?",
     "kindVm": "Restaurar como VM",
     "kindInstantBoot": "Arranque instantáneo",
     "kindSelective": "Restauración selectiva",
@@ -629,6 +655,10 @@
     "path": "Ruta:",
     "useTheRestoreWorkflowToRecoverOrExport": "Utilice el flujo de trabajo de restauración para recuperar o exportar archivos de esta instantánea.",
     "select": "Seleccionar",
+    "folderFileCount_one": "{{count}} archivo",
+    "folderFileCount_other": "{{count}} archivos",
+    "selectFolder": "Seleccionar carpeta {{name}}",
+    "confirmLargeFolderSelection": "Esta selección abarca unos {{count}} archivos y la restauración puede tardar. ¿Continuar?",
     "name": "Nombre",
     "size2": "Tamaño",
     "modified": "Modificado"
@@ -720,7 +750,9 @@
     "vaultType": "Tipo de bóveda",
     "retentionCount": "Recuento de retención",
     "numberOfSnapshotsToKeepInTheVault": "Número de instantáneas que se guardarán en la bóveda (1-100).",
-    "cancel": "Cancelar"
+    "cancel": "Cancelar",
+    "failedToSave": "No se pudo guardar la bóveda. Inténtalo de nuevo.",
+    "deviceConfigNotSent": "Bóveda guardada, pero no se pudo enviar su configuración al dispositivo: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Cargando bóvedas...",
@@ -742,7 +774,12 @@
     "actions": "Acciones",
     "sync": "Sincronizar",
     "edit": "Editar",
-    "deactivate": "Desactivar"
+    "deactivate": "Desactivar",
+    "inactive": "Inactivo",
+    "syncStarted": "Sincronización de la bóveda iniciada",
+    "failedToSync": "No se pudo iniciar la sincronización de la bóveda. Inténtalo de nuevo.",
+    "failedToDeactivate": "No se pudo desactivar la bóveda. Inténtalo de nuevo.",
+    "deviceConfigNotSent": "Bóveda guardada, pero no se pudo enviar su configuración al dispositivo: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Cargando recuperación ante desastres...",
@@ -993,6 +1030,8 @@
     "codeExpires": "Caduca a las {{time}}",
     "overdueNotice": "Aún sin confirmación — revise la consola de recuperación.",
     "fileIndexPreparing": "Preparando el índice de archivos para referencias entre instantáneas…",
+    "snapshotsLoadFailed": "No se pudieron cargar las instantáneas. Recargue la página para volver a intentarlo.",
+    "noSnapshots": "Aún no hay instantáneas restaurables en bare-metal. Se necesita una copia de seguridad completa del equipo marcada como restaurable en bare-metal.",
     "statusFailed": "La recuperación falló",
     "statusRefused": "Recuperación rechazada",
     "status": {
@@ -1002,7 +1041,8 @@
       "restoring": "Restaurando",
       "validated": "Validada",
       "rebooted": "Reiniciada",
-      "checked_in": "Confirmada"
+      "checked_in": "Confirmada",
+      "completed": "Completado"
     }
   },
   "backupHealth": {
@@ -1013,6 +1053,7 @@
     "statusTitle": "Estado",
     "recencyTitle": "Última copia de seguridad correcta",
     "coverage": "{{covered}} de {{total}} endpoints tienen una copia de seguridad reciente",
+    "definition": "«Reciente» significa una copia de seguridad exitosa en las últimas 48 horas. El estado de un dispositivo refleja su última ejecución, por lo que puede tener una copia reciente y aun así mostrar Crítico si esa ejecución falló.",
     "providerOnly": "{{value}} endpoints solo del proveedor",
     "m365Accounts": "{{value}} cuentas de Microsoft 365",
     "status": {
@@ -1069,10 +1110,14 @@
       "hyperv": "Hyper-V",
       "vmware": "VMware",
       "bare_metal": "Bare metal",
+      "m365_mail": "Correo de Microsoft 365",
       "m365_sharepoint": "SharePoint",
       "m365_exchange": "Exchange",
       "m365_onedrive": "OneDrive",
       "m365_teams": "Teams",
+      "gws_mail": "Correo de Google Workspace",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Unidades compartidas de Google",
       "other": "Otros"
     },
     "noObservation": "Sin observación",
@@ -1091,7 +1136,12 @@
       "errorUnlink": "No se pudo desvincular el dispositivo del proveedor",
       "error": "No se pudo cargar el estado de la copia de seguridad externa",
       "alsoCheck": "Revise también las conexiones de copia de seguridad de terceros en Integraciones."
-    }
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} cuentas SaaS",
+    "workloadBackup": "Respaldo de {{workload}}",
+    "sourceProvider": "Proveedores de respaldo"
   },
   "restoreResultNotices": {
     "systemStateRequiresRebuildTitle": "El estado del sistema se aplica con una reconstrucción bare-metal",
@@ -1129,5 +1179,10 @@
     "checking": "Comprobando",
     "unverified": "Sin verificar",
     "failed": "Falló la comprobación de integridad"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "Se omitió {{count}} punto de reanálisis: las uniones y los puntos de montaje no se siguen ni se restauran. Es lo esperado, no es un error.",
+    "summary_other": "Se omitieron {{count}} puntos de reanálisis: las uniones y los puntos de montaje no se siguen ni se restauran. Es lo esperado, no es un error.",
+    "showDetails": "Mostrar rutas omitidas"
   }
 }

@@ -11,6 +11,7 @@ import {
   classifyPreAuth,
   type AuthFailureKind,
 } from '../authOutcome';
+import { withBiometricPrompt } from '../../../services/biometricPromptState';
 
 interface Props {
   // The approval the user is looking at right now (live prop). We snapshot
@@ -31,6 +32,8 @@ interface Props {
   /** W03: the script-proposal card blocks Approve until every STRICT pattern
    *  is acknowledged by a permitted approver. Deny stays available. */
   approveDisabled?: boolean;
+  /** The deny reason is relayed to the end user (uac_intercept / PAM). */
+  denyShownToEndUser?: boolean;
 }
 
 const PASSCODE_FALLBACK_CODES = new Set(['not_enrolled', 'passcode_not_set']);
@@ -44,6 +47,7 @@ export function ApprovalButtons({
   onApprove,
   onDeny,
   approveDisabled = false,
+  denyShownToEndUser = false,
 }: Props) {
   const theme = useApprovalTheme('dark');
   const [denyOpen, setDenyOpen] = useState(false);
@@ -57,10 +61,12 @@ export function ApprovalButtons({
   const denyTargetRef = useRef<CapturedRequestId>(captureRequestId(requestId));
 
   async function authenticateWithPasscode(): Promise<LocalAuthentication.LocalAuthenticationResult> {
-    return await LocalAuthentication.authenticateAsync({
-      promptMessage: 'Confirm to approve',
-      disableDeviceFallback: false,
-    });
+    return await withBiometricPrompt(() =>
+      LocalAuthentication.authenticateAsync({
+        promptMessage: 'Confirm to approve',
+        disableDeviceFallback: false,
+      })
+    );
   }
 
   async function handleApprovePress() {
@@ -113,11 +119,15 @@ export function ApprovalButtons({
         return;
       }
 
-      const r = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Approve this request',
-        cancelLabel: 'Cancel',
-        disableDeviceFallback: false,
-      });
+      // Marked as our own prompt so the app lock does not flash its privacy
+      // cover for the `inactive` the sheet causes (services/biometricPromptState).
+      const r = await withBiometricPrompt(() =>
+        LocalAuthentication.authenticateAsync({
+          promptMessage: 'Approve this request',
+          cancelLabel: 'Cancel',
+          disableDeviceFallback: false,
+        })
+      );
       if (r.success) { onApprove(target); return; }
 
       const code = (r as { error?: string }).error;
@@ -227,6 +237,7 @@ export function ApprovalButtons({
 
       <DenyReasonSheet
         visible={denyOpen}
+        showsToEndUser={denyShownToEndUser}
         onCancel={() => setDenyOpen(false)}
         onSubmit={(reason) => { setDenyOpen(false); onDeny(denyTargetRef.current, reason); }}
       />

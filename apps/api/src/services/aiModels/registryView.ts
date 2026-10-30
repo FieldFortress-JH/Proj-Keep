@@ -14,6 +14,9 @@ import { eq } from 'drizzle-orm';
 import {
   AI_ASSIGNMENT_WRITE_ROLES,
   CONFIGURABLE_AI_SURFACE_ROLES,
+  CONFIGURABLE_AI_SURFACES,
+  envManagementState,
+  envStateDtoFields,
   isGatewayConnectionKind,
   TOOL_REQUIRING_SURFACES,
   type AiAssignmentRowDto,
@@ -45,7 +48,6 @@ import { listOfferings, type Offering } from './offerings';
 import { listAssignmentRows } from './assignmentRows';
 import { mergeEffectiveAssignment, selectRoleRows } from './assignments';
 import { endpointFingerprint, verifiedGatewayCapabilities } from './gatewayCapabilities';
-import { isEnvManaged, isEnvReleased } from './gatewayConnections';
 
 const TOOL_SURFACES = new Set<string>(TOOL_REQUIRING_SURFACES);
 
@@ -245,6 +247,9 @@ export async function buildPartnerModelsSnapshot(partnerId: string): Promise<AiM
     const seen = new Set<string>();
     const defaultFor = allRows
       .filter((r) => r.defaultOfferingId === o.id)
+      // Platform-only surfaces (patch_test) have no UI row to manage, and the
+      // resolver reads them with no partner: counting them strands the model (#9455).
+      .filter((r) => (CONFIGURABLE_AI_SURFACES as readonly string[]).includes(r.surface))
       .map((r) => ({ surface: r.surface as AiSurface, level: r.orgId === null ? 'partner' as const : 'org' as const, orgId: r.orgId }))
       .filter((d) => {
         const k = `${d.surface}/${d.level}/${d.orgId ?? ''}`;
@@ -288,8 +293,7 @@ export async function buildPartnerModelsSnapshot(partnerId: string): Promise<AiM
     discoveryError: null,
     funding: 'platform',
     baseUrl: null,
-    managedBy: null,
-    envReleased: false,
+    ...envStateDtoFields(null),
   };
   const partnerConns: AiConnectionDto[] = connections.map((c) => {
     const gateway = isGatewayConnectionKind(c.kind);
@@ -313,8 +317,7 @@ export async function buildPartnerModelsSnapshot(partnerId: string): Promise<AiM
       funding: 'partner_key' as const,
       // Gateway kinds only; the base URL never carries credentials (byoBaseUrlSchema / byoEndpointPolicy refuse them).
       baseUrl: gateway ? c.baseUrl : null,
-      managedBy: gateway && isEnvManaged(c) ? 'env' as const : null,
-      envReleased: gateway && isEnvReleased(c),
+      ...envStateDtoFields(gateway ? envManagementState(c.providerConfig) : null),
     };
   });
 
