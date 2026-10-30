@@ -61,13 +61,15 @@ export const configFeatureTypeEnum = pgEnum('config_feature_type', [
   'time_sync',
   // #3834. APPENDED, matching the migration's ADD VALUE order.
   'workload_inventory',
-  // MDM Module (2026-10-15). APPENDED, matching the migration's ADD VALUE order.
-  // MDM profiles (Apple .mobileconfig) assignable via configuration policies.
-  'mdm_profile',
   // #4609 (2026-12-24). APPENDED, matching the migration's ADD VALUE order.
   'system_protection',
   // #6960 (2026-12-27). APPENDED, matching the migration's ADD VALUE order.
   'security_agents',
+  // MDM Module (2027-01-16). APPENDED LAST, matching the migration's ADD VALUE
+  // order — the MDM migration is dated past the newest upstream migration so it
+  // replays last on a fresh database, which forces this value to the end of the
+  // enum. MDM profiles (Apple .mobileconfig) assignable via config policies.
+  'mdm_profile',
 ]);
 
 export const configAssignmentLevelEnum = pgEnum('config_assignment_level', [
