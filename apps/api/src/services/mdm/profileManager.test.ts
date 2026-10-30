@@ -225,7 +225,6 @@ describe('profileManager', () => {
         updatedAt: new Date(),
       };
 
-      const mockUpdated = { ...mockProfile, status: 'active', profilePayload: expect.any(String) };
 
       // Mock getMdmProfile (internal call)
       (db.select as any).mockReturnValue({
@@ -236,12 +235,14 @@ describe('profileManager', () => {
         }),
       });
 
+      // Return exactly what production writes, so assertions see the real XML
+      // rather than an asymmetric-matcher placeholder.
       (db.update as any).mockReturnValue({
-        set: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((values: Record<string, unknown>) => ({
           where: vi.fn().mockReturnValue({
-            returning: vi.fn().mockResolvedValue([mockUpdated]),
+            returning: vi.fn().mockResolvedValue([{ ...mockProfile, ...values }]),
           }),
-        }),
+        })),
       });
 
       const result = await signMdmProfile(mockAuth, 'profile-1');
@@ -274,8 +275,6 @@ describe('profileManager — .mobileconfig XML builder', () => {
       updatedAt: new Date(),
     };
 
-    const mockUpdated = { ...mockProfile, status: 'active', profilePayload: expect.any(String) };
-
     (db.select as any).mockReturnValue({
       from: vi.fn().mockReturnValue({
         where: vi.fn().mockReturnValue({
@@ -284,12 +283,14 @@ describe('profileManager — .mobileconfig XML builder', () => {
       }),
     });
 
+    // Return exactly what production writes, so assertions see the real XML
+    // rather than an asymmetric-matcher placeholder.
     (db.update as any).mockReturnValue({
-      set: vi.fn().mockReturnValue({
+      set: vi.fn().mockImplementation((values: Record<string, unknown>) => ({
         where: vi.fn().mockReturnValue({
-          returning: vi.fn().mockResolvedValue([mockUpdated]),
+          returning: vi.fn().mockResolvedValue([{ ...mockProfile, ...values }]),
         }),
-      }),
+      })),
     });
 
     const result = await signMdmProfile(mockAuth, 'profile-1');

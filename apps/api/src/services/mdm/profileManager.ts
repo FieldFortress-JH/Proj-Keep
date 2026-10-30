@@ -441,7 +441,7 @@ function buildAppRestrictionsPayload(s: Record<string, unknown>): string {
     keys.push('allowScreenCapture');
     values.push(`<${s.allowScreenCapture ? 'true' : 'false'}/>`);
   }
-  if (s.allow Siri !== undefined) {
+  if (s.allowSiri !== undefined) {
     keys.push('allowSiri');
     values.push(`<${s.allowSiri ? 'true' : 'false'}/>`);
   }
